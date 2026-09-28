@@ -29,12 +29,14 @@ WORKDIR /home/openchamber
 RUN apt-get update && apt-get install -y --no-install-recommends \
   bash \
   ca-certificates \
+  curl \
   git \
   less \
   nodejs \
   npm \
   openssh-client \
   python3 \
+  sudo \
   && rm -rf /var/lib/apt/lists/*
 
 # Replace the base image's 'bun' user (UID 1000) with 'openchamber'
@@ -43,6 +45,18 @@ RUN userdel bun \
   && groupadd -g 1000 openchamber \
   && useradd -u 1000 -g 1000 -m -s /bin/bash openchamber \
   && chown -R openchamber:openchamber /home/openchamber
+
+# Allow the openchamber user to install packages and write outside $HOME.
+# Without this the container has no way to become root at all, so
+# `apt-get install` and installs into /usr/local/bin are impossible.
+# !requiretty keeps it working for non-interactive tool invocations.
+RUN printf '%s\n' \
+  'Defaults:openchamber !requiretty' \
+  'openchamber ALL=(ALL) NOPASSWD:ALL' \
+  > /etc/sudoers.d/openchamber \
+  && chmod 0440 /etc/sudoers.d/openchamber \
+  && chown root:root /etc/sudoers.d/openchamber \
+  && visudo -cf /etc/sudoers.d/openchamber
 
 # Switch to openchamber user
 USER openchamber
@@ -77,3 +91,4 @@ COPY --from=builder /app/packages/web/dist ./packages/web/dist
 EXPOSE 3000
 
 ENTRYPOINT ["sh", "/home/openchamber/openchamber-entrypoint.sh"]
+

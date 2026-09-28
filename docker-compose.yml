@@ -9,12 +9,12 @@ services:
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:
-      - ./data/openchamber:/home/openchamber/.config/openchamber
-      - ./data/opencode/share:/home/openchamber/.local/share/opencode
-      - ./data/opencode/state:/home/openchamber/.local/state/opencode
-      - ./data/opencode/config:/home/openchamber/.config/opencode
-      - ./data/ssh:/home/openchamber/.ssh
-      - ./workspaces:/home/openchamber/workspaces
+      - ./data/openchamber:/home/openchamber/.config/openchamber:Z
+      - ./data/opencode/share:/home/openchamber/.local/share/opencode:Z
+      - ./data/opencode/state:/home/openchamber/.local/state/opencode:Z
+      - ./data/opencode/config:/home/openchamber/.config/opencode:Z
+      - ./data/ssh:/home/openchamber/.ssh:Z
+      - ./workspaces:/home/openchamber/workspaces:Z
     environment:
       # Docker binds OpenChamber to 0.0.0.0 for port mapping, so UI auth is required.
       # Set this before starting, for example:
