@@ -5,6 +5,8 @@ services:
       dockerfile: Dockerfile
     container_name: openchamber
     userns_mode: keep-id
+    security_opt:
+      - label=disable          # >>> lets the container reach the host podman socket
     ports:
       - "3000:3000"
     extra_hosts:
@@ -16,11 +18,11 @@ services:
       - ./data/opencode/config:/home/openchamber/.config/opencode:Z
       - ./data/ssh:/home/openchamber/.ssh:Z
       - ./workspaces:/home/openchamber/workspaces:Z
-      # >>> docker access: the host rootless engine, exposed as the docker socket
-      - /run/user/1000/podman/podman.sock:/var/run/docker.sock:Z
+      # no :z/:Z here — with label=disable there is nothing to relabel, and this
+      # leaves the host's own socket untouched
+      - /run/user/1000/podman/podman.sock:/var/run/docker.sock
     environment:
       OPENCHAMBER_UI_PASSWORD: ${OPENCHAMBER_UI_PASSWORD:?Set OPENCHAMBER_UI_PASSWORD before exposing OpenChamber through Docker}
-      # >>> docker access: aim the docker CLI at the passed-through socket
       DOCKER_HOST: unix:///var/run/docker.sock
     restart: unless-stopped
 
