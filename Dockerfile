@@ -30,6 +30,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
   bash \
   ca-certificates \
   curl \
+  # >>> docker access: docker CLI + `docker compose` + buildx
+  docker-cli \
+  docker-buildx \
+  docker-compose \
   git \
   less \
   nodejs \
@@ -46,9 +50,13 @@ RUN userdel bun \
   && useradd -u 1000 -g 1000 -m -s /bin/bash openchamber \
   && chown -R openchamber:openchamber /home/openchamber
 
+# >>> docker access: with `userns_mode: keep-id` the container user already
+# matches the host user that owns the socket, so this is belt-and-braces for
+# the case where keep-id is dropped. (docker-cli does not create a group on
+# its own, so create it first.)
+RUN groupadd -f docker && usermod -aG docker openchamber
+
 # Allow the openchamber user to install packages and write outside $HOME.
-# Without this the container has no way to become root at all, so
-# `apt-get install` and installs into /usr/local/bin are impossible.
 # !requiretty keeps it working for non-interactive tool invocations.
 RUN printf '%s\n' \
   'Defaults:openchamber !requiretty' \
@@ -63,6 +71,8 @@ USER openchamber
 
 ENV NPM_CONFIG_PREFIX=/home/openchamber/.npm-global
 ENV PATH=${NPM_CONFIG_PREFIX}/bin:${PATH}
+# >>> docker access: default the client at the socket the compose mounts
+ENV DOCKER_HOST=unix:///var/run/docker.sock
 
 RUN npm config set prefix /home/openchamber/.npm-global && mkdir -p /home/openchamber/.npm-global && \
   mkdir -p /home/openchamber/.local /home/openchamber/.config /home/openchamber/.ssh && \
