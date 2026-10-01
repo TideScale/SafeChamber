@@ -50,11 +50,10 @@ RUN userdel bun \
   && useradd -u 1000 -g 1000 -m -s /bin/bash openchamber \
   && chown -R openchamber:openchamber /home/openchamber
 
-# >>> docker access: with `userns_mode: keep-id` the container user already
-# matches the host user that owns the socket, so this is belt-and-braces for
-# the case where keep-id is dropped. (docker-cli does not create a group on
-# its own, so create it first.)
-RUN groupadd -f docker && usermod -aG docker openchamber
+# >>> docker access: use the host's docker group GID (982) so the mounted
+# socket (root:982, mode 660 at /var/run/docker.sock) is usable by openchamber.
+# The previous auto-assigned GID (1001) did not match, causing "permission denied".
+RUN groupadd -f -g 982 docker && usermod -aG docker openchamber
 
 # Allow the openchamber user to install packages and write outside $HOME.
 # !requiretty keeps it working for non-interactive tool invocations.
