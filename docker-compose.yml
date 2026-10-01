@@ -5,24 +5,22 @@ services:
       dockerfile: Dockerfile
     container_name: openchamber
     userns_mode: keep-id
-    security_opt:
-      - label=disable          # >>> lets the container reach the host podman socket
     ports:
       - "3000:3000"
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:
-      - ./data/openchamber:/home/openchamber/.config/openchamber:Z
-      - ./data/opencode/share:/home/openchamber/.local/share/opencode:Z
-      - ./data/opencode/state:/home/openchamber/.local/state/opencode:Z
-      - ./data/opencode/config:/home/openchamber/.config/opencode:Z
-      - ./data/ssh:/home/openchamber/.ssh:Z
-      - ./workspaces:/home/openchamber/workspaces:Z
-      # no :z/:Z here — with label=disable there is nothing to relabel, and this
-      # leaves the host's own socket untouched
-      - /run/user/1000/podman/podman.sock:/var/run/docker.sock
+      - ./data/openchamber:/home/openchamber/.config/openchamber
+      - ./data/opencode/share:/home/openchamber/.local/share/opencode
+      - ./data/opencode/state:/home/openchamber/.local/state/opencode
+      - ./data/opencode/config:/home/openchamber/.config/opencode
+      - ./data/ssh:/home/openchamber/.ssh
+      - ./workspaces:/home/openchamber/workspaces
+      - /var/run/docker.sock:/var/run/docker.sock
     environment:
       OPENCHAMBER_UI_PASSWORD: ${OPENCHAMBER_UI_PASSWORD:?Set OPENCHAMBER_UI_PASSWORD before exposing OpenChamber through Docker}
       DOCKER_HOST: unix:///var/run/docker.sock
+      OPENCHAMBER_TUNNEL_PROVIDER: ngrok
+      OPENCHAMBER_TUNNEL_MODE: quick
     restart: unless-stopped
 
