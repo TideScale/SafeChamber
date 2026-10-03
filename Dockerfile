@@ -26,14 +26,17 @@ RUN bun run build:web
 FROM oven/bun:1.4.2 AS runtime
 WORKDIR /home/openchamber
 
+# Package postinstalls must not try to start services during the build: there
+# is no init system in the image.
+RUN printf '#!/bin/sh\nexit 101\n' > /usr/sbin/policy-rc.d && chmod +x /usr/sbin/policy-rc.d
+
 RUN apt-get update && apt-get install -y --no-install-recommends \
   bash \
   ca-certificates \
   curl \
-  # >>> docker access: docker CLI + `docker compose` + buildx
-  docker-cli \
-  docker-buildx \
-  docker-compose \
+  # >>> docker-in-docker (sysbox): the inner daemon needs iptables to build
+  # the network for the containers it starts.
+  iptables \
   git \
   less \
   nodejs \
@@ -43,6 +46,25 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
   sudo \
   && rm -rf /var/lib/apt/lists/*
 
+# >>> docker-in-docker (sysbox): install the Docker ENGINE (dockerd), not just
+# the CLI. This container runs its own daemon and never mounts the host's
+# docker socket. On a Sysbox host that daemon is confined to this container's
+# user namespace, so no --privileged is needed on the host side.
+RUN install -m 0755 -d /etc/apt/keyrings \
+  && curl -fsSL https://download.docker.com/linux/debian/gpg -o /etc/apt/keyrings/docker.asc \
+  && chmod a+r /etc/apt/keyrings/docker.asc \
+  && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/debian $(awk -F= '/^VERSION_CODENAME/{print $2}' /etc/os-release) stable" \
+       > /etc/apt/sources.list.d/docker.list \
+  && apt-get update \
+  && apt-get install -y --no-install-recommends \
+       docker-ce \
+       docker-ce-cli \
+       containerd.io \
+       docker-buildx-plugin \
+       docker-compose-plugin \
+  && rm -rf /var/lib/apt/lists/* \
+  && rm -f /usr/sbin/policy-rc.d
+
 # Replace the base image's 'bun' user (UID 1000) with 'openchamber'
 # so mounted volumes with 1000:1000 ownership work correctly.
 RUN userdel bun \
@@ -50,10 +72,11 @@ RUN userdel bun \
   && useradd -u 1000 -g 1000 -m -s /bin/bash openchamber \
   && chown -R openchamber:openchamber /home/openchamber
 
-# >>> docker access: use the host's docker group GID (982) so the mounted
-# socket (root:982, mode 660 at /var/run/docker.sock) is usable by openchamber.
-# The previous auto-assigned GID (1001) did not match, causing "permission denied".
-RUN groupadd -f -g 982 docker && usermod -aG docker openchamber
+# >>> docker-in-docker (sysbox): let openchamber use the INNER dockerd's
+# socket. dockerd creates /var/run/docker.sock as root:docker, so join the
+# 'docker' group. docker-ce already created it, so pin its GID (982).
+RUN if getent group docker >/dev/null; then groupmod -g 982 docker; else groupadd -g 982 docker; fi \
+  && usermod -aG docker openchamber
 
 # Allow the openchamber user to install packages and write outside $HOME.
 # !requiretty keeps it working for non-interactive tool invocations.
@@ -70,8 +93,9 @@ USER openchamber
 
 ENV NPM_CONFIG_PREFIX=/home/openchamber/.npm-global
 ENV PATH=${NPM_CONFIG_PREFIX}/bin:${PATH}
-# >>> docker access: default the client at the socket the compose mounts
-ENV DOCKER_HOST=unix:///var/run/docker.sock
+# >>> docker-in-docker (sysbox): the client talks to the daemon running in THIS
+# container (started below), not to the host's.
+# ENV DOCKER_HOST=unix:///var/run/docker.sock
 
 RUN npm config set prefix /home/openchamber/.npm-global && mkdir -p /home/openchamber/.npm-global && \
   mkdir -p /home/openchamber/.local /home/openchamber/.config /home/openchamber/.ssh && \
@@ -87,6 +111,32 @@ ENV LANG=C.UTF-8
 
 COPY scripts/docker-entrypoint.sh /home/openchamber/openchamber-entrypoint.sh
 
+# >>> docker-in-docker (sysbox): wrapper ENTRYPOINT. It starts the inner
+# dockerd (via sudo, inside the container's user namespace), waits for it to
+# answer, then hands off to the normal OpenChamber entrypoint unchanged.
+RUN cat > /home/openchamber/dind-entrypoint.sh <<'SCRIPT'
+#!/bin/sh
+set -eu
+
+sudo dockerd \
+  --host=unix:///var/run/docker.sock \
+  --storage-driver="vfs" \
+  >/tmp/dockerd.log 2>&1 &
+
+tries=0
+until docker info >/dev/null 2>&1; do
+  tries=$((tries + 1))
+  if [ "$tries" -ge 60 ]; then
+    echo "inner dockerd did not become ready; last log lines:" >&2
+    tail -n 50 /tmp/dockerd.log >&2 || true
+    exit 1
+  fi
+  sleep 1
+done
+
+exec sh /home/openchamber/openchamber-entrypoint.sh "$@"
+SCRIPT
+
 COPY --from=builder /app/node_modules ./node_modules
 COPY --from=builder /app/packages/web/node_modules ./packages/web/node_modules
 COPY --from=builder /app/package.json ./package.json
@@ -99,5 +149,5 @@ COPY --from=builder /app/packages/web/dist ./packages/web/dist
 
 EXPOSE 3000
 
-ENTRYPOINT ["sh", "/home/openchamber/openchamber-entrypoint.sh"]
+ENTRYPOINT ["sh", "/home/openchamber/dind-entrypoint.sh"]
 

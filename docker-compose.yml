@@ -4,7 +4,15 @@ services:
       context: .
       dockerfile: Dockerfile
     container_name: openchamber
-    userns_mode: keep-id
+    # >>> docker-in-docker (sysbox): Sysbox system container. `sysbox-runc`
+    # must be installed and registered as a runtime on the host. Sysbox gives
+    # the container its own user namespace, so the inner Docker daemon (and the
+    # containers it builds) run isolated without --privileged.
+    #
+    # NOTE: `userns_mode: keep-id` was removed. That is Podman syntax; under
+    # Docker the user namespace is managed by the Sysbox runtime and passing it
+    # makes `docker compose up` fail.
+    runtime: sysbox-runc
     ports:
       - "3000:3000"
     extra_hosts:
@@ -16,11 +24,14 @@ services:
       - ./data/opencode/config:/home/openchamber/.config/opencode
       - ./data/ssh:/home/openchamber/.ssh
       - ./workspaces:/home/openchamber/workspaces
-      - /var/run/docker.sock:/var/run/docker.sock
+      # >>> docker-in-docker (sysbox): the inner daemon's image/container store.
+      # The host's /var/run/docker.sock is intentionally NOT mounted: the inner
+      # dockerd owns that path, and mounting the host socket would both defeat
+      # the isolation and stop the inner daemon from binding.
+      - ./data/docker:/var/lib/docker
     environment:
       OPENCHAMBER_UI_PASSWORD: ${OPENCHAMBER_UI_PASSWORD:?Set OPENCHAMBER_UI_PASSWORD before exposing OpenChamber through Docker}
-      DOCKER_HOST: unix:///var/run/docker.sock
-      OPENCHAMBER_TUNNEL_PROVIDER: ngrok
-      OPENCHAMBER_TUNNEL_MODE: quick
+      # OPENCHAMBER_TUNNEL_PROVIDER: ngrok
+      # OPENCHAMBER_TUNNEL_MODE: quick
     restart: unless-stopped
 
