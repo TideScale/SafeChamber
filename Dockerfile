@@ -47,14 +47,18 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
   && rm -rf /var/lib/apt/lists/*
 
 # >>> docker-in-docker (sysbox): install the Docker ENGINE (dockerd), not just
-# the CLI. This container runs its own daemon and never mounts the host's
-# docker socket. On a Sysbox host that daemon is confined to this container's
-# user namespace, so no --privileged is needed on the host side.
+# the CLI, following Docker's official Debian instructions
+# (https://docs.docker.com/engine/install/debian/). This container runs its own
+# daemon and never mounts the host's docker socket. On a Sysbox host that
+# daemon is confined to this container's user namespace, so no --privileged is
+# needed on the host side.
 RUN install -m 0755 -d /etc/apt/keyrings \
   && curl -fsSL https://download.docker.com/linux/debian/gpg -o /etc/apt/keyrings/docker.asc \
   && chmod a+r /etc/apt/keyrings/docker.asc \
-  && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/debian $(awk -F= '/^VERSION_CODENAME/{print $2}' /etc/os-release) stable" \
-       > /etc/apt/sources.list.d/docker.list \
+  && printf 'Types: deb\nURIs: https://download.docker.com/linux/debian\nSuites: %s\nComponents: stable\nArchitectures: %s\nSigned-By: /etc/apt/keyrings/docker.asc\n' \
+       "$(. /etc/os-release && echo "\$VERSION_CODENAME")" \
+       "$(dpkg --print-architecture)" \
+       > /etc/apt/sources.list.d/docker.sources \
   && apt-get update \
   && apt-get install -y --no-install-recommends \
        docker-ce \
