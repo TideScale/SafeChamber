@@ -24,6 +24,7 @@ type UpdateState = {
   available: boolean;
   downloading: boolean;
   downloaded: boolean;
+  installing: boolean;
   info: UpdateInfo | null;
   progress: UpdateProgress | null;
   error: string | null;
@@ -139,7 +140,7 @@ function mapRuntimeParams(runtime: ClientRuntime): URLSearchParams {
   return params;
 }
 
-function parseUpdateCheckResponse(data: {
+export function parseUpdateCheckResponse(data: {
   available?: boolean;
   version?: string;
   currentVersion?: string;
@@ -164,7 +165,11 @@ function parseUpdateCheckResponse(data: {
         : undefined,
     packageManager: data.packageManager,
     updateCommand: data.updateCommand,
-    installBlocked: data.installBlocked === 'service-manager' ? 'service-manager' : undefined,
+    installBlocked: data.installBlocked === 'service-manager'
+      || data.installBlocked === 'manual-install'
+      || data.installBlocked === 'desktop-host'
+      ? data.installBlocked
+      : undefined,
   };
 }
 
@@ -240,6 +245,7 @@ const initialState: UpdateState = {
   available: false,
   downloading: false,
   downloaded: false,
+  installing: false,
   info: null,
   progress: null,
   error: null,
@@ -355,13 +361,16 @@ export const useUpdateStore = create<UpdateStore>()((set, get) => ({
   },
 
   restartToUpdate: async () => {
-    const { downloaded, runtimeType } = get();
+    const { downloaded, installing, runtimeType } = get();
 
-    if (runtimeType !== 'desktop' || !downloaded) {
+    // A restart is already in flight: the app is shutting down, so a second
+    // click must not invoke the updater again. The main process guards the
+    // same race; this keeps the dialog in its restarting state.
+    if (runtimeType !== 'desktop' || !downloaded || installing) {
       return;
     }
 
-    set({ error: null });
+    set({ error: null, installing: true });
 
     try {
       const ok = await restartToApplyUpdate();
@@ -372,12 +381,12 @@ export const useUpdateStore = create<UpdateStore>()((set, get) => ({
     } catch (error) {
       // Keep the real installer failure; the dialog shows it and the button
       // stays clickable for another attempt.
-      set({ error: getUpdateInstallErrorMessage(error instanceof Error ? error : new Error(String(error))) });
+      set({ installing: false, error: getUpdateInstallErrorMessage(error instanceof Error ? error : new Error(String(error))) });
     }
   },
 
   dismiss: () => {
-    set({ available: false, downloaded: false, info: null });
+    set({ available: false, downloaded: false, installing: false, info: null });
   },
 
   reset: () => {

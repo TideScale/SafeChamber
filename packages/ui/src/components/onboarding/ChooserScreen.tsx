@@ -8,10 +8,12 @@ import { loadDesktopSettings, updateDesktopSettings } from '@/lib/persistence';
 import { copyTextToClipboard } from '@/lib/clipboard';
 import { restartDesktopApp } from '@/lib/desktop';
 import { cn } from '@/lib/utils';
+import { useWaitingBlink } from '@/hooks/useDurationTicker';
 import { RemoteConnectionForm } from './RemoteConnectionForm';
 import { desktopHostsGet, desktopHostsSet } from '@/lib/desktopHosts';
 import { useI18n } from '@/lib/i18n';
 import { runtimeFetch } from '@/lib/runtime-fetch';
+import { useEnterprisePolicyStore } from '@/stores/useEnterprisePolicyStore';
 
 const INSTALL_COMMAND = 'curl -fsSL https://opencode.ai/v2/install | bash';
 const WINDOWS_INSTALL_COMMAND = 'npm install -g @opencode/cli';
@@ -29,7 +31,7 @@ type ChooserScreenProps = {
 function InstallCommand({ windows, onCopy, copyTitle }: { windows: boolean; onCopy: () => void; copyTitle: string }) {
   return (
     <div className="flex items-center justify-between gap-3 w-full">
-      <code className="flex-1 min-w-0 text-left overflow-x-auto whitespace-nowrap">
+      <code className="flex-1 min-w-0 text-start overflow-x-auto whitespace-nowrap">
         {windows ? (
           <span style={{ color: 'var(--syntax-keyword)' }}>{WINDOWS_INSTALL_COMMAND}</span>
         ) : (
@@ -54,6 +56,12 @@ function InstallCommand({ windows, onCopy, copyTitle }: { windows: boolean; onCo
   );
 }
 
+// Its own component: the blink re-renders this dot once a second, not the whole screen.
+function WatchingDot() {
+  const blink = useWaitingBlink(true);
+  return <span className={cn('absolute inset-0 rounded-full', blink)} style={{ backgroundColor: 'var(--primary-base)' }} />;
+}
+
 export function ChooserScreen({ onCliAvailable, localAvailable = true }: ChooserScreenProps) {
   const { t } = useI18n();
   const [copied, setCopied] = React.useState(false);
@@ -61,6 +69,8 @@ export function ChooserScreen({ onCliAvailable, localAvailable = true }: Chooser
   const [isApplyingPath, setIsApplyingPath] = React.useState(false);
   const [isManualChecking, setIsManualChecking] = React.useState(false);
   const [opencodeBinary, setOpencodeBinary] = React.useState('');
+  // The server ignores the user's path while the administrator pins one.
+  const pinnedBinary = useEnterprisePolicyStore((state) => state.opencodeBinary);
   const [platform, setPlatform] = React.useState<OnboardingPlatform>('unknown');
   const [activeTab, setActiveTab] = React.useState<'local' | 'remote'>(() => localAvailable ? 'local' : 'remote');
   const [advancedOpen, setAdvancedOpen] = React.useState(false);
@@ -297,7 +307,7 @@ export function ChooserScreen({ onCliAvailable, localAvailable = true }: Chooser
             {platform === 'windows' && (
               <div className="mb-4 rounded-lg border border-border p-4">
                 <div className="text-sm text-foreground">{t('onboarding.localSetup.windows.title')}</div>
-                <ol className="mt-2 list-decimal space-y-1 pl-5 text-sm text-muted-foreground">
+                <ol className="mt-2 list-decimal space-y-1 ps-5 text-sm text-muted-foreground">
                   <li>{t('onboarding.localSetup.windows.stepRunInstallInWsl')}</li>
                   <li>{t('onboarding.localSetup.windows.stepSetBinaryPath')}</li>
                 </ol>
@@ -321,10 +331,7 @@ export function ChooserScreen({ onCliAvailable, localAvailable = true }: Chooser
 
             <div className="app-region-no-drag mt-3 flex items-center gap-2.5 px-1" role="status" aria-live="polite">
               <span className="relative inline-flex h-2 w-2 shrink-0" aria-hidden>
-                <span
-                  className="absolute inset-0 rounded-full"
-                  style={{ backgroundColor: 'var(--primary-base)', animation: 'pulse-opacity 1.6s ease-in-out infinite' }}
-                />
+                <WatchingDot />
               </span>
               <span className="min-w-0 flex-1 text-xs text-muted-foreground">
                 <span className="text-foreground">{t('onboarding.localSetup.status.watching')}</span>
@@ -354,20 +361,26 @@ export function ChooserScreen({ onCliAvailable, localAvailable = true }: Chooser
                 <div className="space-y-2 pb-4">
                   <div className="flex gap-2">
                     <Input
-                      value={opencodeBinary}
+                      value={pinnedBinary ?? opencodeBinary}
                       onChange={(e) => setOpencodeBinary(e.target.value)}
                       placeholder={binaryPlaceholder}
-                      disabled={isApplyingPath}
+                      disabled={isApplyingPath || pinnedBinary !== null}
                       className="flex-1 font-mono text-xs"
                     />
-                    <Button type="button" variant="secondary" size="sm" onClick={handleBrowse} disabled={isApplyingPath || !isDesktopApp}>
-                      {t('onboarding.localSetup.actions.browse')}
-                    </Button>
-                    <Button type="button" size="sm" onClick={handleApplyPath} disabled={isApplyingPath || !opencodeBinary.trim()}>
-                      {t('onboarding.localSetup.actions.apply')}
-                    </Button>
+                    {pinnedBinary === null && (
+                      <>
+                        <Button type="button" variant="secondary" size="sm" onClick={handleBrowse} disabled={isApplyingPath || !isDesktopApp}>
+                          {t('onboarding.localSetup.actions.browse')}
+                        </Button>
+                        <Button type="button" size="sm" onClick={handleApplyPath} disabled={isApplyingPath || !opencodeBinary.trim()}>
+                          {t('onboarding.localSetup.actions.apply')}
+                        </Button>
+                      </>
+                    )}
                   </div>
-                  <p className="text-xs text-muted-foreground/70">{t('onboarding.localSetup.helper.saveAndReload')}</p>
+                  <p className="text-xs text-muted-foreground/70">
+                    {t(pinnedBinary === null ? 'onboarding.localSetup.helper.saveAndReload' : 'onboarding.localSetup.helper.pinnedByAdministrator')}
+                  </p>
                 </div>
               </details>
               <details
@@ -379,7 +392,7 @@ export function ChooserScreen({ onCliAvailable, localAvailable = true }: Chooser
                   <span>{t('onboarding.localSetup.troubleshoot.title')}</span>
                   <Icon name="arrow-down-s" className="h-4 w-4 transition-transform group-open:rotate-180" />
                 </summary>
-                <ul className="list-disc space-y-1.5 pb-4 pl-4 text-xs text-muted-foreground">
+                <ul className="list-disc space-y-1.5 pb-4 ps-4 text-xs text-muted-foreground">
                   {platform === 'windows' ? (
                     <li>{t('onboarding.localSetup.windows.hintDetectionFailed')}</li>
                   ) : (

@@ -1,6 +1,9 @@
 import { OPENCHAMBER_SDK_API_VERSION, OPENCHAMBER_SDK_CHANNEL } from './api-version.ts';
-import { GUEST_STORAGE_KEY_MAX, GUEST_STORAGE_VALUE_BYTES, type GuestProjectsSnapshot, type GuestWorktreesSnapshot, type GuestSessionsSnapshot, type GuestWorkspaceQuery, type GuestWorkspaceSnapshot, type GuestStorageRequest, type GuestStorageResult } from './workspace.ts';
+import { GUEST_STORAGE_KEY_MAX, GUEST_STORAGE_VALUE_BYTES, type GuestProjectsSnapshot, type GuestWorktreesSnapshot, type GuestSessionsSnapshot, type GuestWorkspaceQuery, type GuestWorkspaceSnapshot, type GuestStorageOptions, type GuestStorageRequest, type GuestStorageResult } from './workspace.ts';
+import type { GuestStatusControl, GuestStatusControlEvent } from './status-controls.ts';
+import { isGuestStatusControls } from './status-controls.ts';
 import type { JsonValue } from './contract.ts';
+import { isGuestPopoverRequest, type GuestPopoverClosedEvent, type GuestPopoverRequest } from './popover.ts';
 import {
   GUEST_FILE_EDITOR_CONTENT_MAX,
   GUEST_FILE_EDITOR_VERSION_MAX,
@@ -61,6 +64,7 @@ import {
   type FileWriteResult,
   type GenerateRequest,
   type GenerateResult,
+  type LateGenerateResult,
   isGenerateResult,
   isFileListResult,
   isFileReadResult,
@@ -72,6 +76,7 @@ import {
   isPromptResult,
   isStartSessionResult,
 } from './contract.ts';
+import { GUEST_SHELL_ID_MAX, GUEST_SHELL_OUTPUT_TAIL_MAX, type GuestRunningShellsSnapshot, type GuestShellOutputResult, type GuestShellStopResult, type GuestShellsScope } from './shells.ts';
 
 export type HostFrame = {
   addEventListener: Window['addEventListener'];
@@ -97,12 +102,15 @@ export type HostClient = {
   onProjects: (listener: (snapshot: GuestProjectsSnapshot) => void) => Promise<() => void>;
   onWorktrees: (projectId: string, listener: (snapshot: GuestWorktreesSnapshot) => void) => Promise<() => void>;
   onSessions: (projectId: string, listener: (snapshot: GuestSessionsSnapshot) => void) => Promise<() => void>;
+  onRunningShells: (scope: GuestShellsScope, listener: (snapshot: GuestRunningShellsSnapshot) => void) => Promise<() => void>;
+  readShellOutput: (shellId: string, options?: { cursor?: number; tailBytes?: number }) => Promise<GuestShellOutputResult>;
+  stopShell: (shellId: string) => Promise<GuestShellStopResult>;
   openSession: (sessionId: string) => Promise<void>;
   storage: {
-    get: (key: string) => Promise<JsonValue | undefined>;
-    set: (key: string, value: JsonValue) => Promise<void>;
-    delete: (key: string) => Promise<void>;
-    keys: () => Promise<string[]>;
+    get: (key: string, options?: GuestStorageOptions) => Promise<JsonValue | undefined>;
+    set: (key: string, value: JsonValue, options?: GuestStorageOptions) => Promise<void>;
+    delete: (key: string, options?: GuestStorageOptions) => Promise<void>;
+    keys: (options?: GuestStorageOptions) => Promise<string[]>;
   };
   onReady: (listener: (context: HostReadyContext) => void) => () => void;
   onDirectory: (listener: (directory: string | null) => void) => () => void;
@@ -116,6 +124,14 @@ export type HostClient = {
    * the last value; `null` when there is none.
    */
   onItem: (listener: (item: GuestItem | null) => void) => () => void;
+  /** Receive activation of a host-rendered Work Status control. */
+  onStatusControl: (listener: (event: GuestStatusControlEvent) => void) => () => void;
+  onPopoverClosed: (listener: (event: GuestPopoverClosedEvent) => void) => () => void;
+  /** Replace this status frame's host-rendered controls. Pass [] to clear them. */
+  setStatusControls: (controls: GuestStatusControl[]) => Promise<void>;
+  openPopover: (request: GuestPopoverRequest) => Promise<void>;
+  closePopover: (id: string, reason?: 'closed' | 'escape') => Promise<void>;
+  setPopoverAnchorActive: (id: string, active: boolean) => Promise<void>;
   /**
    * Answer the host when the user submits one of this package's
    * `contributes.commands`. Return the chip to attach, or `null` for nothing
@@ -138,6 +154,11 @@ export type HostClient = {
    * Diff view `UNSUPPORTED`.
    */
   openCommit: (sha: string) => Promise<void>;
+  /**
+   * Show a context panel surface (`git`, or `plugin:<panel id>`). Resolves once
+   * it is on screen; one already open stays open. No chat or project yet is
+   * `NO_DIRECTORY`, a surface that cannot open here `UNSUPPORTED`.
+   */
   openSurface: (surfaceId: string) => Promise<void>;
   writeClipboard: (text: string) => Promise<void>;
   compose: (request: ComposeRequest) => Promise<void>;
@@ -177,6 +198,19 @@ export type HostClient = {
    * failed is `MODEL_FAILED`. Waits up to `GUEST_GENERATE_TIMEOUT_MS`.
    */
   generate: (request: GenerateRequest) => Promise<GenerateResult>;
+  /**
+   * `generate` outcomes that arrived after the frame that asked was gone:
+   * the user closed the panel, or the frame reloaded, before the model
+   * answered. The host keeps each one for a frame of this extension on the
+   * same surface and project and hands it over once, up to
+   * `GUEST_GENERATE_LATE_MAX` per extension for `GUEST_GENERATE_LATE_KEEP_MS`.
+   * One that lands while this frame listens arrives at once. Register when
+   * the frame can use them; the host hands nothing over before the first
+   * listener, or on a host without `ready.features.lateGenerateResults`.
+   * One that arrives after the last listener was removed waits in this frame
+   * for the next listener.
+   */
+  onLateGenerateResult: (listener: (result: LateGenerateResult) => void) => () => void;
   /** Number on this guest's rail icon (0 to `GUEST_BADGE_MAX`); `null` clears it. Opening the panel clears it too. */
   setBadge: (count: number | null) => Promise<void>;
   /**
@@ -245,6 +279,16 @@ const rejectBadFilePath = (): Promise<never> => Promise.reject(
   new HostRequestError('BAD_PATH', `File path must be 1 to ${GUEST_FILE_PATH_MAX} characters without NUL or backslash.`),
 );
 
+const deviceStorageScope = (options: GuestStorageOptions | undefined): 'device' | undefined => {
+  // Typed callers supply GuestStorageOptions, but extensions may call this JavaScript API without TypeScript.
+  if (options === undefined) return undefined;
+  if (Object(options) !== options || Array.isArray(options)
+    || (options.scope !== undefined && options.scope !== 'instance' && options.scope !== 'device')) {
+    throw new HostRequestError('HOST_REJECTED', 'Storage scope must be "instance" or "device".');
+  }
+  return options.scope === 'device' ? 'device' : undefined;
+};
+
 const nextId = (n: { value: number }): string => {
   n.value += 1;
   return `oc-${n.value}`;
@@ -265,6 +309,12 @@ export const connectHost = (options: HostClientOptions = {}): HostClient => {
   const connectionListeners = new Set<(connection: GuestConnection) => void>();
   const settingsListeners = new Set<(settings: GuestSettings) => void>();
   const itemListeners = new Set<(item: GuestItem | null) => void>();
+  const statusControlListeners = new Set<(event: GuestStatusControlEvent) => void>();
+  const popoverClosedListeners = new Set<(event: GuestPopoverClosedEvent) => void>();
+  const lateGenerateListeners = new Set<(result: LateGenerateResult) => void>();
+  // Answers the host handed over after the last listener left; each one comes
+  // from a `generate` this extension made.
+  const unclaimedLateGenerate: LateGenerateResult[] = [];
   let resolveHandler: ((request: ResolveRequest) => Promise<AttachIssueRequest | null> | AttachIssueRequest | null) | null = null;
   let actionHandler: ((item: GuestActionItem) => void | Promise<void>) | null = null;
   const fileOpenListeners = new Set<(file: FileEditorDocument) => void>();
@@ -274,10 +324,14 @@ export const connectHost = (options: HostClientOptions = {}): HostClient => {
   let saveShortcutInstalled = false;
   const pending = new Map<string, Pending>();
   const workspaceListeners = new Map<string, (snapshot: GuestWorkspaceSnapshot) => void>();
+  const shellsListeners = new Map<string, (snapshot: GuestRunningShellsSnapshot) => void>();
   let disposed = false;
   const ids = { value: 0 };
   let lastReady: HostReadyContext | null = null;
   let lastLifecycle: SessionLifecycleEvent | null = null;
+  let popoverPointerActive = false;
+  let popoverFocusActive = false;
+  let popoverActivityReported: boolean | null = null;
 
   const lifecycleFromSession = (session: SessionSnapshot | null): SessionLifecycleEvent | null => {
     if (!session) return null;
@@ -289,6 +343,14 @@ export const connectHost = (options: HostClientOptions = {}): HostClient => {
 
   const post = (message: GuestMessage): void => {
     target.parent.postMessage(message, '*');
+  };
+
+  // Sent again on every `ready`: the host forgets a listening frame when it
+  // re-attaches, and the notice costs nothing to repeat.
+  const listenForLateGenerate = (): void => {
+    if (disposed || target.parent === target || lateGenerateListeners.size === 0
+      || lastReady?.features?.lateGenerateResults !== true) return;
+    post({ channel: OPENCHAMBER_SDK_CHANNEL, v: OPENCHAMBER_SDK_API_VERSION, type: 'generate-late-listen' });
   };
 
   // One listener that throws must not starve the ones after it; the error
@@ -314,6 +376,12 @@ export const connectHost = (options: HostClientOptions = {}): HostClient => {
       return;
     }
 
+    if (message.type === 'shells') {
+      const listener = shellsListeners.get(message.payload.subscriptionId);
+      if (listener) emit([listener], message.payload.snapshot);
+      return;
+    }
+
     if (message.type === 'ready') {
       lastReady = message.payload;
       lastLifecycle = lifecycleFromSession(message.payload.session);
@@ -326,6 +394,14 @@ export const connectHost = (options: HostClientOptions = {}): HostClient => {
       emit(connectionListeners, message.payload.connection);
       emit(settingsListeners, message.payload.settings);
       emit(itemListeners, message.payload.item);
+      listenForLateGenerate();
+      return;
+    }
+
+    if (message.type === 'generate-late') {
+      // The host already let go of it; keep it for the next listener.
+      if (lateGenerateListeners.size === 0) unclaimedLateGenerate.push(message.payload);
+      else emit(lateGenerateListeners, message.payload);
       return;
     }
 
@@ -377,6 +453,16 @@ export const connectHost = (options: HostClientOptions = {}): HostClient => {
         lastReady = { ...lastReady, item: message.payload.item };
       }
       emit(itemListeners, message.payload.item);
+      return;
+    }
+
+    if (message.type === 'status-control-event') {
+      emit(statusControlListeners, message.payload);
+      return;
+    }
+
+    if (message.type === 'popover-closed') {
+      emit(popoverClosedListeners, message.payload);
       return;
     }
 
@@ -527,6 +613,39 @@ export const connectHost = (options: HostClientOptions = {}): HostClient => {
     event.preventDefault();
     requestFileSave();
   };
+  const onPopoverEscape = (event: Event): void => {
+    if (!isKeyEvent(event) || event.key !== 'Escape' || lastReady?.surface !== 'popover' || !lastReady.popover) return;
+    event.preventDefault();
+    void closePopover(lastReady.popover.id, 'escape').catch(() => undefined);
+  };
+  const reportPopoverActivity = (): void => {
+    const popover = lastReady?.surface === 'popover' ? lastReady.popover : undefined;
+    if (!popover) return;
+    const active = popoverPointerActive || popoverFocusActive;
+    if (popoverActivityReported === active) return;
+    popoverActivityReported = active;
+    void setPopoverAnchorActive(popover.id, active).catch(() => undefined);
+  };
+  const onPopoverPointerOver = (): void => {
+    if (lastReady?.surface !== 'popover' || popoverPointerActive) return;
+    popoverPointerActive = true;
+    reportPopoverActivity();
+  };
+  const onPopoverPointerOut = (event: PointerEvent): void => {
+    if (lastReady?.surface !== 'popover' || event.relatedTarget !== null || !popoverPointerActive) return;
+    popoverPointerActive = false;
+    reportPopoverActivity();
+  };
+  const onPopoverFocus = (): void => {
+    if (lastReady?.surface !== 'popover' || popoverFocusActive) return;
+    popoverFocusActive = true;
+    reportPopoverActivity();
+  };
+  const onPopoverBlur = (): void => {
+    if (lastReady?.surface !== 'popover' || !popoverFocusActive) return;
+    popoverFocusActive = false;
+    reportPopoverActivity();
+  };
   const requireIdentity = (value: string, maximum = 1024): void => {
     if (!value.trim() || value.length > maximum) throw new HostRequestError('HOST_REJECTED', `Identity must contain 1 to ${maximum} characters.`);
   };
@@ -554,6 +673,23 @@ export const connectHost = (options: HostClientOptions = {}): HostClient => {
       post({ ...envelope, type: 'workspace-unsubscribe', id: nextId(ids), payload: { subscriptionId } });
     };
   };
+  const subscribeShells = async (scope: GuestShellsScope, listener: (snapshot: GuestRunningShellsSnapshot) => void): Promise<() => void> => {
+    if (scope.kind === 'session') requireIdentity(scope.sessionId);
+    if (scope.kind === 'project') requireIdentity(scope.projectId);
+    const subscriptionId = nextId(ids);
+    shellsListeners.set(subscriptionId, listener);
+    try {
+      await request({ ...envelope, type: 'shells-subscribe', id: nextId(ids), payload: { subscriptionId, scope } });
+    } catch (error) {
+      shellsListeners.delete(subscriptionId);
+      if (!disposed) post({ ...envelope, type: 'shells-unsubscribe', id: nextId(ids), payload: { subscriptionId } });
+      throw error;
+    }
+    return () => {
+      if (!shellsListeners.delete(subscriptionId) || disposed) return;
+      post({ ...envelope, type: 'shells-unsubscribe', id: nextId(ids), payload: { subscriptionId } });
+    };
+  };
   const storage = async (payload: GuestStorageRequest): Promise<GuestStorageResult> => {
     if ('key' in payload && (payload.key.length === 0 || payload.key.length > GUEST_STORAGE_KEY_MAX)) {
       throw new HostRequestError('HOST_REJECTED', 'Storage key must contain 1 to 128 characters.');
@@ -564,10 +700,29 @@ export const connectHost = (options: HostClientOptions = {}): HostClient => {
     if (payload.op === 'set' && new TextEncoder().encode(JSON.stringify(payload.value)).length > GUEST_STORAGE_VALUE_BYTES) {
       throw new HostRequestError('HOST_REJECTED', 'Storage value exceeds 64 KiB.');
     }
+    if (payload.scope === 'device' && lastReady?.features?.deviceStorage !== true) {
+      throw new HostRequestError('UNSUPPORTED', 'This host does not support device storage.');
+    }
     const result = await send({ ...envelope, type: 'storage', id: nextId(ids), payload });
     if (!result || !('storage' in result) || result.op !== payload.op) throw new HostRequestError('HOST_REJECTED', 'Host did not return storage data.');
     return result;
   };
+  const closePopover = (id: string, reason?: 'closed' | 'escape'): Promise<void> => (
+    lastReady?.features?.popovers !== true && !(lastReady?.surface === 'popover' && lastReady.popover?.id === id)
+      ? Promise.reject(new HostRequestError('UNSUPPORTED', 'This host does not support popovers.'))
+      : request({ ...envelope, type: 'popover-close', id: nextId(ids), payload: reason ? { id, reason } : { id } })
+  );
+  const setPopoverAnchorActive = (id: string, active: boolean): Promise<void> => (
+    lastReady?.features?.popovers !== true && !(lastReady?.surface === 'popover' && lastReady.popover?.id === id)
+      ? Promise.reject(new HostRequestError('UNSUPPORTED', 'This host does not support popovers.'))
+      : request({ ...envelope, type: 'popover-anchor', id: nextId(ids), payload: { id, active } })
+  );
+  target.addEventListener('keydown', onPopoverEscape, true);
+  target.addEventListener('pointerover', onPopoverPointerOver);
+  target.addEventListener('pointermove', onPopoverPointerOver);
+  target.addEventListener('pointerout', onPopoverPointerOut);
+  target.addEventListener('focus', onPopoverFocus);
+  target.addEventListener('blur', onPopoverBlur);
 
   return {
     onAction: (handler) => {
@@ -592,19 +747,59 @@ export const connectHost = (options: HostClientOptions = {}): HostClient => {
     onProjects: (listener) => subscribeWorkspace({ kind: 'projects' }, (snapshot) => { if (snapshot.kind === 'projects') listener(snapshot); }),
     onWorktrees: (projectId, listener) => subscribeWorkspace({ kind: 'worktrees', projectId }, (snapshot) => { if (snapshot.kind === 'worktrees') listener(snapshot); }),
     onSessions: (projectId, listener) => subscribeWorkspace({ kind: 'sessions', projectId }, (snapshot) => { if (snapshot.kind === 'sessions') listener(snapshot); }),
+    onRunningShells: (scope, listener) => subscribeShells(scope, listener),
+    readShellOutput: async (shellId, options) => {
+      requireIdentity(shellId, GUEST_SHELL_ID_MAX);
+      const cursor = options?.cursor;
+      if (cursor !== undefined && (!Number.isInteger(cursor) || cursor < 0)) {
+        throw new HostRequestError('HOST_REJECTED', 'Shell output cursor must be a non-negative integer.');
+      }
+      const tailBytes = options?.tailBytes;
+      if (tailBytes !== undefined && (!Number.isInteger(tailBytes) || tailBytes < 1 || tailBytes > GUEST_SHELL_OUTPUT_TAIL_MAX)) {
+        throw new HostRequestError('HOST_REJECTED', `Shell output tailBytes must be an integer between 1 and ${GUEST_SHELL_OUTPUT_TAIL_MAX}.`);
+      }
+      const result = await send({ ...envelope, type: 'shell-output', id: nextId(ids), payload: { shellId, cursor, tailBytes } });
+      const output = result as GuestShellOutputResult | undefined;
+      if (!output || typeof output.output !== 'string' || !Number.isFinite(output.cursor)) {
+        throw new HostRequestError('HOST_REJECTED', 'Host did not return shell output.');
+      }
+      return output;
+    },
+    stopShell: async (shellId) => {
+      requireIdentity(shellId, GUEST_SHELL_ID_MAX);
+      const result = (await send({ ...envelope, type: 'shell-stop', id: nextId(ids), payload: { shellId } })) as GuestShellStopResult | undefined;
+      if (result?.stopped !== true) throw new HostRequestError('HOST_REJECTED', 'Host did not stop the shell.');
+      return { stopped: true as const };
+    },
     openSession: async (sessionId) => {
       requireIdentity(sessionId);
       await request({ ...envelope, type: 'open-session', id: nextId(ids), payload: { sessionId } });
     },
     storage: {
-      get: async (key) => {
-        const result = await storage({ op: 'get', key });
+      get: async (key, options) => {
+        const scope = deviceStorageScope(options);
+        const payload: GuestStorageRequest = { op: 'get', key };
+        if (scope) payload.scope = scope;
+        const result = await storage(payload);
         return result.op === 'get' && result.found ? result.value : undefined;
       },
-      set: async (key, value) => { await storage({ op: 'set', key, value }); },
-      delete: async (key) => { await storage({ op: 'delete', key }); },
-      keys: async () => {
-        const result = await storage({ op: 'keys' });
+      set: async (key, value, options) => {
+        const scope = deviceStorageScope(options);
+        const payload: GuestStorageRequest = { op: 'set', key, value };
+        if (scope) payload.scope = scope;
+        await storage(payload);
+      },
+      delete: async (key, options) => {
+        const scope = deviceStorageScope(options);
+        const payload: GuestStorageRequest = { op: 'delete', key };
+        if (scope) payload.scope = scope;
+        await storage(payload);
+      },
+      keys: async (options) => {
+        const scope = deviceStorageScope(options);
+        const payload: GuestStorageRequest = { op: 'keys' };
+        if (scope) payload.scope = scope;
+        const result = await storage(payload);
         if (result.op !== 'keys') throw new HostRequestError('HOST_REJECTED', 'Expected storage keys.');
         return result.keys;
       },
@@ -658,6 +853,36 @@ export const connectHost = (options: HostClientOptions = {}): HostClient => {
         itemListeners.delete(listener);
       };
     },
+    onStatusControl: (listener) => {
+      statusControlListeners.add(listener);
+      return () => {
+        statusControlListeners.delete(listener);
+      };
+    },
+    onPopoverClosed: (listener) => {
+      popoverClosedListeners.add(listener);
+      return () => { popoverClosedListeners.delete(listener); };
+    },
+    setStatusControls: (controls) => {
+      if (lastReady?.features?.statusControls !== true) {
+        return Promise.reject(new HostRequestError('UNSUPPORTED', 'This host does not support status controls.'));
+      }
+      if (!isGuestStatusControls(controls)) {
+        return Promise.reject(new HostRequestError('HOST_REJECTED', 'Status controls must have unique bounded ids and valid selected options.'));
+      }
+      return request({ ...envelope, type: 'status-controls', id: nextId(ids), payload: { controls } });
+    },
+    openPopover: (payload) => {
+      if (lastReady?.features?.popovers !== true) {
+        return Promise.reject(new HostRequestError('UNSUPPORTED', 'This host does not support popovers.'));
+      }
+      if (!isGuestPopoverRequest(payload)) {
+        return Promise.reject(new HostRequestError('HOST_REJECTED', 'Popover requests need bounded geometry and JSON data.'));
+      }
+      return request({ ...envelope, type: 'popover-open', id: nextId(ids), payload });
+    },
+    closePopover,
+    setPopoverAnchorActive,
     onResolve: (handler) => {
       resolveHandler = handler;
       return () => {
@@ -904,6 +1129,12 @@ export const connectHost = (options: HostClientOptions = {}): HostClient => {
         return result;
       });
     },
+    onLateGenerateResult: (listener) => {
+      lateGenerateListeners.add(listener);
+      for (const result of unclaimedLateGenerate.splice(0)) emit([listener], result);
+      listenForLateGenerate();
+      return () => { lateGenerateListeners.delete(listener); };
+    },
     setBadge: (count) => request({
       channel: OPENCHAMBER_SDK_CHANNEL,
       v: OPENCHAMBER_SDK_API_VERSION,
@@ -949,6 +1180,10 @@ export const connectHost = (options: HostClientOptions = {}): HostClient => {
         post({ ...envelope, type: 'workspace-unsubscribe', id: nextId(ids), payload: { subscriptionId } });
       }
       workspaceListeners.clear();
+      for (const subscriptionId of shellsListeners.keys()) {
+        post({ ...envelope, type: 'shells-unsubscribe', id: nextId(ids), payload: { subscriptionId } });
+      }
+      shellsListeners.clear();
       disposed = true;
       resolveHandler = null;
       actionHandler = null;
@@ -957,6 +1192,12 @@ export const connectHost = (options: HostClientOptions = {}): HostClient => {
       fileSavedListeners.clear();
       if (saveShortcutInstalled) target.removeEventListener('keydown', onSaveShortcut, true);
       target.removeEventListener('message', onMessage);
+      target.removeEventListener('keydown', onPopoverEscape, true);
+      target.removeEventListener('pointerover', onPopoverPointerOver);
+      target.removeEventListener('pointermove', onPopoverPointerOver);
+      target.removeEventListener('pointerout', onPopoverPointerOut);
+      target.removeEventListener('focus', onPopoverFocus);
+      target.removeEventListener('blur', onPopoverBlur);
       for (const waiter of pending.values()) {
         clearTimeout(waiter.timer);
         waiter.reject(new HostRequestError('HOST_UNAVAILABLE', 'Host client was disposed.'));
@@ -969,6 +1210,10 @@ export const connectHost = (options: HostClientOptions = {}): HostClient => {
       connectionListeners.clear();
       settingsListeners.clear();
       itemListeners.clear();
+      statusControlListeners.clear();
+      popoverClosedListeners.clear();
+      lateGenerateListeners.clear();
+      unclaimedLateGenerate.length = 0;
     },
   };
 };

@@ -1,6 +1,6 @@
 import React from 'react';
 import { focusChatInput } from '@/components/chat/composer/editor/dom';
-import { canUseElectronDesktopIPC, invokeDesktop } from '@/lib/desktop';
+import { canUseElectronDesktopIPC, getMiniChatRuntimeArgs, invokeDesktop } from '@/lib/desktop';
 import { ShortcutDispatcher, getEffectiveShortcutCombo, shortcutRegistry } from '@/lib/shortcuts';
 import { useConfigStore } from '@/stores/useConfigStore';
 import { useUIStore } from '@/stores/useUIStore';
@@ -26,7 +26,7 @@ export const useMiniChatKeyboardShortcuts = () => {
 
   const cycleFavoriteModel = (delta: number): boolean | void => {
     if (hasActiveBtwComposer()) return false;
-    const { favoriteModels, addRecentModel } = useUIStore.getState();
+    const { favoriteModels, addRecentModel, setLastSelectedModel } = useUIStore.getState();
     if (favoriteModels.length === 0) return false;
 
     const {
@@ -42,6 +42,7 @@ export const useMiniChatKeyboardShortcuts = () => {
     setProvider(next.providerID);
     setModel(next.modelID);
     addRecentModel(next.providerID, next.modelID);
+    setLastSelectedModel(next.providerID, next.modelID);
   };
 
   useKeybinds({
@@ -53,6 +54,7 @@ export const useMiniChatKeyboardShortcuts = () => {
       void invokeDesktop('desktop_open_draft_mini_chat_window', {
         directory: '',
         projectId: null,
+        ...getMiniChatRuntimeArgs(),
       })?.catch((error) => {
         console.warn('[mini-chat-shortcuts] failed to open draft mini chat window', error);
       });

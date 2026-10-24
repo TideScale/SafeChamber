@@ -15,7 +15,6 @@ import {
   SETTINGS_HELPER_CLASS,
   SETTINGS_OPTION_STACK_CLASS,
   SETTINGS_SELECT_ROW_TRIGGER_CLASS,
-  SETTINGS_SELECT_SIZE,
   SettingsCheckboxRow,
   SettingsFieldRow,
   SettingsSection,
@@ -30,6 +29,7 @@ import { getRuntimeKey } from '@/lib/runtime-switch';
 import type { RoutingCategory, RoutingConfig } from '@/lib/routing/routingApi';
 import { useConfigStore } from '@/stores/useConfigStore';
 import { parseModelIdentifier } from '@/lib/modelIdentifier';
+import { modelVariantNames } from '@/lib/modelVariants';
 import { isAutoModel } from '@/lib/routing/autoModel';
 import { useRoutingStore } from '@/stores/useRoutingStore';
 import { JevAccessNote } from '@/components/sections/classification/JevAccessNote';
@@ -37,6 +37,19 @@ import { JevAccessNote } from '@/components/sections/classification/JevAccessNot
 const DEFAULT_VARIANT_VALUE = '__default__';
 const SAVE_DEBOUNCE_MS = 500;
 
+
+/**
+ * Whether the server's copy is the draft as the server stores it. The server
+ * trims names and descriptions, so a mid-typing "- " or trailing newline comes
+ * back without it; adopting that copy would eat what the user just typed.
+ */
+const isStoredFormOf = (server: RoutingConfig, draft: RoutingConfig): boolean => {
+  const trimmed = (config: RoutingConfig) => JSON.stringify({
+    ...config,
+    categories: config.categories.map((category) => ({ ...category, name: category.name.trim(), description: category.description.trim() })),
+  });
+  return trimmed(server) === trimmed(draft);
+};
 
 const slugify = (name: string) => name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 64);
 
@@ -47,9 +60,18 @@ const useModelVariants = (providerID: string | null | undefined, modelID: string
     if (!providerID || !modelID) return [];
     const provider = providers.find((entry) => entry.id === providerID);
     const model = provider?.models.find((entry) => entry.id === modelID);
-    return model?.variants ? Object.keys(model.variants) : [];
+    return modelVariantNames(model);
   }, [modelID, providerID, providers]);
 };
+
+/**
+ * The saved level, or null when the model does not list it: list positions
+ * saved before #4133 run as the model's default on the server, so they read
+ * as Default here too. A model with no known levels keeps what was saved.
+ */
+const knownVariant = (value: string | null | undefined, variants: string[]): string | null => (
+  value && (variants.length === 0 || variants.includes(value)) ? value : null
+);
 
 const VariantSelect: React.FC<{
   providerID: string | null | undefined;
@@ -61,13 +83,14 @@ const VariantSelect: React.FC<{
 }> = ({ providerID, modelID, value, onChange, ariaLabel, className }) => {
   const { t } = useI18n();
   const variants = useModelVariants(providerID, modelID);
+  const selected = knownVariant(value, variants) ?? DEFAULT_VARIANT_VALUE;
   const label = (variant: string) => (variant === DEFAULT_VARIANT_VALUE
     ? t('settings.routing.thinking.default')
     : variant.charAt(0).toUpperCase() + variant.slice(1));
   return (
-    <Select value={value ?? DEFAULT_VARIANT_VALUE} onValueChange={(next) => onChange(next === DEFAULT_VARIANT_VALUE ? null : next)} disabled={variants.length === 0}>
-      <SelectTrigger size={SETTINGS_SELECT_SIZE} className={cn(SETTINGS_SELECT_ROW_TRIGGER_CLASS, className)} aria-label={ariaLabel}>
-        <SelectValue>{label(value ?? DEFAULT_VARIANT_VALUE)}</SelectValue>
+    <Select value={selected} onValueChange={(next) => onChange(next === DEFAULT_VARIANT_VALUE ? null : next)} disabled={variants.length === 0}>
+      <SelectTrigger className={cn(SETTINGS_SELECT_ROW_TRIGGER_CLASS, className)} aria-label={ariaLabel}>
+        <SelectValue>{label(selected)}</SelectValue>
       </SelectTrigger>
       <SelectContent>
         <SelectItem value={DEFAULT_VARIANT_VALUE}>{label(DEFAULT_VARIANT_VALUE)}</SelectItem>
@@ -90,8 +113,10 @@ const CategoryRow: React.FC<{
   onRemove: () => void;
 }> = ({ category, expanded, onToggle, onChange, onReset, onRemove }) => {
   const { t } = useI18n();
+  const variants = useModelVariants(category.model?.providerID, category.model?.modelID);
+  const shownVariant = knownVariant(category.variant, variants);
   const modelLabel = category.model
-    ? `${category.model.modelID}${category.variant ? ` / ${category.variant}` : ''}`
+    ? `${category.model.modelID}${shownVariant ? ` / ${shownVariant}` : ''}`
     : t('settings.routing.model.useFallback');
   const summary = [modelLabel, category.agent].filter(Boolean).join(' · ');
   return (
@@ -101,7 +126,7 @@ const CategoryRow: React.FC<{
           type="button"
           onClick={onToggle}
           aria-expanded={expanded}
-          className="flex min-w-0 flex-1 items-center gap-2 rounded-md px-1 py-1.5 text-left hover:bg-interactive-hover/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          className="flex min-w-0 flex-1 items-center gap-2 rounded-md px-1 py-1.5 text-start hover:bg-interactive-hover/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
         >
           <Icon name={expanded ? 'arrow-down-s' : 'arrow-right-s'} className="size-4 flex-shrink-0 text-muted-foreground" />
           <span className="typography-ui-label font-medium text-foreground truncate">{category.name || category.id}</span>
@@ -207,9 +232,11 @@ export const RoutingPage: React.FC = () => {
     void load();
   }, [load]);
 
-  // The server is authoritative; adopt its config whenever nothing is mid-edit.
+  // The server is authoritative; adopt its config whenever nothing is mid-edit,
+  // unless it is only the trimmed form of what is already on screen.
   React.useEffect(() => {
-    if (!pendingRef.current && savesInFlightRef.current === 0) setDraft(serverConfig);
+    if (pendingRef.current || savesInFlightRef.current > 0) return;
+    setDraft((current) => (current && serverConfig && isStoredFormOf(serverConfig, current) ? current : serverConfig));
   }, [serverConfig]);
 
   const flush = React.useCallback(() => {
@@ -258,7 +285,7 @@ export const RoutingPage: React.FC = () => {
       fallback: { model: { providerID: parsed.providerId, modelID: parsed.modelId }, variant: settingsDefaultVariant ?? null },
     }));
   // `update` is stable; the effect keys on what decides whether to prefill.
-  // eslint-disable-next-line react-hooks/exhaustive-deps
+  // oxlint-disable-next-line react-hooks/exhaustive-deps
   }, [loaded, serverConfig, settingsDefaultModel, settingsDefaultVariant]);
 
   const update = React.useCallback((mutate: (config: RoutingConfig) => RoutingConfig) => {
@@ -346,6 +373,16 @@ export const RoutingPage: React.FC = () => {
                   ariaLabel={t('settings.routing.auto.enable')}
                   info={t('settings.routing.auto.enableInfo')}
                 />
+                {draft.preserveCache === undefined ? null : (
+                  <SettingsCheckboxRow
+                    settingsItem="routing.preserve-cache"
+                    checked={draft.preserveCache}
+                    onChange={(checked) => update((config) => ({ ...config, preserveCache: checked }))}
+                    label={t('settings.routing.auto.preserveCache')}
+                    ariaLabel={t('settings.routing.auto.preserveCache')}
+                    info={t('settings.routing.auto.preserveCacheInfo')}
+                  />
+                )}
               </div>
               <p className={SETTINGS_HELPER_CLASS}>{readinessText}</p>
               <SettingsFieldRow

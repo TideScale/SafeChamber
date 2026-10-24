@@ -1,5 +1,4 @@
 import type {
-  Agent,
   Config,
   FormRequest,
   Message,
@@ -11,8 +10,6 @@ import type {
   Vcs,
 } from "@/lib/opencode/model"
 import type { ProviderCatalog } from "@/lib/opencode/client"
-
-export type { Project }
 
 /** Resolved filesystem context of a directory (from `/api/location` plus the server home). */
 export type Path = {
@@ -37,11 +34,9 @@ export type ProjectMeta = {
 /** Per-directory store state */
 export type State = {
   status: "loading" | "partial" | "complete"
-  agent: Agent[]
   project: string
   projectMeta: ProjectMeta | undefined
   icon: string | undefined
-  provider: ProviderCatalog
   config: Config
   path: Path
   session: Session[]
@@ -120,18 +115,16 @@ export const EVICTION_GRACE_MS = 30 * 1000
 export const DIR_IDLE_TTL_MS = 20 * 60 * 1000
 export const SESSION_CACHE_LIMIT = 20
 
-export const EMPTY_PATH: Path = { directory: "", worktree: "", home: "" }
-export const EMPTY_PROVIDER_CATALOG: ProviderCatalog = { providers: [], models: [] }
+const EMPTY_PATH: Path = { directory: "", worktree: "", home: "" }
+const EMPTY_PROVIDER_CATALOG: ProviderCatalog = { providers: [], models: [] }
 
 export const INITIAL_STATE: State = {
   project: "",
   projectMeta: undefined,
   icon: undefined,
-  provider: EMPTY_PROVIDER_CATALOG,
   config: {},
   path: EMPTY_PATH,
   status: "loading",
-  agent: [],
   session: [],
   sessionTotal: 0,
   sessionListSource: "empty",

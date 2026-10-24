@@ -110,13 +110,13 @@ Panel çizmek ve geçerli oturumu okumak izin gerektirmez. Kullanıcı adına bi
 | `files` | açık projedeki dosyaları okuyup yazmak (göreli yol ile `readFile`, `writeFile`, `listDir`, `stat`) |
 | `model` | kullanıcının Small Model'iyle tek seferlik metin üretimi (`generate`), herhangi bir oturumun dışında |
 
-Dört tanesi sizin için otomatik eklenir: bir `integration` tanımladığınızda `network`, bir `service` tanımladığınızda `service`, `filesystem` desenleri tanımladığınızda `filesystem` ve bir oturum eylemi mesajları istediğinde `conversation` (bkz. [Eylemler, komutlar ve rozet](#eylemler-komutlar-ve-rozet)).
+Beş tanesi sizin için otomatik eklenir: bir `integration` tanımladığınızda `network`, bir `service` tanımladığınızda `service`, `filesystem` desenleri tanımladığınızda `filesystem`, `origins` tanımladığınızda `origins` ve bir oturum eylemi mesajları istediğinde `conversation` (bkz. [Eylemler, komutlar ve rozet](#eylemler-komutlar-ve-rozet)).
 
 Kullanıcı tam listeyi bir kez, eklentiyi kurarken görür ve ya onaylar ya da eklentiyi kaldırır. Yeni bir sürüm daha fazlasını isterse pencere yeniden görünür. Kullanıcının onaylamadığı bir yeteneği gerektiren çağrı `NOT_GRANTED` ile başarısız olur.
 
 ## Metin üretme
 
-`model` yeteneğiyle `host.generate`, kullanıcının Small Model'inden tek seferlik bir yanıt ister: bir özet, bir başlık, bir taslak. Hiçbir şey bir oturuma girmez, geçmiş tutulmaz ve eklenti asla bir sağlayıcı seçmez. OpenChamber, kendi arka plan işleri için kullandığı aynı modeli kullanır; bu model Ayarlar → Oturumlar → Small Model üzerinden seçilir veya kullanıcının oturum açtığı sağlayıcılardan otomatik olarak seçilir.
+`model` yeteneğiyle `host.generate`, kullanıcının Small Model'inden tek seferlik bir yanıt ister: bir özet, bir başlık, bir taslak. Hiçbir şey bir oturuma girmez, geçmiş tutulmaz ve eklenti asla bir sağlayıcı seçmez. OpenChamber, kendi arka plan işleri için kullandığı aynı modeli kullanır; bu model Ayarlar → Oturumlar → Small Model üzerinden seçilen model, kullanıcının çalıştığı sağlayıcının küçük modeli ya da kullanıcının OpenCode yapılandırmasındaki varsayılan modeldir.
 
 ```ts
 const { text } = await host.generate({
@@ -130,7 +130,19 @@ Hiçbir model kullanılamadığında çağrı `NO_MODEL` ile başarısız olur; 
 
 ## Hesaplar ve ağ
 
-Sayfanız bir sandbox içinde çalışır ve internete doğrudan erişemez. Bir `integration` tanımlayın; OpenChamber çağrıları `host.request` üzerinden, kullanıcının token'ı ekli olarak sizin yerinize yapar. Token sayfanıza asla ulaşmaz.
+Sayfanız bir sandbox içinde çalışır ve ağa kendi başına erişemez: betikler, stiller, görseller, yazı tipleri ve medya yalnızca paketinizden yüklenir, `fetch` de yalnızca paketinizdeki dosyalara ulaşır. Yazı tiplerini ve görselleri bir CDN'den yüklemek yerine paketin içinde gönderin.
+
+Dışarıdaki bir hizmetle konuşmak için bir `integration` tanımlayın; OpenChamber çağrıları `host.request` üzerinden, kullanıcının token'ı ekli olarak sizin yerinize yapar. Token sayfanıza asla ulaşmaz.
+
+Sayfanızın doğrudan ihtiyaç duyduğu diğer her şey için, örneğin bir CDN'den yazı tipleri veya görseller ya da herkese açık bir API için, en fazla 8 https kaynağı listeleyin:
+
+```json
+"origins": ["https://fonts.example.com"]
+```
+
+Kullanıcı bunları onay penceresinde eklentinizin veri gönderip veri alabileceği adresler olarak görür ve bir güncelleme yenisini eklerse yeniden onaylar. Onaylanan kaynaklar `fetch`, görseller, yazı tipleri, stiller ve medya için açıktır ama betikler için asla: kod paketinizle birlikte gelmelidir. Sayfanın kaynağı `null` olduğundan, bir `fetch` yanıtını okuyabilmeniz için sunucunun bu kaynağa CORS izni vermesi gerekir.
+
+[Kurumsal modda](/security/) `origins`, `integration` ya da `service` içeren bir eklenti yalnızca yöneticinin listeye eklediği bir Git deposundan kurulur. Eklentiniz bunlar olmadan çalışabiliyorsa, bu ekipler için kurulabilir kalır. Böyle bir makinede eklenti geliştirmek için yöneticiden `allowLocalExtensions` isteyin; bununla eklentiyi kendi klasöründen kurabilirsiniz.
 
 - `token`: kullanıcı Ayarlar → Entegrasyonlar kartına bir API token'ı yapıştırır. `apiOrigin`, `request` çağrısının erişebileceği tek kaynaktır. `account` isteğe bağlıdır: bir GET yolu ve bir alan adı; kart böylece kimin bağlı olduğunu gösterebilir. `scheme`, token'ın nasıl gönderileceğini belirler; aşağıdaki tabloya bakın. Hangi başlığı beklediğini sağlayıcının API belgelerinden kontrol edin.
 - `oauth`: kullanıcı bir client id yapıştırır, yetkilendirme akışını OpenChamber yürütür. `authorizeUrl`, `tokenUrl` ve `apiOrigin` gerekir.

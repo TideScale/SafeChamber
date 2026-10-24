@@ -9,5 +9,6 @@ export const SPACE_ACTION_TEXT = {
   stop: 'spaces.actions.stop',
   restart_opencode: 'spaces.actions.restartOpenCode',
   restart: 'spaces.actions.restart',
+  setup: 'spaces.actions.setup',
   remove: 'spaces.actions.remove',
 } satisfies Record<SpaceAction, I18nKey>;

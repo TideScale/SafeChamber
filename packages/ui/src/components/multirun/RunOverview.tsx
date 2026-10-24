@@ -30,7 +30,8 @@ import { ModelEffortMenu } from './ModelEffortMenu';
 import { LaneStatusIcon } from './LaneStatusIcon';
 import { LANE_STATUS_COUNT_KEYS, LANE_STATUS_ORDER, resolveLaneStatus, type LaneStatus } from '@/lib/multirun/laneStatus';
 import { useGlobalBlockingRequestsStore } from '@/sync/global-blocking-requests';
-import { useNotificationStore } from '@/sync/notification-store';
+import { isSessionUnread } from '@/sync/session-unread';
+import { useGlobalSessionsStore } from '@/stores/useGlobalSessionsStore';
 
 type BarMode =
   | { kind: 'idle' }
@@ -66,7 +67,7 @@ function useVariantPrompts(run: MultiRunSummary | null, sessionById: ReadonlyMap
     }
     return () => { cancelled = true; };
   // Captions are fixed once read; a session update never changes the first prompt.
-  // eslint-disable-next-line react-hooks/exhaustive-deps
+  // oxlint-disable-next-line react-hooks/exhaustive-deps
   }, [firstLaneByVariant]);
   return prompts;
 }
@@ -124,7 +125,7 @@ function RunOverviewContent({ runKey }: { runKey: string }): React.ReactNode {
   const projects = useProjectsStore((state) => state.projects);
   const activeSessionIds = useGlobalSessionStatusStore((state) => state.activeSessionIds);
   const blockingBySession = useGlobalBlockingRequestsStore((state) => state.bySession);
-  const unseenCountBySession = useNotificationStore((state) => state.index.session.unseenCount);
+  const globalSessionById = useGlobalSessionsStore((state) => state.entityById);
   // Phones get the overview, fusion and Keep, but never launch lanes (no header back arrow either).
   const isMobile = useUIStore((state) => state.isMobile);
   const [bar, setBar] = React.useState<BarMode>({ kind: 'idle' });
@@ -184,7 +185,7 @@ function RunOverviewContent({ runKey }: { runKey: string }): React.ReactNode {
     return resolveLaneStatus({
       session,
       busy: activeSessionIds.has(sessionId),
-      blocking: pending?.permissions.length ? 'permission' : pending?.forms.length ? 'question' : null,
+      blocking: pending?.permissions.length ? 'permission' : pending?.forms.length || pending?.pages.length ? 'question' : null,
       reply: summaries.get(sessionId)?.reply,
     });
   };
@@ -337,7 +338,7 @@ function RunOverviewContent({ runKey }: { runKey: string }): React.ReactNode {
         isFusion={isFusion}
         busy={activeSessionIds.has(member.sessionId)}
         status={statusOf(member.sessionId) ?? 'notStarted'}
-        unread={(unseenCountBySession[member.sessionId] ?? 0) > 0}
+        unread={isSessionUnread(globalSessionById.get(member.sessionId))}
         summary={summaries.get(member.sessionId)}
         fuseSource={bar.kind === 'fuse' && !isFusion
           ? { checked: finished && !bar.excluded.has(member.sessionId), selectable: finished }
@@ -423,7 +424,7 @@ function RunOverviewContent({ runKey }: { runKey: string }): React.ReactNode {
               <Button
                 variant="ghost"
                 size="icon"
-                className="-ml-2 shrink-0"
+                className="-ms-2 shrink-0"
                 aria-label={t('header.mainSurface.backToChat')}
                 onClick={() => useUIStore.getState().closeMainSurfaces()}
               >
@@ -447,7 +448,8 @@ function RunOverviewContent({ runKey }: { runKey: string }): React.ReactNode {
                 <button
                   type="button"
                   onClick={() => setRenaming(run.title)}
-                  className="max-w-full truncate text-left typography-heading-lg text-foreground hover:underline decoration-dotted underline-offset-4"
+                  dir="auto"
+                  className="max-w-full truncate oc-ui-start-align typography-heading-lg text-foreground hover:underline decoration-dotted underline-offset-4"
                   title={t('multirun.overview.rename.aria')}
                 >
                   {run.title}
@@ -529,7 +531,7 @@ function RunOverviewContent({ runKey }: { runKey: string }): React.ReactNode {
                       })}
                     />
                   ) : null}
-                  {!isMobile && run.variants.length > 1 ? <span className="ml-auto shrink-0">{renderAddModel(variant)}</span> : null}
+                  {!isMobile && run.variants.length > 1 ? <span className="ms-auto shrink-0">{renderAddModel(variant)}</span> : null}
                 </div>
                 <div className={cardGridClassName}>
                   {lanes.map(renderCard)}
@@ -570,7 +572,7 @@ function RunOverviewContent({ runKey }: { runKey: string }): React.ReactNode {
                 showChips={false}
                 dropdownSide="top"
                 addButtonLabel={judge[0] ? (judge[0].displayName || judge[0].modelID) : t('multirun.fusion.model.placeholder')}
-                triggerIcon={judge[0] ? <ProviderLogo providerId={judge[0].providerID} className="mr-1 size-3.5" /> : undefined}
+                triggerIcon={judge[0] ? <ProviderLogo providerId={judge[0].providerID} className="me-1 size-3.5" /> : undefined}
               />
               {judge[0] ? (
                 <ModelEffortMenu

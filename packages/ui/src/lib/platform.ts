@@ -15,14 +15,23 @@ export const isCapacitorApp = (): boolean => {
  */
 export const isIPadApp = (): boolean => {
   if (typeof window === 'undefined' || !isCapacitorApp()) return false;
-  if (getClientPlatform() !== 'ios') return false;
+  return getClientPlatform() === 'ios' && isIPadDevice();
+};
+
+/**
+ * True on an iPad in any runtime (Safari, Home Screen app, Capacitor).
+ * iPadOS sends a Mac user agent; real touch points are the tell, since no
+ * Mac has them.
+ */
+export const isIPadDevice = (): boolean => {
+  if (typeof navigator === 'undefined') return false;
   const userAgent = navigator.userAgent || '';
   const maxTouchPoints = navigator.maxTouchPoints ?? 0;
   return /iPad/i.test(userAgent)
     || (/Macintosh|MacIntel/i.test(userAgent) && maxTouchPoints > 1);
 };
 
-export type ClientPlatform = 'ios' | 'android' | 'vscode' | 'desktop' | 'web';
+type ClientPlatform = 'ios' | 'android' | 'vscode' | 'desktop' | 'web';
 
 /**
  * The runtime surface this client is. Used by the push presence model: only 'ios'/'android'

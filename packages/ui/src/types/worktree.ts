@@ -1,4 +1,5 @@
 export interface WorktreeMetadata {
+  provenance?: import('@/lib/api/types').GitContributorWorktreeProvenance;
 
   /**
    * Worktree origin.
@@ -32,6 +33,8 @@ export interface WorktreeMetadata {
     ahead?: number;
     behind?: number;
     upstream?: string | null;
+    /** Base ref `ahead` was counted against when there is no upstream. */
+    aheadBase?: string | null;
   };
 
   // --- Phase 1: canonical worktree attachment fields ---

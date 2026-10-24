@@ -1,11 +1,5 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-
-vi.mock('../github/octokit.js', () => ({ getOctokitOrNull: vi.fn() }));
-vi.mock('../github/repo/index.js', () => ({ resolveGitHubRepoFromDirectory: vi.fn() }));
-
-const { getPullRequestDiff, getPullRequestFileContents } = await import('./pull-request.js');
-const { getOctokitOrNull } = await import('../github/octokit.js');
-const { resolveGitHubRepoFromDirectory } = await import('../github/repo/index.js');
+import { describe, expect, it, vi } from 'vitest';
+import { getPullRequestDiff, getPullRequestFileContents, supportsChangeRequestPatch } from './pull-request.js';
 
 const PATCH = `diff --git a/src/a.ts b/src/a.ts
 --- a/src/a.ts
@@ -14,133 +8,43 @@ const PATCH = `diff --git a/src/a.ts b/src/a.ts
 +const added = true;
 `;
 
-describe('getPullRequestDiff', () => {
-  let request;
-
-  beforeEach(() => {
-    request = vi.fn().mockResolvedValue({ data: PATCH });
-    getOctokitOrNull.mockReturnValue({ request });
-    // The resolver hands back a wrapper, not the repo. Reading `.owner` off the
-    // wrapper made every repository look remote-less, which is what this suite
-    // exists to prevent.
-    resolveGitHubRepoFromDirectory.mockResolvedValue({
-      repo: { owner: 'openchamber', repo: 'openchamber' },
-      remoteUrl: 'git@github.com:openchamber/openchamber.git',
-    });
-  });
-
-  afterEach(() => {
-    vi.clearAllMocks();
-  });
-
-  it('requests the diff for the resolved repository', async () => {
-    const result = await getPullRequestDiff('/repo', 2122);
-
-    expect(result.patch).toBe(PATCH);
-    expect(result.meta).toEqual({ owner: 'openchamber', repo: 'openchamber', number: 2122 });
-    expect(request).toHaveBeenCalledWith('GET /repos/{owner}/{repo}/pulls/{pull_number}', {
-      owner: 'openchamber',
-      repo: 'openchamber',
-      pull_number: 2122,
-      headers: { accept: 'application/vnd.github.v3.diff' },
-    });
-  });
-
-  it('reports a missing GitHub remote only when there really is none', async () => {
-    resolveGitHubRepoFromDirectory.mockResolvedValue({ repo: null, remoteUrl: null });
-
-    await expect(getPullRequestDiff('/repo', 2122)).rejects.toMatchObject({
-      code: 'no-github-remote',
-      statusCode: 400,
-    });
-    expect(request).not.toHaveBeenCalled();
-  });
-
-  it('uses the selected upstream repository rather than the local fork', async () => {
-    const result = await getPullRequestDiff('/repo', 42, { owner: 'upstream', repo: 'project' });
-    expect(result.meta).toEqual({ owner: 'upstream', repo: 'project', number: 42 });
-    expect(resolveGitHubRepoFromDirectory).not.toHaveBeenCalled();
-    expect(request).toHaveBeenCalledWith('GET /repos/{owner}/{repo}/pulls/{pull_number}', {
-      owner: 'upstream', repo: 'project', pull_number: 42, headers: { accept: 'application/vnd.github.v3.diff' },
-    });
-  });
-
-  it('allows an empty comparison but rejects malformed GitHub bodies', async () => {
-    request.mockResolvedValue({ data: '' });
-    expect((await getPullRequestDiff('/repo', 42, undefined, { allowEmpty: true })).patch).toBe('');
-    request.mockResolvedValue({ data: { message: 'Not a diff' } });
-    await expect(getPullRequestDiff('/repo', 42)).rejects.toThrow();
-  });
-
-  it('asks the user to connect GitHub before anything else', async () => {
-    getOctokitOrNull.mockReturnValue(null);
-
-    await expect(getPullRequestDiff('/repo', 2122)).rejects.toMatchObject({
-      code: 'github-not-connected',
-      statusCode: 401,
-    });
-    expect(resolveGitHubRepoFromDirectory).not.toHaveBeenCalled();
-  });
-
-  it('treats an empty diff as a missing pull request rather than an empty review', async () => {
-    request.mockResolvedValue({ data: '   ' });
-
-    await expect(getPullRequestDiff('/repo', 2122)).rejects.toMatchObject({
-      code: 'empty-diff',
-      statusCode: 404,
-    });
-  });
+const contextOf = (provider) => ({
+  provider, instance: provider === 'github' ? 'github.com' : 'https://gitlab.com', accountId: 'account-1',
+  repositoryId: 'repo-1', bindingRevision: 2, directory: '/repo', primaryRemote: 'origin',
 });
 
-describe('getPullRequestFileContents', () => {
-  const HEAD = 'a'.repeat(40);
-  const BASE_TIP = 'b'.repeat(40);
-  const MERGE_BASE = 'c'.repeat(40);
-  let request;
+describe('change request reads', () => {
+  it('hands the validated context to the provider-neutral reader and keeps the empty-diff rule in the provider\'s words', async () => {
+    const context = contextOf('gitlab');
+    const readChangeRequestPatch = vi.fn(async () => ({ patch: PATCH, meta: { owner: 'o', repo: 'r', number: 3 } }));
+    const sourceRepo = { owner: 'o', repo: 'r' };
+    await expect(getPullRequestDiff('/repo', 3, context, { sourceRepo, readChangeRequestPatch }))
+      .resolves.toEqual({ patch: PATCH, meta: { owner: 'o', repo: 'r', number: 3 } });
+    expect(readChangeRequestPatch).toHaveBeenCalledWith({ context, number: 3, sourceRepo });
 
-  beforeEach(() => {
-    request = vi.fn(async (route, params) => {
-      if (route === 'GET /repos/{owner}/{repo}/pulls/{pull_number}') return { data: { head: { sha: HEAD }, base: { sha: BASE_TIP } } };
-      if (route === 'GET /repos/{owner}/{repo}/compare/{basehead}') return { data: { merge_base_commit: { sha: MERGE_BASE } } };
-      if (route === 'GET /repos/{owner}/{repo}/contents/{path}') return { data: `${params.path}@${params.ref}` };
-      throw new Error(`unexpected ${route}`);
-    });
-    getOctokitOrNull.mockReturnValue({ request });
+    const empty = vi.fn(async () => ({ patch: '   ', meta: { owner: 'o', repo: 'r', number: 4 } }));
+    await expect(getPullRequestDiff('/repo', 4, context, { readChangeRequestPatch: empty }))
+      .rejects.toMatchObject({ code: 'empty-diff', statusCode: 404, message: 'Merge request !4 has no diff' });
+    await expect(getPullRequestDiff('/repo', 4, contextOf('github'), { readChangeRequestPatch: empty }))
+      .rejects.toMatchObject({ code: 'empty-diff', message: 'Pull request #4 has no diff' });
+    await expect(getPullRequestDiff('/repo', 4, context, { allowEmpty: true, readChangeRequestPatch: empty }))
+      .resolves.toMatchObject({ patch: '   ' });
   });
 
-  afterEach(() => {
-    vi.clearAllMocks();
+  it('reads one file through the reader and fails plainly without one', async () => {
+    const context = contextOf('github');
+    const readChangeRequestFile = vi.fn(async () => ({ original: 'a', modified: 'b' }));
+    await expect(getPullRequestFileContents('/repo', 3, context, { path: 'a.ts', status: 'M', readChangeRequestFile }))
+      .resolves.toEqual({ original: 'a', modified: 'b' });
+    expect(readChangeRequestFile).toHaveBeenCalledWith({ context, number: 3, sourceRepo: null, path: 'a.ts', previousPath: undefined, status: 'M' });
+    await expect(getPullRequestDiff('/repo', 3, context)).rejects.toMatchObject({ statusCode: 501 });
+    await expect(getPullRequestFileContents('/repo', 3, context, { path: 'a.ts' })).rejects.toMatchObject({ statusCode: 501 });
   });
 
-  it('reads the base side at the merge base and the head side at the PR head', async () => {
-    const result = await getPullRequestFileContents('/repo', 7, { owner: 'upstream', repo: 'project' }, { path: 'src/a.ts', status: 'M' });
-    expect(result).toEqual({ original: `src/a.ts@${MERGE_BASE}`, modified: `src/a.ts@${HEAD}` });
-    expect(request).toHaveBeenCalledWith('GET /repos/{owner}/{repo}/compare/{basehead}', {
-      owner: 'upstream', repo: 'project', basehead: `${BASE_TIP}...${HEAD}`,
-    });
-    expect(request).toHaveBeenCalledWith('GET /repos/{owner}/{repo}/contents/{path}', expect.objectContaining({
-      owner: 'upstream', repo: 'project', headers: { accept: 'application/vnd.github.raw+json' },
-    }));
-  });
-
-  it('skips the missing side of added and deleted files and follows renames', async () => {
-    expect(await getPullRequestFileContents('/repo', 7, { owner: 'o', repo: 'r' }, { path: 'new.ts', status: 'A' }))
-      .toEqual({ original: '', modified: `new.ts@${HEAD}` });
-    expect(await getPullRequestFileContents('/repo', 7, { owner: 'o', repo: 'r' }, { path: 'gone.ts', status: 'D' }))
-      .toEqual({ original: `gone.ts@${MERGE_BASE}`, modified: '' });
-    expect(await getPullRequestFileContents('/repo', 7, { owner: 'o', repo: 'r' }, { path: 'new.ts', previousPath: 'old.ts', status: 'R' }))
-      .toEqual({ original: `old.ts@${MERGE_BASE}`, modified: `new.ts@${HEAD}` });
-  });
-
-  it('rejects oversized files and malformed GitHub metadata', async () => {
-    request.mockImplementationOnce(async () => ({ data: { head: { sha: 'nope' }, base: { sha: BASE_TIP } } }));
-    await expect(getPullRequestFileContents('/repo', 7, { owner: 'o', repo: 'r' }, { path: 'a.ts', status: 'M' })).rejects.toThrow(/invalid pull request head/);
-
-    request.mockImplementation(async (route) => {
-      if (route === 'GET /repos/{owner}/{repo}/pulls/{pull_number}') return { data: { head: { sha: HEAD }, base: { sha: BASE_TIP } } };
-      if (route === 'GET /repos/{owner}/{repo}/compare/{basehead}') return { data: { merge_base_commit: { sha: MERGE_BASE } } };
-      return { data: 'x'.repeat(5 * 1024 * 1024 + 1) };
-    });
-    await expect(getPullRequestFileContents('/repo', 7, { owner: 'o', repo: 'r' }, { path: 'a.ts', status: 'M' })).rejects.toMatchObject({ code: 'file-too-large', statusCode: 413 });
+  it('offers walkthroughs for the providers whose descriptor serves change request patches only', () => {
+    expect(supportsChangeRequestPatch('github')).toBe(true);
+    expect(supportsChangeRequestPatch('gitlab')).toBe(true);
+    expect(supportsChangeRequestPatch('sourcehut')).toBe(false);
+    expect(supportsChangeRequestPatch(undefined)).toBe(false);
   });
 });

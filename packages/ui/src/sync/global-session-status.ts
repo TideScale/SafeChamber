@@ -13,6 +13,7 @@ import {
   type SessionActivityTimingMutation,
 } from './session-activity-timing';
 import { countSyncPerformance } from './performance-diagnostics';
+import { hasRunningShell, useBackgroundShellsStore } from './background-shells';
 
 // Shared live busy/retry index for every directory. Global events update it
 // incrementally and authoritative directory snapshots reconcile it, so each
@@ -84,44 +85,78 @@ export const setSessionParentResolver = (resolver: SessionParentResolver): void 
 /** Subagents nest; a deeper chain than this is treated as unrelated. */
 const MAX_SUBAGENT_DEPTH = 8;
 
-const forEachAncestorId = (sessionId: string, visit: (ancestorId: string) => void): void => {
-  let current = resolveSessionParentId(sessionId);
+const forEachAncestorId = (sessionId: string, visit: (ancestorId: string) => void, resolveParentId: SessionParentResolver = resolveSessionParentId): void => {
+  let current = resolveParentId(sessionId);
   for (let depth = 0; current && depth < MAX_SUBAGENT_DEPTH; depth += 1) {
     visit(current);
-    current = resolveSessionParentId(current);
+    current = resolveParentId(current);
   }
 };
 
 /** True when a subagent anywhere below the session is running. */
-export const hasActiveSubagent = (sessionId: string, activeSessionIds: ReadonlySet<string>): boolean => {
+export const hasActiveSubagent = (sessionId: string, activeSessionIds: ReadonlySet<string>, resolveParentId: SessionParentResolver = resolveSessionParentId): boolean => {
   for (const activeId of activeSessionIds) {
     if (activeId === sessionId) continue;
     let found = false;
     forEachAncestorId(activeId, (ancestorId) => {
       if (ancestorId === sessionId) found = true;
-    });
+    }, resolveParentId);
     if (found) return true;
   }
   return false;
 };
 
-/** Active sessions plus every ancestor whose turn they keep open. */
-const withSubagentAncestors = (activeSessionIds: ReadonlySet<string>): ReadonlySet<string> => {
+/**
+ * Active sessions plus every session whose turn they keep open: ancestors of
+ * running subagents, and sessions waiting on a background command.
+ */
+const withBackgroundWork = (activeSessionIds: ReadonlySet<string>): ReadonlySet<string> => {
   let extended: Set<string> | null = null;
-  for (const activeId of activeSessionIds) {
-    forEachAncestorId(activeId, (ancestorId) => {
-      if (activeSessionIds.has(ancestorId)) return;
-      extended ??= new Set(activeSessionIds);
-      extended.add(ancestorId);
-    });
-  }
+  const add = (sessionId: string): void => {
+    if (activeSessionIds.has(sessionId)) return;
+    extended ??= new Set(activeSessionIds);
+    extended.add(sessionId);
+  };
+  for (const activeId of activeSessionIds) forEachAncestorId(activeId, add);
+  for (const sessionId of useBackgroundShellsStore.getState().sessionIds) add(sessionId);
   return extended ?? activeSessionIds;
 };
 
-/** The session's turn is still open: it runs itself, or one of its subagents does. */
-export const useSessionTurnActive = (sessionId: string): boolean => useGlobalSessionStatusStore(
-  (state) => state.activeSessionIds.has(sessionId) || hasActiveSubagent(sessionId, state.activeSessionIds),
+/** True when the session idles only while its background work runs. */
+const hasBackgroundWork = (sessionId: string, activeSessionIds: ReadonlySet<string>): boolean => (
+  hasActiveSubagent(sessionId, activeSessionIds) || hasRunningShell(sessionId)
 );
+
+/**
+ * What keeps the session's turn open, or null when nothing does: the session
+ * runs itself, or it idles while a subagent below it runs, or while a command
+ * it started in the background runs. The session's own run wins; a pause with
+ * both kinds of background work reports the subagent.
+ */
+type SessionTurnActivity = 'running' | 'subagent' | 'shell';
+
+export const useSessionTurnActivity = (sessionId: string): SessionTurnActivity | null => {
+  const status = useGlobalSessionStatusStore((state): SessionTurnActivity | null => {
+    if (state.activeSessionIds.has(sessionId)) return 'running';
+    return hasActiveSubagent(sessionId, state.activeSessionIds) ? 'subagent' : null;
+  });
+  const waitingOnShell = useBackgroundShellsStore((state) => state.sessionIds.has(sessionId));
+  return status ?? (waitingOnShell ? 'shell' : null);
+};
+
+// The last background command of an idle session ending closes its turn,
+// the way the last subagent finishing does below.
+useBackgroundShellsStore.subscribe((state, previous) => {
+  if (state.sessionIds === previous.sessionIds) return;
+  const { activeSessionIds } = useGlobalSessionStatusStore.getState();
+  const timingMutations: SessionActivityTimingMutation[] = [];
+  for (const sessionId of previous.sessionIds) {
+    if (state.sessionIds.has(sessionId)) continue;
+    if (activeSessionIds.has(sessionId) || hasActiveSubagent(sessionId, activeSessionIds)) continue;
+    timingMutations.push({ type: 'observe', sessionId, phase: 'settled' });
+  }
+  applySessionActivityTimingMutations(timingMutations);
+});
 
 const normalizeStatusType = (type: string | undefined): ActiveStatusType | 'idle' => {
   if (type === 'busy') return 'busy';
@@ -186,15 +221,17 @@ export const applyGlobalSessionStatusEvents = (directory: string, payloads: read
     }
     orderingMutations.push({ type: 'observe', sessionId, phase: 'settled' });
     settledIds.push(sessionId);
-    // The turn timer keeps running through a background-subagent pause.
-    if (!hasActiveSubagent(sessionId, currentActiveIds())) {
+    // The turn timer keeps running through a background-subagent or background-command pause.
+    if (!hasBackgroundWork(sessionId, currentActiveIds())) {
       timingMutations.push({ type: 'observe', sessionId, phase: 'settled' });
+    } else {
+      timingMutations.push({ type: 'hold', sessionId });
     }
   };
 
   for (const payload of payloads) {
     if (payload.type === 'session.status') {
-      const { sessionID, status } = payload.properties;
+      const { sessionID, status, turnStart } = payload.properties;
       if (!sessionID) continue;
       const type = normalizeStatusType(status.type);
       // A status event only records that the session is running again; the
@@ -210,7 +247,7 @@ export const applyGlobalSessionStatusEvents = (directory: string, payloads: read
         if (!current) draftActiveIds().add(sessionID);
       }
       orderingMutations.push({ type: 'observe', sessionId: sessionID, phase: 'active' });
-      timingMutations.push({ type: 'observe', sessionId: sessionID, phase: 'active' });
+      timingMutations.push({ type: 'observe', sessionId: sessionID, phase: 'active', turnStart });
       continue;
     }
 
@@ -244,7 +281,7 @@ export const applyGlobalSessionStatusEvents = (directory: string, payloads: read
   const finalActiveIds = currentActiveIds();
   for (const settledId of settledIds) {
     forEachAncestorId(settledId, (ancestorId) => {
-      if (finalActiveIds.has(ancestorId) || hasActiveSubagent(ancestorId, finalActiveIds)) return;
+      if (finalActiveIds.has(ancestorId) || hasBackgroundWork(ancestorId, finalActiveIds)) return;
       timingMutations.push({ type: 'observe', sessionId: ancestorId, phase: 'settled' });
     });
   }
@@ -287,9 +324,15 @@ export const applyGlobalSessionStatusSnapshot = (
   // authoritatively covers the caller's session list plus every id it reports
   // itself, and only the handful of sessions actually being timed need an
   // answer. Reuses the sets already built above, so this allocates nothing.
+  const turnSessionIds = withBackgroundWork(activeSessionIds);
+  const heldSessionIds = new Set<string>();
+  for (const sessionId of turnSessionIds) {
+    if (!activeSessionIds.has(sessionId)) heldSessionIds.add(sessionId);
+  }
   reconcileSessionActivityTiming(
-    withSubagentAncestors(activeSessionIds),
+    turnSessionIds,
     (sessionId) => known.has(sessionId) || sessionId in raw,
+    heldSessionIds,
   );
   useGlobalSessionStatusStore.setState((state) => {
     let changed = false;

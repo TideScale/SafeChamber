@@ -1,4 +1,4 @@
-import { readAuthFile } from '../../opencode/auth.js';
+import { readOpenCodeCredentials } from '../../opencode/auth.js';
 import {
   getAuthEntry,
   normalizeAuthEntry,
@@ -12,7 +12,7 @@ import {
 
 export const providerId = 'hyper';
 export const providerName = 'Charm Hyper';
-export const aliases = ['hyper'];
+const aliases = ['hyper'];
 const HYPER_QUOTA_URL = 'https://hyper.charm.land/v1/credits';
 const CREDIT_TO_USD = 0.05;
 
@@ -21,10 +21,10 @@ const getApiKey = (auth) => {
   return asNonEmptyString(entry?.key) ?? asNonEmptyString(entry?.token);
 };
 
-export const isConfigured = (auth = readAuthFile()) => Boolean(getApiKey(auth));
+export const isConfigured = (auth) => Boolean(getApiKey(auth));
 
-export const fetchQuota = async ({ readAuth = readAuthFile, fetchImpl = fetch } = {}) => {
-  const apiKey = getApiKey(readAuth());
+export const fetchQuota = async ({ readAuth = readOpenCodeCredentials, fetchImpl = fetch } = {}) => {
+  const apiKey = getApiKey(await readAuth());
 
   if (!apiKey) {
     return buildResult({

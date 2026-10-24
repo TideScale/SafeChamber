@@ -4,10 +4,12 @@ import { useProjectsStore } from '@/stores/useProjectsStore';
 import { getDeferredSafeStorage } from '@/stores/utils/safeStorage';
 import { z } from 'zod';
 import { useGroupOrdering } from './useGroupOrdering';
+import { SIDEBAR_ACTIVITY_KEYS } from '../sessionSidebarRowModel';
 
 const PROJECT_COLLAPSE_STORAGE_KEY = 'oc.sessions.projectCollapse';
 const GROUP_ORDER_STORAGE_KEY = 'oc.sessions.groupOrder';
 const GROUP_COLLAPSE_STORAGE_KEY = 'oc.sessions.groupCollapse';
+const ACTIVITY_COLLAPSE_STORAGE_KEY = 'oc.sessions.activityCollapse';
 
 type Project = { id: string };
 
@@ -52,11 +54,15 @@ export const useSessionProjectViewState = ({
   const [collapsedGroups, setCollapsedGroups] = React.useState<Set<string>>(() => (
     parseStringSet(safeStorage.getItem(GROUP_COLLAPSE_STORAGE_KEY))
   ));
+  const [collapsedActivities, setCollapsedActivities] = React.useState<Set<string>>(() => (
+    parseStringSet(safeStorage.getItem(ACTIVITY_COLLAPSE_STORAGE_KEY))
+  ));
   const [groupOrderByProject, setGroupOrderByProject] = React.useState<Map<string, string[]>>(() => (
     parseGroupOrder(safeStorage.getItem(GROUP_ORDER_STORAGE_KEY))
   ));
   const ignoreIntersectionUntil = React.useRef<number>(0);
   const groupCollapseDirty = React.useRef(false);
+  const activityCollapseDirty = React.useRef(false);
   const groupOrderDirty = React.useRef(false);
   const persistCollapsedProjectsTimer = React.useRef<number | null>(null);
   const pendingCollapsedProjects = React.useRef<Set<string> | null>(null);
@@ -115,10 +121,26 @@ export const useSessionProjectViewState = ({
     }
   }, [collapsedGroups, safeStorage]);
 
-  const collapseAllProjects = React.useCallback(() => {
+  React.useEffect(() => {
+    if (!activityCollapseDirty.current) return;
+    try {
+      safeStorage.setItem(ACTIVITY_COLLAPSE_STORAGE_KEY, JSON.stringify(Array.from(collapsedActivities)));
+    } catch {
+      // ignored
+    }
+  }, [collapsedActivities, safeStorage]);
+
+  const updateCollapsedActivities = React.useCallback<React.Dispatch<React.SetStateAction<Set<string>>>>((update) => {
+    activityCollapseDirty.current = true;
+    setCollapsedActivities(update);
+  }, []);
+
+  const collapseAll = React.useCallback(() => {
     ignoreIntersectionUntil.current = Date.now() + 150;
     groupCollapseDirty.current = true;
+    activityCollapseDirty.current = true;
     setCollapsedGroups(new Set());
+    setCollapsedActivities((current) => new Set([...current, ...SIDEBAR_ACTIVITY_KEYS]));
     setCollapsedProjects(() => {
       const allIds = new Set(projects.map((project) => project.id));
       try {
@@ -131,10 +153,16 @@ export const useSessionProjectViewState = ({
     });
   }, [projects, safeStorage, scheduleCollapsedProjectsPersist]);
 
-  const expandAllProjects = React.useCallback(() => {
+  const expandAll = React.useCallback(() => {
     ignoreIntersectionUntil.current = Date.now() + 150;
     groupCollapseDirty.current = true;
+    activityCollapseDirty.current = true;
     setCollapsedGroups(new Set());
+    setCollapsedActivities((current) => {
+      const next = new Set(current);
+      for (const key of SIDEBAR_ACTIVITY_KEYS) next.delete(key);
+      return next;
+    });
     setCollapsedProjects(() => {
       const empty = new Set<string>();
       try {
@@ -181,19 +209,21 @@ export const useSessionProjectViewState = ({
   const state = React.useMemo(() => ({
     collapsedProjects,
     collapsedGroups,
+    collapsedActivities,
     groupOrderByProject,
-  }), [collapsedGroups, collapsedProjects, groupOrderByProject]);
+  }), [collapsedActivities, collapsedGroups, collapsedProjects, groupOrderByProject]);
   const actions = React.useMemo(() => ({
     setCollapsedProjects,
     toggleProject,
-    collapseAllProjects,
-    expandAllProjects,
+    collapseAll,
+    expandAll,
     scheduleCollapsedProjectsPersist,
     setCollapsedGroups,
+    setCollapsedActivities: updateCollapsedActivities,
     toggleGroup,
     setGroupOrderByProject: updateGroupOrderByProject,
     getOrderedGroups,
-  }), [collapseAllProjects, expandAllProjects, getOrderedGroups, scheduleCollapsedProjectsPersist, toggleGroup, toggleProject, updateGroupOrderByProject]);
+  }), [collapseAll, expandAll, getOrderedGroups, scheduleCollapsedProjectsPersist, toggleGroup, toggleProject, updateCollapsedActivities, updateGroupOrderByProject]);
 
   return { state, actions };
 };

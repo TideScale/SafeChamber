@@ -17,6 +17,7 @@ declare module "bun:test" {
     toMatchObject(expected: unknown): void;
     rejects: {
       toThrow(expected?: string | RegExp | (new (...args: never[]) => unknown)): Promise<void>;
+      toBeInstanceOf(expected: new (...args: never[]) => object): Promise<void>;
     };
     toBeGreaterThan(expected: number): void;
     toBeGreaterThanOrEqual(expected: number): void;
@@ -24,14 +25,17 @@ declare module "bun:test" {
     toBeLessThanOrEqual(expected: number): void;
     toHaveLength(expected: number): void;
     toBeInstanceOf(expected: unknown): void;
+    toHaveProperty(path: string): void;
     not: {
       toEqual(expected: unknown): void;
       toBe(expected: unknown): void;
       toContain(expected: unknown): void;
       toBeNull(): void;
+      toHaveProperty(path: string): void;
     };
   }
   export function expect(value: unknown): ExpectResult;
+  export function beforeAll(fn: () => void | Promise<void>): void;
   export function beforeEach(fn: () => void | Promise<void>): void;
   export function afterEach(fn: () => void | Promise<void>): void;
   export function afterAll(fn: () => void | Promise<void>): void;
@@ -59,6 +63,11 @@ declare module "bun:test" {
     function module(moduleName: string, factory: () => Record<string, unknown>): void;
     function restore(): void;
   }
+  export namespace jest {
+    function useFakeTimers(): void;
+    function useRealTimers(): void;
+    function advanceTimersByTime(ms: number): void;
+  }
 }
 
 // Vite asset-query imports need a URL loader when real UI modules run in Bun.
@@ -67,7 +76,11 @@ declare module "bun" {
   export function plugin(options: {
     name: string;
     setup(build: {
-      onLoad(options: { filter: RegExp }, callback: (args: { path: string }) => {
+      onResolve(options: { filter: RegExp; namespace?: string }, callback: (args: { path: string }) => {
+        path: string;
+        namespace?: string;
+      }): void;
+      onLoad(options: { filter: RegExp; namespace?: string }, callback: (args: { path: string }) => {
         contents: string;
         loader: "js" | "ts";
       }): void;

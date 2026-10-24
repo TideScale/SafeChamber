@@ -47,6 +47,15 @@ describe('effectiveGrants', () => {
     expect(effectiveGrants(granted, approved, moreExec)).toEqual(['prompt', 'filesystem', 'network']);
   });
 
+  test('an origin added in an update is not approved until the user approves the new list', () => {
+    const approved = guestGrantScope({ origins: ['https://fonts.example.com'] });
+    expect(approved).toEqual({ origins: ['https://fonts.example.com'] });
+    expect(effectiveGrants(['origins'], approved, guestGrantScope({ origins: ['https://fonts.example.com'] }))).toEqual(['origins']);
+    const added = guestGrantScope({ origins: ['https://fonts.example.com', 'https://collect.example.net'] });
+    expect(effectiveGrants(['origins'], approved, added)).toEqual([]);
+    expect(effectiveGrants(['origins'], undefined, approved)).toEqual([]);
+  });
+
   test('never counts a scoped grant without a recorded scope', () => {
     expect(effectiveGrants(granted, undefined, guestGrantScope(guest))).toEqual(['prompt']);
   });
@@ -71,5 +80,31 @@ describe('oauth endpoints', () => {
     expect(effectiveGrants(['network'], approved, moved)).toEqual([]);
     expect(sameCredentialTarget(approved, moved)).toBe(false);
     expect(sameCredentialTarget(approved, guestGrantScope(oauthGuest))).toBe(true);
+  });
+});
+
+describe('the Git host role in the service grant', () => {
+  const sourceControl = (defaultInstances, custom) => ({ instances: { defaultInstances, custom } });
+  const provider = (contribution) => ({
+    service: { ...guest.service, provides: ['source-control'] },
+    sourceControl: contribution,
+  });
+
+  test('covers the instances the role reaches, and nothing for a service without it', () => {
+    expect(guestGrantScope(provider(sourceControl(['https://b.example', 'https://a.example'], false))).service).toEqual({
+      exec: ['docker'], sockets: ['docker'], sourceControl: { defaultInstances: ['https://a.example', 'https://b.example'], custom: false },
+    });
+    expect(guestGrantScope(guest).service).not.toHaveProperty('sourceControl');
+  });
+
+  test('asks again when a version adds the role or changes where it reaches', () => {
+    const plain = guestGrantScope(guest);
+    const narrow = guestGrantScope(provider(sourceControl(['https://a.example'], false)));
+    expect(effectiveGrants(['service'], plain, narrow)).toEqual([]);
+    expect(effectiveGrants(['service'], narrow, guestGrantScope(provider(sourceControl(['https://a.example'], true))))).toEqual([]);
+    expect(effectiveGrants(['service'], narrow, guestGrantScope(provider(sourceControl(['https://c.example'], false))))).toEqual([]);
+    expect(effectiveGrants(['service'], narrow, narrow)).toEqual(['service']);
+    // Dropping the role is a narrower package: it was approved for more.
+    expect(effectiveGrants(['service'], narrow, plain)).toEqual([]);
   });
 });

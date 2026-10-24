@@ -11,7 +11,13 @@ import { cn } from '@/lib/utils';
 type GoToLineDialogProps = {
   open: boolean;
   onOpenChange: (open: boolean) => void;
-  view: EditorView | null;
+  /**
+   * The editor arrives as a ref, never as the view itself: React's dev
+   * profiling walks changed props deep enough to reach the view's window and
+   * its frames, and a cross-origin extension frame there throws mid-commit,
+   * which leaves the whole app unable to render (react#34840).
+   */
+  viewRef: React.RefObject<EditorView | null>;
   variant?: 'overlay' | 'inline';
 };
 
@@ -54,8 +60,10 @@ const moveSelectionToLine = (view: EditorView, lineNumber: number, preferredChar
   });
 };
 
-export function GoToLineDialog({ open, onOpenChange, view, variant = 'overlay' }: GoToLineDialogProps) {
+export function GoToLineDialog({ open, onOpenChange, viewRef, variant = 'overlay' }: GoToLineDialogProps) {
   const { t } = useI18n();
+  // The owner re-renders when its editor mounts or goes away.
+  const view = viewRef.current;
   const [inputValue, setInputValue] = React.useState('');
   const initialCursorRef = React.useRef<CursorSnapshot | null>(null);
   const committedRef = React.useRef(false);
@@ -117,6 +125,14 @@ export function GoToLineDialog({ open, onOpenChange, view, variant = 'overlay' }
     });
   }, [view]);
 
+  // Closed from outside (the toolbar button) without going to a line: put
+  // the cursor back, as Escape and an outside click do.
+  const wasOpenRef = React.useRef(open);
+  React.useEffect(() => {
+    if (wasOpenRef.current && !open) restoreInitialSelection();
+    wasOpenRef.current = open;
+  }, [open, restoreInitialSelection]);
+
   const handleOpenChange = React.useCallback((nextOpen: boolean) => {
     if (!nextOpen) {
       restoreInitialSelection();
@@ -143,9 +159,12 @@ export function GoToLineDialog({ open, onOpenChange, view, variant = 'overlay' }
     const handlePointerDown = (event: PointerEvent) => {
       const panel = panelRef.current;
       const target = event.target;
-      if (!panel || !(target instanceof Node) || panel.contains(target)) {
+      if (!panel || !(target instanceof Element) || panel.contains(target)) {
         return;
       }
+      // The toolbar button closes the panel with its own click; closing here
+      // first would let that click open it again.
+      if (target.closest('[data-go-to-line-toggle]')) return;
       handleOpenChange(false);
     };
 
@@ -189,7 +208,8 @@ export function GoToLineDialog({ open, onOpenChange, view, variant = 'overlay' }
     return (
       <div
         ref={panelRef}
-        className="ml-1 flex h-6 items-center gap-1"
+        data-editor-overlay
+        className="ms-1 flex h-6 items-center gap-1"
       >
         <Input
           ref={inputRef}
@@ -224,8 +244,9 @@ export function GoToLineDialog({ open, onOpenChange, view, variant = 'overlay' }
   return (
     <div
       ref={panelRef}
+      data-editor-overlay
       className={cn(
-        'absolute left-3 top-3 z-40 w-[min(32rem,calc(100%-1.5rem))] rounded-xl border border-[var(--interactive-border)] bg-[color:color-mix(in_srgb,var(--surface-elevated)_94%,transparent)] p-2.5 shadow-lg backdrop-blur-sm transition-all',
+        'absolute inset-s-3 top-3 z-40 w-[min(32rem,calc(100%-1.5rem))] rounded-xl border border-[var(--interactive-border)] bg-[color:color-mix(in_srgb,var(--surface-elevated)_94%,transparent)] p-2.5 shadow-lg backdrop-blur-sm transition-all',
         open ? 'pointer-events-auto translate-y-0 opacity-100' : 'pointer-events-none -translate-y-1 opacity-0',
       )}
     >

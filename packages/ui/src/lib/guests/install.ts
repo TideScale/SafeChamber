@@ -1,10 +1,13 @@
 import type { GuestCapability } from '@openchamber/sdk';
 import { runtimeFetch } from '@/lib/runtime-fetch';
+import { getRuntimeKey } from '@/lib/runtime-switch';
 import { z } from 'zod';
 
-import { parseInstalledGuestJson } from './parse.ts';
+import { parseInstallAnswerJson } from './parse.ts';
 import type { InstalledGuest } from './types.ts';
 import type { GuestRequestFailure } from './request-failure.ts';
+import { removeDeviceGuestStorage } from './device-storage.ts';
+import { useGuestsStore } from './store.ts';
 
 const errorSchema = z.object({
   error: z.enum([
@@ -19,8 +22,10 @@ const errorSchema = z.object({
     'bundled',
     'reserved-id',
     'clone-failed',
+    'clone-auth-failed',
     'extract-failed',
     'too-large',
+    'enterprise-mode',
   ]),
   required: z.string().trim().min(1).max(64).optional(),
   id: z.string().trim().min(1).max(128).optional(),
@@ -38,8 +43,12 @@ export type InstallGuestErrorCode =
   | 'bundled'
   | 'reserved-id'
   | 'clone-failed'
+  | 'clone-auth-failed'
   | 'extract-failed'
   | 'too-large'
+  | 'enterprise-mode'
+  /** The server installed it, but this build cannot read the row it answered with. */
+  | 'unreadable'
   | 'failed';
 
 type InstallGuestResult =
@@ -100,7 +109,7 @@ const readInstallError = async (
   }
 };
 
-export type InstallGuestOptions = {
+type InstallGuestOptions = {
   replace?: boolean;
   gitIdentityId?: string;
 };
@@ -111,7 +120,10 @@ const readInstallResponse = async (response: Response, path: GuestRequestFailure
     return { ok: false, ...error, diagnostic: { method: 'POST', path, kind: 'http', status: response.status } };
   }
   const content = await response.text().catch(() => null);
-  const guest = content === null ? null : parseInstalledGuestJson(content);
+  const guest = content === null ? null : parseInstallAnswerJson(content);
+  if (guest === 'unreadable') {
+    return { ok: false, code: 'unreadable' };
+  }
   if (!guest) {
     return { ok: false, code: 'failed', diagnostic: { method: 'POST', path, kind: 'invalid-response', status: response.status } };
   }
@@ -168,9 +180,20 @@ export const uploadGuestZip = async (
 };
 
 export const uninstallGuest = async (id: string): Promise<UninstallGuestResult> => {
+  const catalog = useGuestsStore.getState();
+  const runtimeKey = getRuntimeKey();
+  const storageId = catalog.runtimeKey === runtimeKey
+    ? catalog.guests.find((guest) => guest.id === id)?.storageId : undefined;
   try {
     const response = await runtimeFetch(`/api/guests/${id}`, { method: 'DELETE' });
     if (response.status === 204) {
+      if (storageId && globalThis.indexedDB) {
+        // Server removal has already succeeded. A failed local cleanup cannot undo it;
+        // the retired installation identity makes any retained bytes inaccessible.
+        await removeDeviceGuestStorage({ runtimeKey, guestId: id, storageId }).catch(() => {
+          console.warn('Could not clear local extension preferences.');
+        });
+      }
       return { ok: true };
     }
     const error = await readInstallError(response);

@@ -23,12 +23,15 @@ Auto. There is no env gate — the feature shipped dark behind
   for routing and for the safety net, history excerpt limits.
 - `classifier.js` — the classification providers: `resolveClassifier` (the
   user's pick, what is usable, and the source that actually answers) and
-  `classifierEndpoint` (where a request for a source goes), and
-  `legacyClassifier` (the view older clients parse).
+  `classifierEndpoint` (where a request for a source goes),
+  `legacyClassifier` (the view older clients parse) and
+  `parseCustomEndpointUrl` (the custom endpoint's request URL).
 - `store.js` — `routing.json` (only deviations from the built-ins),
-  `routing-auth.json` (the TypeSafe key alone, mode 0600) and
-  `classification.json` (the classification provider pick) in the OpenChamber
-  data dir. An unreadable pick file reads as no pick. `resolveEffectiveConfig` merges built-ins with stored overrides;
+  `routing-auth.json` (the TypeSafe key alone, mode 0600),
+  `classification.json` (the classification provider pick) and
+  `classifier-endpoint.json` (the custom endpoint, mode 0600) in the
+  OpenChamber data dir. An unreadable pick file reads as no pick, an
+  unreadable endpoint file as no endpoint. `resolveEffectiveConfig` merges built-ins with stored overrides;
   `toStoredConfig` is its inverse. A missing file is the defaults, a malformed
   one throws.
 - `jev.js` — request builders, answer parsing, and the HTTP call with a
@@ -36,15 +39,26 @@ Auto. There is no env gate — the feature shipped dark behind
 - `history.js` — the last three settled turns through session assist's
   `loadAssistContext` (text parts only, attached quotes included, no files or
   tool payloads), each user message cut to its head and each answer to head
-  plus tail. The new request is never cut.
+  plus tail. The new request is never cut. Also the model that wrote the last
+  settled answer and when it finished (`lastAnswer`), for `cache.js`.
+- `cache.js` — "Try to preserve cache usage": which category a send stays on
+  while the current model's prompt cache is likely warm (`cacheHoldCategory`),
+  and how long that is given OpenCode's `warming` config (`warmWindowMs`).
 - `runtime.js` — `createRoutingRuntime`: `describe`, `classifierEndpoint` (the
   endpoint a Jev request goes to now, or null; also used by
   `../session-work` and `../session-goal`), `noteModelSelection`,
   `isAutoSession`, `resolveAutoSelection`, `applySessionSelection`, `routeSend`,
-  `evaluatePermission`, `legacySafetyNetEnabled`, config, token and classifier
-  writes, event broadcasts.
+  `evaluatePermission`, `legacySafetyNetEnabled`, config, token, classifier and
+  custom endpoint writes, event broadcasts, and `testClassifier` (one probe
+  request from Settings' Test button, through the provider answering now or
+  through custom endpoint fields as typed; stores nothing, and typed fields are
+  refused in enterprise mode like a save). The classifier judges the user's
+  text plus one attachment fact for sends with images (`attachmentHint`,
+  `routingRequestTextOf`); that fact never reaches OpenCode.
 - `routes.js` — `/api/routing` (GET, PUT), `/api/routing/token` (PUT, DELETE),
-  `/api/routing/classifier` (PUT) and `registerRoutingPromptRewrite`.
+  `/api/routing/classifier` (PUT), `/api/routing/classifier/custom` (PUT,
+  DELETE), `/api/routing/classifier/test` (POST) and
+  `registerRoutingPromptRewrite`.
 
 ## Invariants
 
@@ -68,6 +82,10 @@ Auto. There is no env gate — the feature shipped dark behind
 - Routing failures keep the user's own behaviour: a Jev error, timeout, unknown
   category or low confidence routes to the fallback model, and the decision
   carries the reason.
+- The routing question sends `ROUTING_INSTRUCTIONS` as one string, the same
+  form as the Test probe. TypeSafe also accepts a list there, but a
+  self-hosted System One server may not: Kev answers a list with 400, so Auto
+  fell back on every send while Test passed (#4175).
 - The safety net accepts only on a verdict from Jev. With no usable
   classification provider it holds quietly (the session behaves like `ask`);
   when Jev fails it holds, broadcasts `openchamber:routing.safety-skipped` with
@@ -79,6 +97,27 @@ Auto. There is no env gate — the feature shipped dark behind
 - A category without a model uses the fallback model *and* variant; a variant
   only travels with the model it was chosen for. A category agent replaces the
   composer's agent; an empty one keeps it.
+- A variant the model's catalog entry does not list is dropped before the
+  switch, so the reply runs on the model's default thinking instead of OpenCode
+  refusing it (Settings from before #4133 saved list positions like `"2"`).
+  An unreadable catalog, or one that does not know the model yet, keeps it.
+- A provider's prompt cache belongs to one model, so a model switch makes the
+  new model read the whole context uncached. With `preserveCache` on (the
+  default; a config without the key reads as on), a send Jev routes to a
+  built-in category below the one the session is on runs as that one instead,
+  while the cache is likely warm. "Below" is the built-in order trivial <
+  research < implement < hard; the session is on the highest enabled built-in
+  category whose model wrote the last settled answer. Moving up is never held,
+  and neither is a send routed to a user category, a fallback for low
+  confidence or an error, or a hold that would change the agent (another
+  agent is another system prompt, which misses the cache anyway). Warm means
+  within 5 minutes of the last answer finishing; for a session OpenChamber
+  keeps warm itself (`../session-warming`, `isSessionWarm`), until its warm
+  window ends plus 5 minutes; otherwise, when OpenCode's `warming` is on for the
+  directory, within its `duration` (30 minutes for `true`) plus 5 minutes. The
+  config is read only after the first 5 minutes, and not for a session
+  OpenChamber keeps warm; an unreadable one counts as warming off. The decision event names the category the send
+  ran as and carries `cacheHold.requested`, the one Jev chose.
 - Auto is offered (`autoReady`) with a usable classification provider
   (`jevAvailable`), `enabled`, a fallback model and at least two enabled
   categories.
@@ -113,6 +152,35 @@ Classification providers:
   (checked 2026-09-27); a paid call is not verified live yet.
 - `typesafe`: `api.typesafe.ai/v1/systemone` as `jev-latest` with the key saved
   in `routing-auth.json`. Saving a key also picks it.
+- `custom`: any endpoint that speaks the System One API, with the URL, model
+  and optional key the user saved (`classifier-endpoint.json`, mode 0600, its
+  own file so a token write never rewrites it). The key goes as a bearer when
+  present; `describe` returns `customEndpoint` as URL, model and `keyPresent`,
+  never the key. `setCustomEndpoint` stores the request URL exactly as pasted
+  (trimmed, without a `#fragment`) and appends nothing: a company proxy can
+  serve System One on any path, so only the user knows the full address. Before
+  2026-10-05 a `/v1` base or an API root got `/v1/systemone` appended; URLs
+  saved then are already full and read back unchanged, but a pin written in
+  that short form now needs the full address. Only http(s), no credentials in
+  the URL. It does not go through the TTS remote-URL gate: a remote classifier is
+  the user's explicit choice, the same as the hosted sources. Saving picks it;
+  a missing `key` keeps the saved one, null removes it without changing the
+  pick.
+  An administrator can pin the endpoint (`readPinnedCustomEndpoint`): `jev` in
+  the machine policy file, else `OPENCHAMBER_JEV_URL`, `OPENCHAMBER_JEV_MODEL`
+  defaulting to `jev-latest`, optional `OPENCHAMBER_JEV_API_KEY` (source rules
+  in `../enterprise-mode.js`). The pin
+  replaces the saved endpoint, `customEndpoint.pinned` tells the page to show
+  it read-only, and `setCustomEndpoint` / `clearCustomEndpoint` answer 409.
+
+In enterprise mode (policy file or `OPENCHAMBER_ENTERPRISE_MODE`, `../enterprise-mode.js`)
+`resolveAccess` treats the pick as `off` whatever is stored (the stored pick is
+kept for when the mode is lifted), `setClassifierSource` refuses anything but
+`off` and `setToken` and `setCustomEndpoint` refuse every write with 403, and `describe` reports
+`enterpriseMode` so the page shows why only Off is offered. With a pinned
+endpoint it is the administrator's own infrastructure, so it becomes the
+default (`custom` unless the stored pick is `off`) and `custom` is the one
+other pick allowed.
 
 Jev reads conversation excerpts, so it is opt-in. Without a stored pick the
 default is `typesafe` when a key is saved (saving a key is choosing it, and it
@@ -120,7 +188,9 @@ always won before the pick existed) and `off` otherwise. Until v2.0.3 the
 default was `zen-promo`, which sent every message of users who never opened
 this page to zen (#4109); an install without a stored pick now reads as `off`
 with no conversion. A pick that cannot be used falls back to the first usable
-key (`typesafe`, `openrouter`, `vercel`, `zen-key`); none usable means no Jev.
+key (`typesafe`, `custom`, `openrouter`, `vercel`, `zen-key`: what the user set
+up in OpenChamber for Jev before keys borrowed from OpenCode); none usable
+means no Jev.
 `zen-promo` needs no credential, so it is never a fallback: only an explicit
 pick sends anything there, and `off` never falls back.
 The OpenCode keys are read on every request, so a key added or removed in
@@ -150,38 +220,41 @@ limited time", and the keys are what users fall back to when it ends.
 Broadcast on the OpenChamber control stream: `openchamber:routing.updated`
 (availability, including `jevAvailable`), `openchamber:routing.decision` (per
 send), `openchamber:routing.permission-held`,
-`openchamber:routing.safety-skipped`. The last two carry the request's
-directory so the UI can raise the permission toast for a held request.
+`openchamber:routing.safety-skipped`. Showing the held request itself is not
+routing's job: the permission auto-accept runtime reports every request it
+left for the user (`../permission-auto-accept/DOCUMENTATION.md`).
 
 `/api/routing` keeps `jevSource` (`typesafe` or `zen-free`) for clients from
 before the classifier pick and adds `jevAvailable`, `classifier` and
 `classification` (both `selected`, `effective`, `sources`). `classification`
 is the full picture. `classifier` is what v2.0.2 clients parse: their schema
 knows only `zen-promo`, `zen-key` and `typesafe` and rejects the whole state
-on any other id, so it lists only those and is null while OpenRouter or
-Vercel is picked or answering (`legacyClassifier`). Current clients read
+on any other id, so it lists only those and is null while OpenRouter,
+Vercel or a custom endpoint is picked or answering (`legacyClassifier`). Current clients read
 `classification` and drop source ids they do not know.
 
 ## UI
 
 `packages/ui/src/stores/useRoutingStore.ts` projects `/api/routing` and these
 events (`selectSafetyNetAvailable` gates the safety-net mode everywhere);
-`hooks/useRoutingSync.ts` keeps it current, shows the skipped-check toast and
-raises the permission toast for a held request (`notifyHeldPermission`). `lib/routing/autoModel.ts` owns the sentinel; `useConfigStore` accepts it
+`hooks/useRoutingSync.ts` keeps it current and shows the skipped-check toast. `lib/routing/autoModel.ts` owns the sentinel; `useConfigStore` accepts it
 as a valid selection while `autoReady`. `ModelPickerList` renders it as the
 pinned `leadingEntry`; `ModelControls` hides the agent and thinking controls
 while Auto is selected. `PermissionCard` shows the hold reason. Settings →
 Routing (`components/sections/routing/RoutingPage.tsx`) edits the config with
 debounced saves. Settings → Providers → Classification providers
 (`components/sections/classification/ClassificationProvidersPage.tsx`) picks
-the source and manages the TypeSafe key; `JevAccessNote` links there from the
+the source and manages the TypeSafe key and, through `CustomEndpointFields.tsx`,
+the custom endpoint; `JevAccessNote` links there from the
 features that need Jev.
 
 ## Tests
 
-`store.test.js` (defaults, deviation round-trip, deleted built-ins, malformed
-file, token file mode, classifier pick), `runtime.test.js` (request text,
-excerpts, decisions, endpoints, classifier fallback, rewrite and fallback
+`store.test.js` (defaults, deviation round-trip, the cache setting's default,
+deleted built-ins, malformed
+file, token file mode, classifier pick, custom endpoint file), `runtime.test.js` (request text,
+excerpts, decisions, cache holds and the warm window, endpoints, custom URL normalization and setter,
+classifier fallback, rewrite and fallback
 paths, safety net accept/hold/skip/unavailable), `routes.http.test.js`
 (sentinel dropped from a create and swallowed on the model switch, routed send
 ahead of a stand-in proxy, the routes). The queue and auto-accept tests cover

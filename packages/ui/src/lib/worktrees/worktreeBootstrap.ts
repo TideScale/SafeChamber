@@ -1,4 +1,5 @@
 import * as gitHttp from '@/lib/gitApiHttp';
+import { normalizePath as normalizePathImpl } from '@/lib/pathNormalization';
 import type { GitWorktreeBootstrapStatus } from '@/lib/api/types';
 import { getRegisteredRuntimeAPIs } from '@/contexts/runtimeAPIRegistry';
 import { toast } from '@/components/ui';
@@ -8,10 +9,13 @@ type WorktreeBootstrapState = GitWorktreeBootstrapStatus;
 type WorktreeBootstrapFailureHandler = (status: GitWorktreeBootstrapStatus) => void;
 type WorktreeBootstrapReadyHandler = (status: GitWorktreeBootstrapStatus) => void;
 
-const DEFAULT_TIMEOUT_MS = 5 * 60 * 1000;
+// Only the checkout has a deadline, the same one the server's OpenCode gate
+// applies. Setup commands in a large repository can run far longer, and the
+// server reports when they end, fail or die with it.
+const CHECKOUT_TIMEOUT_MS = 5 * 60 * 1000;
 const POLL_INTERVAL_MS = 250;
 
-const normalizePath = (value: string): string => value.replace(/\\/g, '/').replace(/\/+$/, '') || value;
+const normalizePath = (value: string | null | undefined): string => normalizePathImpl(value) ?? '';
 
 const state = new Map<string, WorktreeBootstrapState>();
 type WorktreeBootstrapTarget = 'git-ready' | 'setup-ready';
@@ -68,6 +72,9 @@ const phaseRank = (phase: GitWorktreeBootstrapStatus['phase']): number => {
       return 0;
   }
 };
+
+const isWithinCheckoutDeadline = (key: string, startedAt: number, checkoutTimeoutMs: number): boolean =>
+  phaseRank(state.get(key)?.phase) >= phaseRank('git-ready') || Date.now() - startedAt < checkoutTimeoutMs;
 
 const storePolledState = (
   key: string,
@@ -159,6 +166,27 @@ const createFailedStatus = (error: string): GitWorktreeBootstrapStatus => ({
   updatedAt: Date.now(),
 });
 
+const bootstrapFailureDescription = (status: GitWorktreeBootstrapStatus): string => {
+  switch (status.errorCode) {
+    case 'AUTHENTICATION_REQUIRED':
+      return t('worktree.bootstrap.toast.authorizationRequired');
+    case 'GIT_LFS_CLIENT_MISSING':
+      return t('worktree.bootstrap.toast.lfsClientMissing');
+    case 'INVALID_REQUEST':
+      return t('worktree.bootstrap.toast.invalidConfiguration');
+    case 'CHECKOUT_TOO_LARGE':
+      return t('worktree.bootstrap.toast.repositoryTooManyFiles');
+    case 'CANCELLED':
+      return t('worktree.bootstrap.toast.cancelled');
+    case 'TIMEOUT':
+      return t('worktree.bootstrap.toast.timeoutDescription');
+    case 'TRANSPORT_FAILED':
+      return t('worktree.bootstrap.toast.transportFailed');
+    default:
+      return status.error || t('worktree.bootstrap.toast.failedDescription');
+  }
+};
+
 const markBootstrapFailed = (
   directory: string,
   error: string,
@@ -180,12 +208,11 @@ const pollWorktreeBootstrapUntilSettled = async (
   directory: string,
   key: string,
   lifecycleVersion: number,
-  timeoutMs: number,
   target: WorktreeBootstrapTarget,
 ): Promise<void> => {
   const startedAt = Date.now();
 
-  while (Date.now() - startedAt < timeoutMs) {
+  while (isWithinCheckoutDeadline(key, startedAt, CHECKOUT_TIMEOUT_MS)) {
     const result = await getGitWorktreeBootstrapStatus(directory);
     const current = storePolledState(key, result, lifecycleVersion);
     if (!current) {
@@ -211,14 +238,14 @@ const pollWorktreeBootstrapInBackground = async (
   directory: string,
   key: string,
   watcher: { cancelled: boolean; lifecycleVersion: number },
-  timeoutMs: number,
+  checkoutTimeoutMs: number,
   pollIntervalMs: number,
   onFailed?: WorktreeBootstrapFailureHandler,
   onReady?: WorktreeBootstrapReadyHandler,
 ): Promise<void> => {
   const startedAt = Date.now();
 
-  while (!watcher.cancelled && Date.now() - startedAt < timeoutMs) {
+  while (!watcher.cancelled && isWithinCheckoutDeadline(key, startedAt, checkoutTimeoutMs)) {
     const result = await getGitWorktreeBootstrapStatus(directory);
     if (watcher.cancelled) {
       return;
@@ -236,7 +263,7 @@ const pollWorktreeBootstrapInBackground = async (
     if (current.status === 'failed') {
       onFailed?.(current);
       toast.error(t('worktree.bootstrap.toast.failed'), {
-        description: current.error || t('worktree.bootstrap.toast.failedDescription'),
+        description: bootstrapFailureDescription(current),
       });
       return;
     }
@@ -255,7 +282,7 @@ const pollWorktreeBootstrapInBackground = async (
 export const startWorktreeBootstrapWatcher = (
   directory: string,
   options?: {
-    timeoutMs?: number;
+    checkoutTimeoutMs?: number;
     pollIntervalMs?: number;
     onFailed?: WorktreeBootstrapFailureHandler;
     onReady?: WorktreeBootstrapReadyHandler;
@@ -283,7 +310,7 @@ export const startWorktreeBootstrapWatcher = (
     directory,
     key,
     watcher,
-    options?.timeoutMs ?? DEFAULT_TIMEOUT_MS,
+    options?.checkoutTimeoutMs ?? CHECKOUT_TIMEOUT_MS,
     options?.pollIntervalMs ?? POLL_INTERVAL_MS,
     options?.onFailed,
     options?.onReady,
@@ -310,7 +337,6 @@ export const startWorktreeBootstrapWatcher = (
 const waitForWorktreePhase = async (
   directory: string,
   target: WorktreeBootstrapTarget,
-  timeoutMs = DEFAULT_TIMEOUT_MS,
 ): Promise<void> => {
   const key = getKey(directory);
   if (!key) {
@@ -336,7 +362,7 @@ const waitForWorktreePhase = async (
   }
 
   const lifecycleVersion = lifecycleVersions.get(key) ?? 0;
-  const pending = pollWorktreeBootstrapUntilSettled(directory, key, lifecycleVersion, timeoutMs, target).finally(() => {
+  const pending = pollWorktreeBootstrapUntilSettled(directory, key, lifecycleVersion, target).finally(() => {
     if (waiters.get(waiterKey) === pending) {
       waiters.delete(waiterKey);
     }
@@ -345,8 +371,8 @@ const waitForWorktreePhase = async (
   return pending;
 };
 
-export const waitForWorktreeGitReady = (directory: string, timeoutMs = DEFAULT_TIMEOUT_MS): Promise<void> =>
-  waitForWorktreePhase(directory, 'git-ready', timeoutMs);
+export const waitForWorktreeGitReady = (directory: string): Promise<void> =>
+  waitForWorktreePhase(directory, 'git-ready');
 
-export const waitForWorktreeBootstrap = (directory: string, timeoutMs = DEFAULT_TIMEOUT_MS): Promise<void> =>
-  waitForWorktreePhase(directory, 'setup-ready', timeoutMs);
+export const waitForWorktreeBootstrap = (directory: string): Promise<void> =>
+  waitForWorktreePhase(directory, 'setup-ready');

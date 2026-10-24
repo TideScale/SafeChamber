@@ -1,9 +1,9 @@
 /**
- * Tests for interrupted-turn reconciliation (#2577): when a managed OpenCode
- * process dies mid-turn, the persisted turn never settles — the trailing
- * assistant message has no time.completed and its tool parts stay running.
- * Once the session is authoritatively settled, `interruptedTurnToolParts`
- * completes the assistant message as aborted and finalizes orphaned parts.
+ * Tests for interrupted-turn reconciliation (#2577): when OpenCode records a
+ * turn as interrupted or failed, the trailing assistant message can still
+ * lack time.completed and its tool parts can stay running.
+ * `interruptedTurnToolParts` completes the assistant message as aborted and
+ * finalizes orphaned parts; its callers decide that OpenCode said so.
  */
 import { describe, expect, test } from "bun:test"
 import type { Message, Part, ToolPart } from "@/lib/opencode/model"
@@ -65,6 +65,7 @@ describe("interruptedTurnToolParts (#2577)", () => {
       ...unfinishedAssistantMessage("msg_1"),
       time: { created: 10, completed: 5000 },
       error: { type: "aborted", message: "aborted" },
+      closedLocally: true,
     })
   })
 
@@ -77,12 +78,12 @@ describe("interruptedTurnToolParts (#2577)", () => {
     expect(interruptedTurnToolParts(store, "ses_1")).toBeNull()
   })
 
-  test("absent status is unknown, not settled — never marked", () => {
+  test("an unknown status does not block a turn OpenCode recorded as stopped", () => {
     const store = state({
       message: { ses_1: [unfinishedAssistantMessage("msg_1")] },
       part: { msg_1: [runningTool("tool_1", "msg_1")] },
     })
-    expect(interruptedTurnToolParts(store, "ses_1")).toBeNull()
+    expect(interruptedTurnToolParts(store, "ses_1")).not.toBeNull()
   })
 
   test("finished message is not an interruption (tail refresh reconciles it)", () => {
@@ -143,6 +144,24 @@ describe("interruptedTurnToolParts (#2577)", () => {
       ...unfinishedAssistantMessage("msg_1"),
       time: { created: 10, completed: 5000 },
       error: { type: "aborted", message: "aborted" },
+      closedLocally: true,
+    })
+  })
+
+  test("a failed turn closes the message with the error OpenCode reported", () => {
+    const store = state({
+      session_status: { ses_1: { type: "idle" } },
+      message: { ses_1: [unfinishedAssistantMessage("msg_1")] },
+      part: {},
+    })
+    const quota = { type: "provider", message: "quota exceeded" }
+
+    const result = interruptedTurnToolParts(store, "ses_1", 5000, quota)
+    expect(result!.messages[0]).toEqual({
+      ...unfinishedAssistantMessage("msg_1"),
+      time: { created: 10, completed: 5000 },
+      error: quota,
+      closedLocally: true,
     })
   })
 
@@ -162,6 +181,7 @@ describe("interruptedTurnToolParts (#2577)", () => {
       ...unfinishedAssistantMessage("msg_1"),
       time: { created: 10, completed: 5000 },
       error: { type: "aborted", message: "aborted" },
+      closedLocally: true,
     })
   })
 })

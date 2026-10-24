@@ -1,13 +1,15 @@
+import { asNonEmptyString } from '../shared/guards.js';
 import fs from 'node:fs';
 import path from 'node:path';
 import { OpenChamberControlError } from '../openchamber-control/error.js';
-import { setLoopFileEnabled } from './loops.js';
+import { discoverLoopFiles, loopFingerprint, parseLoopDefinition, setLoopFileEnabled } from './loops.js';
 
-const asNonEmptyString = (value) => {
-  if (typeof value !== 'string') return null;
-  const trimmed = value.trim();
-  return trimmed.length > 0 ? trimmed : null;
-};
+const samePath = (a, b) => a && b && path.resolve(a) === path.resolve(b);
+
+// Same scope rule the scheduler applies: a file under the project's own
+// `.agents/loops` is a repository loop, even where it is also the user folder.
+const isRepositoryLoop = (projectPath, loopFile) => discoverLoopFiles(projectPath)
+  .some((entry) => entry.scope === 'project' && entry.filePath === loopFile);
 
 export const createScheduledTaskService = (dependencies) => {
   const {
@@ -15,6 +17,10 @@ export const createScheduledTaskService = (dependencies) => {
     sanitizeProjects,
     projectConfigRuntime,
     scheduledTasksRuntime,
+    chatsScope = null,
+    // Git helper that maps a linked worktree back to the checkout it came from;
+    // see resolveProjectID.
+    resolvePrimaryWorktreeRoot = null,
   } = dependencies;
 
   const listProjects = async () => {
@@ -22,13 +28,17 @@ export const createScheduledTaskService = (dependencies) => {
     return sanitizeProjects(settings?.projects || []);
   };
 
+  // Resolves a project or the chats scope; every method below keys the
+  // runtime and config by the returned id, never by the raw request value.
   const findProjectByID = async (projectID) => {
-    const normalized = asNonEmptyString(projectID);
-    if (!normalized) throw new OpenChamberControlError('projectId is required', 400);
+    const requested = asNonEmptyString(projectID);
+    if (!requested) throw new OpenChamberControlError('projectId is required', 400);
+    const normalized = chatsScope ? chatsScope.toStorageID(requested) : requested;
     const projects = await listProjects();
     const project = projects.find((entry) => entry.id === normalized) || null;
-    if (!project) throw new OpenChamberControlError('Project not found', 404);
-    return project;
+    if (project) return project;
+    if (chatsScope && normalized === chatsScope.id) return { id: chatsScope.id, path: chatsScope.root };
+    throw new OpenChamberControlError('Project not found', 404);
   };
 
   const resolveProjectID = async ({ projectId, directory } = {}) => {
@@ -38,39 +48,57 @@ export const createScheduledTaskService = (dependencies) => {
       throw new OpenChamberControlError('Provide only one of projectId or directory', 400);
     }
     if (requestedProjectID) {
-      await findProjectByID(requestedProjectID);
-      return requestedProjectID;
+      return (await findProjectByID(requestedProjectID)).id;
     }
     if (!requestedDirectory) throw new OpenChamberControlError('projectId or directory is required', 400);
     const resolvedDirectory = path.resolve(requestedDirectory);
     const projects = await listProjects();
-    const project = projects.find((entry) => path.resolve(entry.path) === resolvedDirectory);
-    if (!project) throw new OpenChamberControlError(`Project not found for directory: ${resolvedDirectory}`, 404);
-    return project.id;
+    const project = projects.find((entry) => samePath(entry.path, resolvedDirectory));
+    if (project) return project.id;
+    // A session in a linked worktree of a registered project schedules for
+    // that project: the worktree itself is almost never registered, and the
+    // project root checkout is what its record stores. A directory inside the
+    // chats scope wins first, so chats paths are never run through git.
+    if (chatsScope?.contains(resolvedDirectory)) return chatsScope.id;
+    if (resolvePrimaryWorktreeRoot) {
+      try {
+        const primaryRoot = asNonEmptyString((await resolvePrimaryWorktreeRoot(resolvedDirectory))?.root);
+        if (primaryRoot && !samePath(primaryRoot, resolvedDirectory)) {
+          const owner = projects.find((entry) => samePath(entry.path, primaryRoot));
+          if (owner) return owner.id;
+        }
+      } catch {
+        // A throwing resolver call: fall through to the unchanged 404.
+        // resolvePrimaryWorktreeRoot itself reports the directory for a
+        // non-checkout or unavailable git, and the samePath guard above
+        // skips those, so only an unexpected throw reaches this catch.
+      }
+    }
+    throw new OpenChamberControlError(`Project not found for directory: ${resolvedDirectory}`, 404);
   };
 
   const list = async (projectID) => {
-    await findProjectByID(projectID);
-    return scheduledTasksRuntime.syncProject(projectID);
+    const { id } = await findProjectByID(projectID);
+    return scheduledTasksRuntime.syncProject(id);
   };
 
   const findLoopTask = async (projectID, taskID) => {
-    await findProjectByID(projectID);
+    const { id } = await findProjectByID(projectID);
     const normalizedTaskID = asNonEmptyString(taskID);
     if (!normalizedTaskID) throw new OpenChamberControlError('taskId is required', 400);
-    const tasks = await scheduledTasksRuntime.syncProject(projectID);
+    const tasks = await scheduledTasksRuntime.syncProject(id);
     const task = tasks.find((entry) => entry?.id === normalizedTaskID) || null;
     if (!task) throw new OpenChamberControlError('Task not found', 404);
     if (!task.loopFile) throw new OpenChamberControlError('Task is not managed by a loop file', 400);
     if (!fs.existsSync(task.loopFile)) throw new OpenChamberControlError('Loop file not found', 404);
-    return task;
+    return { id, task };
   };
 
   const setLoopEnabled = async (projectID, taskID, enabled) => {
     if (typeof enabled !== 'boolean') {
       throw new OpenChamberControlError('enabled must be a boolean', 400);
     }
-    const task = await findLoopTask(projectID, taskID);
+    const { id, task } = await findLoopTask(projectID, taskID);
     try {
       if (!setLoopFileEnabled(task.loopFile, enabled)) {
         throw new OpenChamberControlError('Loop file must be valid before changing its enabled state', 400);
@@ -80,36 +108,47 @@ export const createScheduledTaskService = (dependencies) => {
       const message = error instanceof Error ? error.message : 'Failed to update loop file';
       throw new OpenChamberControlError(message, 500);
     }
-    const tasks = await scheduledTasksRuntime.syncProject(projectID);
+    // Enabling here is the user's approval of this version of the loop on
+    // this machine; a repository loop does not run on its file's word alone.
+    const definition = enabled ? parseLoopDefinition(task.loopFile) : null;
+    await projectConfigRuntime.setLoopApproval(id, task.loopFile, definition ? loopFingerprint(definition) : null);
+    const tasks = await scheduledTasksRuntime.syncProject(id);
     return tasks.find((entry) => entry.id === taskID) || null;
   };
 
   const removeLoopFile = async (projectID, taskID) => {
-    const task = await findLoopTask(projectID, taskID);
+    const { id, task } = await findLoopTask(projectID, taskID);
     try {
       fs.unlinkSync(task.loopFile);
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Failed to delete loop file';
       throw new OpenChamberControlError(message, 500);
     }
-    return scheduledTasksRuntime.syncProject(projectID);
+    return scheduledTasksRuntime.syncProject(id);
   };
 
   const upsert = async (projectID, taskInput) => {
-    await findProjectByID(projectID);
+    const { id } = await findProjectByID(projectID);
     if (!taskInput || typeof taskInput !== 'object') {
       throw new OpenChamberControlError('task payload is required', 400);
     }
     let upserted;
+    const previous = taskInput.id ? (await projectConfigRuntime.listScheduledTasks(id)).find((task) => task.id === taskInput.id) : null;
+    if (taskInput.targetSessionId && (taskInput.enabled !== false || previous?.targetSessionId !== taskInput.targetSessionId)) {
+      await scheduledTasksRuntime.validateTarget(id, taskInput.targetSessionId);
+    }
     try {
-      upserted = await projectConfigRuntime.upsertScheduledTask(projectID, taskInput);
+      upserted = await projectConfigRuntime.upsertScheduledTask(id, taskInput);
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Failed to save scheduled task';
       const invalid = message.toLowerCase().includes('required') || message.toLowerCase().includes('invalid');
       throw new OpenChamberControlError(message, invalid ? 400 : 500);
     }
-    await scheduledTasksRuntime.syncProject(projectID);
-    const tasks = await projectConfigRuntime.listScheduledTasks(projectID);
+    if (previous?.targetSessionId && ((previous.enabled && upserted.task.enabled === false) || previous.targetSessionId !== upserted.task.targetSessionId)) {
+      await scheduledTasksRuntime.cancelWaitingPrompt(id, taskInput.id);
+    }
+    await scheduledTasksRuntime.syncProject(id);
+    const tasks = await projectConfigRuntime.listScheduledTasks(id);
     return {
       tasks,
       task: tasks.find((task) => task.id === upserted.task.id) || upserted.task,
@@ -118,10 +157,10 @@ export const createScheduledTaskService = (dependencies) => {
   };
 
   const remove = async (projectID, taskID) => {
-    await findProjectByID(projectID);
+    const { id } = await findProjectByID(projectID);
     const normalizedTaskID = asNonEmptyString(taskID);
     if (!normalizedTaskID) throw new OpenChamberControlError('taskId is required', 400);
-    const current = await projectConfigRuntime.listScheduledTasks(projectID);
+    const current = await projectConfigRuntime.listScheduledTasks(id);
     const existing = current.find((task) => task.id === normalizedTaskID) || null;
     if (existing?.loopFile && fs.existsSync(existing.loopFile)) {
       // Loop tasks are owned by their `.agents/loops` markdown file: deleting
@@ -134,39 +173,56 @@ export const createScheduledTaskService = (dependencies) => {
         400,
       );
     }
-    const result = await projectConfigRuntime.deleteScheduledTask(projectID, normalizedTaskID);
+    const result = await projectConfigRuntime.deleteScheduledTask(id, normalizedTaskID);
     if (!result.deleted) throw new OpenChamberControlError('Task not found', 404);
-    await scheduledTasksRuntime.syncProject(projectID);
-    return projectConfigRuntime.listScheduledTasks(projectID);
+    await scheduledTasksRuntime.cancelWaitingPrompt?.(id, normalizedTaskID);
+    await scheduledTasksRuntime.syncProject(id);
+    return projectConfigRuntime.listScheduledTasks(id);
   };
 
   const run = async (projectID, taskID) => {
-    await findProjectByID(projectID);
+    const { id } = await findProjectByID(projectID);
     const normalizedTaskID = asNonEmptyString(taskID);
     if (!normalizedTaskID) throw new OpenChamberControlError('taskId is required', 400);
-    const result = await scheduledTasksRuntime.runNow(projectID, normalizedTaskID);
+    const result = await scheduledTasksRuntime.runNow(id, normalizedTaskID);
     if (result.running || result.queued) {
-      throw new OpenChamberControlError(result.error || 'Task already running', 409);
+      throw new OpenChamberControlError(result.error || 'Task already running', 409, { busy: result.queued ? 'queued' : 'running' });
     }
     if (result.skipped) throw new OpenChamberControlError('Task not found or disabled', 404);
     if (!result.ok) {
-      throw new OpenChamberControlError(result.error || 'Task run failed', 500, { task: result.task });
+      throw new OpenChamberControlError(result.error || 'Task run failed', result.statusCode || 500, { task: result.task });
     }
-    return {
+    const response = {
       task: result.task,
       sessionId: result.sessionID,
       ...(typeof result.persistError === 'string' && result.persistError.trim()
         ? { persistError: result.persistError.trim() }
         : {}),
     };
+    if (result.directory) response.directory = result.directory;
+    return response;
   };
 
+  // The agent tool and the CLI. A loop task follows its file, so it changes
+  // the way the Scheduled tasks checkbox does. A repository loop is the
+  // exception for enabling: that is the user's own decision on this machine,
+  // made in Scheduled tasks, never by an agent or a script on their behalf.
   const setEnabled = async (projectID, taskID, enabled) => {
-    const tasks = await list(projectID);
+    const project = await findProjectByID(projectID);
+    const tasks = await scheduledTasksRuntime.syncProject(project.id);
     const task = tasks.find((entry) => entry?.id === taskID);
     if (!task) throw new OpenChamberControlError('Task not found', 404);
-    const result = await upsert(projectID, { ...task, enabled });
-    return result.task;
+    if (!task.loopFile) {
+      const result = await upsert(project.id, { ...task, enabled });
+      return result.task;
+    }
+    // Nothing to change: the loop file, which may be tracked in the
+    // repository, and the approval stay untouched.
+    if (enabled === task.enabled) return task;
+    if (enabled && isRepositoryLoop(project.path, task.loopFile)) {
+      throw new OpenChamberControlError(`"${task.name}" comes from this repository. Enable it in Scheduled tasks.`, 409);
+    }
+    return setLoopEnabled(project.id, task.id, enabled);
   };
 
   const status = async () => {

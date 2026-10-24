@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test"
 
 import type { SyncEvent } from "@/lib/opencode/events"
 import type { Message, Part, PermissionRequest, Session } from "@/lib/opencode/model"
+import { toolContentShellChars } from "@/lib/opencode/toolContentShells"
 import { applyDirectoryEvent, reduceGlobalEvent } from "./event-reducer"
 import { INITIAL_STATE, type State } from "./types"
 
@@ -200,9 +201,13 @@ describe("message events", () => {
   })
 
   test("a reported completion lifts the local interruption mark", () => {
-    // `interruptedTurnToolParts` closes an open turn with `{type:"aborted"}`
-    // when idle status lands before the completion event flushes.
-    const marked = assistant({ time: { created: 10, completed: 15 }, error: { type: "aborted", message: "aborted" } })
+    // `interruptedTurnToolParts` closes an open turn locally when idle status
+    // lands before the completion event flushes.
+    const marked = assistant({
+      time: { created: 10, completed: 15 },
+      error: { type: "aborted", message: "aborted" },
+      closedLocally: true,
+    })
     const draft = state({ message: { ses_1: [marked] } })
     apply(draft, {
       type: "message.patched",
@@ -210,6 +215,7 @@ describe("message events", () => {
     })
     expect(draft.message.ses_1[0]).toMatchObject({ time: { completed: 20 }, finish: "stop" })
     expect("error" in draft.message.ses_1[0]).toBe(false)
+    expect("closedLocally" in draft.message.ses_1[0]).toBe(false)
 
     // A turn that really failed keeps the error the server sent.
     const failed = state({ message: { ses_1: [marked] } })
@@ -362,6 +368,25 @@ describe("streaming parts", () => {
     ).toBe(false)
   })
 
+  test("a finished read keeps no result, since its row opens the file instead", () => {
+    const draft = state()
+    apply(draft, {
+      type: "message.part.updated",
+      properties: {
+        sessionID: "ses_1",
+        part: { id: "call_r", sessionID: "ses_1", messageID: "msg_a", type: "tool", callID: "call_r", tool: "read", state: { status: "running", input: { path: "a.ts" }, time: { start: 1 } } },
+      },
+    })
+    apply(draft, {
+      type: "message.tool.transition",
+      properties: { sessionID: "ses_1", messageID: "msg_a", partID: "call_r", transition: { kind: "success", output: "file body", executed: true, end: 2 } },
+    })
+    const done = draft.part.msg_a[0]
+    if (done.type !== "tool" || done.state.status !== "completed") throw new Error("expected completed tool")
+    expect(done.state).toEqual({ status: "completed", input: { path: "a.ts" }, output: "", metadata: { openchamberContentShell: { chars: 9 } }, time: { start: 1, end: 2 } })
+    expect(toolContentShellChars(done)).toBe(9)
+  })
+
   test("a transition for an unknown call asks for materialization", () => {
     const draft = state({ part: { msg_a: [] } })
     const result = apply(draft, {
@@ -422,25 +447,52 @@ describe("ordering and trimming", () => {
     expect(draft.part.msg_a).toEqual([legacyPart, currentPart])
   })
 
+  // OpenCode session ids descend with time: a newer session sorts first.
+  const older = () => session({ id: "ses_9", title: "Older", time: { created: 1, updated: 1 } })
+  const newest = () => session({ id: "ses_1", title: "Newest", time: { created: 2, updated: 2 } })
+
   test("trimming past the limit spares a session that still has a pending permission", () => {
-    const older = session({ id: "ses_0", title: "Older" })
     const draft = state({
-      session: [older],
+      session: [older()],
       limit: 1,
-      permission: { ses_0: [permission("perm_1", "ses_0")] },
+      permission: { ses_9: [permission("perm_1", "ses_9")] },
     })
 
-    apply(draft, { type: "session.created", properties: { info: session({ id: "ses_2", title: "Newest" }) } })
+    apply(draft, { type: "session.created", properties: { info: newest() } })
 
-    expect(draft.session.map((item) => item.id)).toEqual(["ses_0", "ses_2"])
+    expect(draft.session.map((item) => item.id)).toEqual(["ses_1", "ses_9"])
   })
 
-  test("trimming past the limit drops the oldest session with nothing pending", () => {
-    const draft = state({ session: [session({ id: "ses_0", title: "Older" })], limit: 1 })
+  test("trimming past the limit spares a session that still has a pending form", () => {
+    const draft = state({
+      session: [older()],
+      limit: 1,
+      form: { ses_9: [{ id: "frm_1", sessionID: "ses_9", title: "Pick", fields: [{ key: "answer", type: "boolean" }] }] },
+    })
 
-    apply(draft, { type: "session.created", properties: { info: session({ id: "ses_2", title: "Newest" }) } })
+    apply(draft, { type: "session.created", properties: { info: newest() } })
 
-    expect(draft.session.map((item) => item.id)).toEqual(["ses_2"])
+    expect(draft.session.map((item) => item.id)).toEqual(["ses_1", "ses_9"])
+  })
+
+  test("trimming past the limit drops the oldest session, not the one just created", () => {
+    const draft = state({ session: [older()], limit: 1 })
+
+    apply(draft, { type: "session.created", properties: { info: newest() } })
+
+    expect(draft.session.map((item) => item.id)).toEqual(["ses_1"])
+  })
+
+  test("a just-created subagent survives trimming so its parent can find it", () => {
+    const parent = session({ id: "ses_5", title: "Parent", time: { created: 5, updated: 5 } })
+    const draft = state({ session: [parent, older()], limit: 2 })
+
+    apply(draft, {
+      type: "session.created",
+      properties: { info: session({ id: "ses_1", parentID: "ses_5", time: { created: 6, updated: 6 } }) },
+    })
+
+    expect(draft.session.map((item) => item.id)).toEqual(["ses_1", "ses_5"])
   })
 })
 

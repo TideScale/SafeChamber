@@ -1,8 +1,8 @@
+import { isRecord } from '../shared/guards.js';
+import { assertPromptResponse } from '../opencode/prompt-response.js';
 import { unwrapOpenCodeResponse } from '../opencode/response-envelope.js';
 const FETCH_TIMEOUT_MS = 15_000;
 const MESSAGE_FETCH_LIMIT = 20;
-
-const isRecord = (value) => Boolean(value && typeof value === 'object' && !Array.isArray(value));
 
 const readContextState = (session) => {
   const metadata = isRecord(session?.metadata) ? session.metadata : {};
@@ -42,7 +42,6 @@ const buildContextPrompt = (entries) => {
 export const createContextObligatoryRuntime = ({
   buildOpenCodeUrl,
   getOpenCodeAuthHeaders,
-  sessionKnowledgeRuntime = null,
   persistContextCursor = null,
   readSessionMetadata = null,
 }) => {
@@ -63,7 +62,11 @@ export const createContextObligatoryRuntime = ({
       ...(body ? { body: JSON.stringify(body) } : {}),
       signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
     });
-    if (!response.ok) throw new Error(`OpenCode ${method} ${fetchPath} failed with ${response.status}`);
+    if (method === 'POST' && fetchPath.endsWith('/synthetic')) {
+      await assertPromptResponse(response, 'session.synthetic');
+    } else if (!response.ok) {
+      throw new Error(`OpenCode ${method} ${fetchPath} failed with ${response.status}`);
+    }
     return unwrapOpenCodeResponse(await response.json().catch(() => null));
   };
 
@@ -74,25 +77,9 @@ export const createContextObligatoryRuntime = ({
     const stored = { metadata: await readSessionMetadata(sessionId) };
     const state = readContextState(stored);
 
-    /**
-     * Project knowledge rides along with the pinned messages. Compaction takes
-     * both away, and both are restored for the same reason, so they travel as
-     * one message: two synthetic turns back to back would read as the agent
-     * being interrupted twice.
-     */
-    const knowledge = sessionKnowledgeRuntime
-      ? await sessionKnowledgeRuntime
-        .resolvePending(
-          directory,
-          // Compaction removed the previously delivered block, so its stored
-          // signature is no longer evidence that the session still carries it.
-          '',
-          sessionKnowledgeRuntime.readPins(stored),
-        )
-        .catch(() => ({ text: '', signature: '' }))
-      : { text: '', signature: '' };
-
-    if (state.messages.length === 0 && !knowledge.text) return;
+    // Project knowledge needs nothing here: it lives in the session's
+    // instruction entries, which OpenCode carries through compaction.
+    if (state.messages.length === 0) return;
 
     const recent = await openCodeFetch(`/api/session/${encodeURIComponent(sessionId)}/message`, {
       directory,
@@ -128,7 +115,7 @@ export const createContextObligatoryRuntime = ({
       .filter((result) => result.status === 'fulfilled' && result.value.text)
       .map((result) => result.value)
       .sort((left, right) => left.pinned.createdAt - right.pinned.createdAt);
-    if (entries.length === 0 && !knowledge.text) return;
+    if (entries.length === 0) return;
 
     // v2 has no inline synthetic parts, and the model/agent selection lives on
     // the session, so the restored context is simply its own synthetic message.
@@ -136,9 +123,7 @@ export const createContextObligatoryRuntime = ({
       directory,
       method: 'POST',
       body: {
-        text: [knowledge.text, entries.length > 0 ? buildContextPrompt(entries) : '']
-          .filter(Boolean)
-          .join('\n\n---\n\n'),
+        text: buildContextPrompt(entries),
         resume: false,
       },
     });
@@ -146,13 +131,9 @@ export const createContextObligatoryRuntime = ({
     // A merge patch: the store folds this into whatever else the session's
     // `openchamber` namespace holds, so a concurrent goal or assist write is
     // not clobbered.
-    const patch = { context_obligatory_last_compaction_message_id: summary.id };
-    if (knowledge.signature) {
-      // Recorded together with the cursor: the session now carries this
-      // knowledge again, so the next send must not repeat it.
-      patch[sessionKnowledgeRuntime.metadataKey] = knowledge.signature;
-    }
-    await persistContextCursor(sessionId, directory, { openchamber: patch });
+    await persistContextCursor(sessionId, directory, {
+      openchamber: { context_obligatory_last_compaction_message_id: summary.id },
+    });
   };
 
   let parkedNoticeLogged = false;

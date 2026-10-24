@@ -110,13 +110,13 @@ OpenChamber 会读取清单，并弹出一个对话框列出扩展所请求的�
 | `files` | 读写打开项目中的文件（使用相对路径的 `readFile`、`writeFile`、`listDir`、`stat`） |
 | `model` | 使用用户的 Small Model 进行一次性文本生成（`generate`），不在任何会话中 |
 
-另有四项会自动为你加上：声明了 `integration` 时加上 `network`，声明了 `service` 时加上 `service`，声明了 `filesystem` 模式时加上 `filesystem`，会话操作请求消息时加上 `conversation`（见[操作、命令和徽标](#操作命令和徽标)）。
+另有五项会自动为你加上：声明了 `integration` 时加上 `network`，声明了 `service` 时加上 `service`，声明了 `filesystem` 模式时加上 `filesystem`，声明了 `origins` 时加上 `origins`，会话操作请求消息时加上 `conversation`（见[操作、命令和徽标](#操作命令和徽标)）。
 
 用户在安装扩展时会看到完整列表一次，然后批准或移除扩展。如果新版本请求更多权限，对话框会再次出现。调用需要用户尚未批准的能力时，会以 `NOT_GRANTED` 失败。
 
 ## 生成文本
 
-有了 `model` 能力，`host.generate` 会向用户的 Small Model 请求一次性回答：摘要、标题、草稿。内容不会进入任何会话，也不保留历史记录，扩展永远不能选择提供方。OpenChamber 使用它自己后台工作所用的同一个模型，该模型在 设置 → 会话 → Small Model 中选择，或从用户已登录的提供方中自动选取。
+有了 `model` 能力，`host.generate` 会向用户的 Small Model 请求一次性回答：摘要、标题、草稿。内容不会进入任何会话，也不保留历史记录，扩展永远不能选择提供方。OpenChamber 使用它自己后台工作所用的同一个模型，即在 设置 → 会话 → Small Model 中选择的模型，或用户正在使用的提供方的小模型，或用户 OpenCode 配置中的默认模型。
 
 ```ts
 const { text } = await host.generate({
@@ -130,7 +130,19 @@ const { text } = await host.generate({
 
 ## 账户与网络
 
-你的页面运行在沙箱中，无法直接访问互联网。声明一个 `integration`，OpenChamber 就会通过 `host.request` 替你发起调用，并附上用户的令牌。令牌永远不会到达你的页面。
+你的页面运行在沙箱中，无法自行访问网络：脚本、样式、图片、字体和媒体只能从你的包中加载，`fetch` 也只能访问你包里的文件。请把字体和图片放进包里，而不是从 CDN 加载。
+
+要与外部服务通信，请声明一个 `integration`，OpenChamber 就会通过 `host.request` 替你发起调用，并附上用户的令牌。令牌永远不会到达你的页面。
+
+对于页面需要直接访问的其他内容，比如来自 CDN 的字体或图片、公开 API，最多列出 8 个 https 源：
+
+```json
+"origins": ["https://fonts.example.com"]
+```
+
+用户会在批准对话框中看到它们，作为你的扩展可以发送和接收数据的地址；如果更新新增了源，需要再次批准。已批准的源对 `fetch`、图片、字体、样式和媒体开放，但永远不对脚本开放：代码必须随包一起提供。页面的源是 `null`，所以要读取 `fetch` 响应，服务器必须为该源允许 CORS。
+
+在[企业模式](/security/)下，带有 `origins`、`integration` 或 `service` 的扩展只能从管理员列出的 Git 仓库安装。如果你的扩展不需要它们也能工作，这些团队仍然可以安装它。要在这样的机器上开发扩展，请向管理员申请 `allowLocalExtensions`，这样就能从扩展所在的文件夹安装它。
 
 - `token`：用户在 设置 → 集成 的卡片上粘贴 API 令牌。`apiOrigin` 是 `request` 唯一可以调用的源。`account` 可选：一个 GET 路径和一个字段名，让卡片能显示已连接的是谁。`scheme` 决定令牌如何发送,见下表。请查看提供方的 API 文档,确认它期望哪种请求头。
 - `oauth`：用户粘贴 client id，由 OpenChamber 执行授权流程。需要 `authorizeUrl`、`tokenUrl` 和 `apiOrigin`。

@@ -1,8 +1,10 @@
 import path from 'node:path';
+import { availableParallelism } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { configDefaults, defineConfig } from 'vitest/config';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
+const maxWorkers = Math.max(1, Math.min(4, availableParallelism() - 1));
 
 export default defineConfig({
   resolve: {
@@ -13,6 +15,7 @@ export default defineConfig({
       // real module behind it, which is what forced mocks to hand-copy export
       // lists that then fell behind the source.
       { find: '@openchamber/sdk/schemas', replacement: path.resolve(here, '../sdk/src/schemas.ts') },
+      { find: '@openchamber/sdk/ui', replacement: path.resolve(here, '../sdk/src/ui/index.ts') },
       { find: '@openchamber/sdk', replacement: path.resolve(here, '../sdk/src/index.ts') },
       { find: '@openchamber/ui', replacement: path.resolve(here, '../ui/src') },
       { find: '@web', replacement: path.resolve(here, './src') },
@@ -22,6 +25,10 @@ export default defineConfig({
     ],
   },
   test: {
+    // Loopback integration tests and real Git subprocesses need event-loop and
+    // CPU capacity outside Vitest's workers. Saturating every logical CPU made
+    // short deadline tests and socket handshakes fail at random.
+    maxWorkers,
     // UI integration fixtures with Vite asset imports cannot execute in Bun's
     // raw TS loader. Keep them beside their UI owner and run them here.
     include: [...configDefaults.include, '../ui/src/**/*.vitest.tsx'],
@@ -31,5 +38,23 @@ export default defineConfig({
     // suite fail differently on every run.
     testTimeout: 30_000,
     hookTimeout: 30_000,
+    // Tests never touch the developer's real ~/.config/openchamber, and
+    // supertest servers listen on the loopback address it sends to.
+    setupFiles: ['./test/isolated-data-dir.ts', './test/loopback-supertest.js'],
+    // A developer who turned on enterprise mode or pinned endpoints for their
+    // own app (often in ~/.zshrc) must not flip what the suites assert; tests
+    // that need them set them themselves.
+    env: {
+      OPENCHAMBER_ENTERPRISE_MODE: '',
+      OPENCHAMBER_RELAY_URL: '',
+      OPENCHAMBER_JEV_URL: '',
+      OPENCHAMBER_JEV_MODEL: '',
+      OPENCHAMBER_JEV_API_KEY: '',
+      // OpenCode's own switches for external skills, often set by people who
+      // run OpenCode beside Claude Code.
+      OPENCODE_DISABLE_CLAUDE_CODE: '',
+      OPENCODE_DISABLE_CLAUDE_CODE_SKILLS: '',
+      OPENCODE_DISABLE_EXTERNAL_SKILLS: '',
+    },
   },
 });

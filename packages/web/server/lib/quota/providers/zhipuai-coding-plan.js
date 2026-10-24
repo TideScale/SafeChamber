@@ -16,9 +16,10 @@
  *
  * `data.level` is the plan tier (for example "lite") and becomes `planLabel`.
  */
-import { readAuthFile } from '../../opencode/auth.js';
+import { readOpenCodeCredentials } from '../../opencode/auth.js';
 import { readConfigLayers } from '../../opencode/shared.js';
 import {
+  resolveConfigApiKey,
   getAuthEntry,
   normalizeAuthEntry,
   buildResult,
@@ -61,7 +62,8 @@ const resolveUsedPercent = (limit) => {
   return Math.round((used / total) * 100);
 };
 
-const envelopeError = (payload) => {
+/** A business failure reported inside an HTTP 200 body; shared with the z.ai provider (same monitor API). */
+export const envelopeError = (payload) => {
   const code = payload?.code;
   if (payload?.success !== false && !(code !== undefined && code !== null && code !== 200)) {
     return null;
@@ -70,8 +72,7 @@ const envelopeError = (payload) => {
   return msg ?? `API error: ${code ?? 'unknown'}`;
 };
 
-function getApiKey() {
-  const auth = readAuthFile();
+function getApiKey(auth) {
   const entry = normalizeAuthEntry(getAuthEntry(auth, aliases));
   const apiKeyFromAuth = entry?.key ?? entry?.token;
 
@@ -85,7 +86,7 @@ function getApiKey() {
     for (const alias of aliases) {
       const providerConfig = mergedConfig?.provider?.[alias];
       if (providerConfig?.options?.apiKey) {
-        return providerConfig.options.apiKey;
+        return resolveConfigApiKey(providerConfig.options.apiKey);
       }
     }
   } catch {
@@ -95,12 +96,12 @@ function getApiKey() {
   return null;
 }
 
-export const isConfigured = () => {
-  return Boolean(getApiKey());
+export const isConfigured = (auth) => {
+  return Boolean(getApiKey(auth));
 };
 
 export const fetchQuota = async () => {
-  const apiKey = getApiKey();
+  const apiKey = getApiKey(await readOpenCodeCredentials());
 
   if (!apiKey) {
     return buildResult({

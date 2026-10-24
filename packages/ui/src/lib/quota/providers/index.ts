@@ -1,6 +1,6 @@
 import type { QuotaProviderId } from '@/types';
 
-export interface QuotaProviderMeta {
+interface QuotaProviderMeta {
   id: QuotaProviderId;
   name: string;
 }
@@ -12,6 +12,7 @@ export const QUOTA_PROVIDERS: QuotaProviderMeta[] = [
   { id: 'cursor', name: 'Cursor' },
   { id: 'github-copilot', name: 'GitHub Copilot' },
   { id: 'google', name: 'Google' },
+  { id: 'antigravity', name: 'Antigravity' },
   { id: 'kimi-for-coding', name: 'Kimi for Coding' },
   { id: 'nano-gpt', name: 'NanoGPT' },
   { id: 'openrouter', name: 'OpenRouter' },
@@ -22,9 +23,12 @@ export const QUOTA_PROVIDERS: QuotaProviderMeta[] = [
   { id: 'ollama-cloud', name: 'Ollama Cloud' },
   { id: 'wafer', name: 'Wafer.ai' },
   { id: 'opencode-go', name: 'OpenCode Go' },
+  { id: 'deepinfra', name: 'DeepInfra' },
   { id: 'deepseek', name: 'DeepSeek' },
   { id: 'exe-dev', name: 'exe.dev' },
   { id: 'hyper', name: 'Charm Hyper' },
   { id: 'neuralwatt', name: 'NeuralWatt' },
+  { id: 'kilo', name: 'Kilo Code' },
+  { id: 'zenmux', name: 'ZenMux' },
   { id: 'xai', name: 'xAI' },
 ];

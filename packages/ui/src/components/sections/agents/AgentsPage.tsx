@@ -1,4 +1,5 @@
 import React from 'react';
+import { modelVariantNames } from '@/lib/modelVariants';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { NumberInput } from '@/components/ui/number-input';
@@ -8,6 +9,8 @@ import { useSettingsDirectory } from '@/hooks/useSettingsDirectory';
 import { selectAgentsForDirectory, useAgentsStore, type AgentConfig, type AgentEntity, type AgentEntityEnvelope, type AgentMutationResult, type AgentRequest, type AgentRequestBody, type AgentScope, type AgentWithExtras } from '@/stores/useAgentsStore';
 import { useShallow } from 'zustand/react/shallow';
 import { ModelSelector } from './ModelSelector';
+import { SettingsColorField } from '@/components/sections/shared/SettingsColorField';
+import { configuredAgentColor } from '@/lib/agentColors';
 import { useI18n } from '@/lib/i18n';
 import { formatModelSelection, parseModelIdentifier, parseModelSelection } from '@/lib/modelIdentifier';
 import { findCatalogModel } from '@/lib/opencode/model';
@@ -25,7 +28,6 @@ import {
   SettingsFieldRow,
   SettingsStackedField,
   SettingsChipGroup,
-  SETTINGS_SELECT_SIZE,
   SETTINGS_NUMBER_INPUT_CLASS,
   SETTINGS_SELECT_ROW_TRIGGER_CLASS,
   SETTINGS_ICON_BUTTON_CLASS,
@@ -59,8 +61,11 @@ const getVariantOptionsForModel = (
 
   const provider = providers.find((item) => item.id === parsedModel.providerId);
   const model = findCatalogModel(provider?.models, parsedModel.modelId);
-  return model?.variants.map((variant) => variant.id) ?? [];
+  return modelVariantNames(model);
 };
+/** The colour the form shows for a stored value; empty reads as automatic, as in the colour resolver. */
+const storedAgentColor = (stored: string | null | undefined): string => configuredAgentColor(stored)?.toLowerCase() ?? '';
+
 /** Everything the page writes into the agent's config file. */
 interface FormState {
   draftName: string;
@@ -73,6 +78,8 @@ interface FormState {
   temperature: number | undefined;
   topP: number | undefined;
   system: string;
+  /** Six-digit hex, or '' for the automatic theme colour. */
+  color: string;
 }
 
 export const AgentsPage: React.FC = () => {
@@ -123,6 +130,7 @@ export const AgentsPage: React.FC = () => {
   const [temperature, setTemperature] = React.useState<number | undefined>(undefined);
   const [topP, setTopP] = React.useState<number | undefined>(undefined);
   const [system, setSystem] = React.useState('');
+  const [color, setColor] = React.useState('');
   const [isCreating, setIsCreating] = React.useState(false);
   const [storedAt, setStoredAt] = React.useState<{ legacy: boolean; path: string | null; source: AgentEntityEnvelope['source'] } | null>(null);
 
@@ -154,7 +162,7 @@ export const AgentsPage: React.FC = () => {
   const selectionRef = React.useRef(selectionKey);
   selectionRef.current = selectionKey;
   const hydratedSelectionRef = React.useRef<string | null>(null);
-  const currentFields = { description, mode, model, variant, steps, temperature, topP, system };
+  const currentFields = { description, mode, model, variant, steps, temperature, topP, system, color };
   const currentFieldsRef = React.useRef(currentFields);
   currentFieldsRef.current = currentFields;
 
@@ -180,6 +188,7 @@ export const AgentsPage: React.FC = () => {
     const temperatureValue = agentDraft.temperature ?? undefined;
     const topPValue = agentDraft.top_p ?? undefined;
     const systemValue = agentDraft.system || '';
+    const colorValue = '';
 
     entityRef.current = {};
     setStoredAt(null);
@@ -193,6 +202,7 @@ export const AgentsPage: React.FC = () => {
     setTemperature(temperatureValue);
     setTopP(topPValue);
     setSystem(systemValue);
+    setColor(colorValue);
 
     savedRef.current = {
       draftName: draftNameValue,
@@ -205,6 +215,7 @@ export const AgentsPage: React.FC = () => {
       temperature: temperatureValue,
       topP: topPValue,
       system: systemValue,
+      color: colorValue,
     };
   }, [agentDraft, isNewAgent]);
 
@@ -234,6 +245,7 @@ export const AgentsPage: React.FC = () => {
         temperature: body?.temperature,
         topP: body?.top_p,
         system: entity.system || '',
+        color: storedAgentColor(entity.color),
       };
 
       const saved = savedRef.current;
@@ -242,7 +254,8 @@ export const AgentsPage: React.FC = () => {
         current.description !== saved.description || current.mode !== saved.mode ||
         current.model !== saved.model || current.variant !== saved.variant ||
         current.steps !== saved.steps || current.temperature !== saved.temperature ||
-        current.topP !== saved.topP || current.system !== saved.system
+        current.topP !== saved.topP || current.system !== saved.system ||
+        current.color !== saved.color
       );
       setStoredAt({ legacy: envelope.legacy === true, path: envelope.path, source: envelope.source });
       // A refresh can publish an older write while the next draft is still being edited.
@@ -257,6 +270,7 @@ export const AgentsPage: React.FC = () => {
       setTemperature(next.temperature);
       setTopP(next.topP);
       setSystem(next.system);
+      setColor(next.color);
       savedRef.current = next;
     })();
     return () => {
@@ -299,7 +313,11 @@ export const AgentsPage: React.FC = () => {
       request: Object.keys(request).length > 0 ? request : null,
     };
     if (trimmedDescription) config.description = trimmedDescription;
+    // Written only when it changed, so an untouched agent keeps whatever its
+    // file holds; null removes the key and the theme colour returns.
+    if (color !== (savedRef.current?.color ?? '')) config.color = color || null;
     if (isNewAgent && draftScope) config.scope = draftScope;
+    if (isNewAgent && agentDraft?.hidden !== undefined) config.hidden = agentDraft.hidden;
     // A duplicate carries the source agent's rules; the permissions editor only
     // appears once the agent exists, so this is the one path that writes them
     // at creation time.
@@ -307,7 +325,7 @@ export const AgentsPage: React.FC = () => {
       config.permissions = agentDraft.permissions;
     }
     return config;
-  }, [agentDraft, description, draftScope, isNewAgent, mode, model, steps, system, temperature, topP, variant]);
+  }, [agentDraft, color, description, draftScope, isNewAgent, mode, model, steps, system, temperature, topP, variant]);
 
   // An existing agent writes itself; a new one is only created once the user
   // confirms it, so an abandoned draft never reaches disk.
@@ -330,7 +348,8 @@ export const AgentsPage: React.FC = () => {
       steps === saved.steps &&
       temperature === saved.temperature &&
       topP === saved.topP &&
-      system === saved.system;
+      system === saved.system &&
+      color === saved.color;
     if (unchanged) return permissionsResult;
     if (!permissionsResult.ok) return permissionsResult;
 
@@ -356,10 +375,12 @@ export const AgentsPage: React.FC = () => {
       temperature,
       topP,
       system,
+      color,
     };
     return AUTOSAVE_SAVED;
   }, [
     buildConfig,
+    color,
     description,
     isNewAgent,
     mode,
@@ -418,7 +439,7 @@ export const AgentsPage: React.FC = () => {
       <div className="flex h-full items-center justify-center">
         <div className="text-center text-muted-foreground">
           <Icon name="robot-2" className="mx-auto mb-3 h-12 w-12 opacity-50" />
-          <p className="typography-body">{t('settings.agents.page.empty.title')}</p>
+          <p className="typography-ui-label">{t('settings.agents.page.empty.title')}</p>
           <p className="typography-meta mt-1 opacity-75">{t('settings.agents.page.empty.description')}</p>
         </div>
       </div>
@@ -443,7 +464,7 @@ export const AgentsPage: React.FC = () => {
       <SettingsSection
         title={t('settings.agents.page.section.identityRole')}
         divider={false}
-        contentClassName="space-y-0"
+        contentClassName="space-y-3"
       >
         {isNewAgent && (
           <SettingsFieldRow
@@ -451,7 +472,7 @@ export const AgentsPage: React.FC = () => {
             label={t('settings.agents.page.field.agentName')}
           >
             <div className="flex items-center">
-              <span className="typography-ui-label text-muted-foreground mr-1">@</span>
+              <span className="typography-ui-label text-muted-foreground me-1">@</span>
               <Input
                 value={draftName}
                 onChange={(e) => setDraftName(e.target.value)}
@@ -460,7 +481,7 @@ export const AgentsPage: React.FC = () => {
               />
             </div>
             <Select value={draftScope} onValueChange={(v) => setDraftScope(v as AgentScope)}>
-              <SelectTrigger size={SETTINGS_SELECT_SIZE} className="w-fit min-w-[100px]">
+              <SelectTrigger className="w-fit min-w-[100px]">
                 <SelectValue placeholder={t('settings.agents.page.field.scopePlaceholder')} />
               </SelectTrigger>
               <SelectContent align="end">
@@ -513,6 +534,26 @@ export const AgentsPage: React.FC = () => {
             ]}
           />
         </SettingsStackedField>
+
+        <SettingsStackedField
+          settingsItem="agents.color"
+          label={t('settings.agents.page.field.color')}
+          info={t('settings.agents.page.field.colorTooltip')}
+        >
+          <SettingsColorField
+            value={color}
+            labels={{
+              empty: t('settings.agents.page.field.colorAutomatic'),
+              swatch: (swatch) => t('settings.agents.page.field.colorSwatchAria', { color: swatch }),
+              custom: t('settings.agents.page.field.colorCustomAria'),
+              hex: t('settings.agents.page.field.colorHexAria'),
+            }}
+            onChange={(next) => {
+              setColor(next);
+              requestSave();
+            }}
+          />
+        </SettingsStackedField>
       </SettingsSection>
 
       <SettingsSection
@@ -557,7 +598,7 @@ export const AgentsPage: React.FC = () => {
                 requestSave();
               }}
             >
-              <SelectTrigger size={SETTINGS_SELECT_SIZE} className={SETTINGS_SELECT_ROW_TRIGGER_CLASS}>
+              <SelectTrigger className={SETTINGS_SELECT_ROW_TRIGGER_CLASS}>
                 <SelectValue placeholder={t('settings.agents.page.field.variantPlaceholder')}>
                   {(value) => value === '__default' ? t('chat.modelControls.default') : value}
                 </SelectValue>

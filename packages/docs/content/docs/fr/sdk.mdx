@@ -110,13 +110,13 @@ Dessiner un panneau et lire la session en cours ne demandent aucune permission. 
 | `files` | lire et écrire des fichiers dans le projet ouvert (`readFile`, `writeFile`, `listDir`, `stat` avec un chemin relatif) |
 | `model` | génération de texte ponctuelle avec le Small Model de l'utilisateur (`generate`), en dehors de toute session |
 
-Quatre autres sont ajoutées pour vous : `network` quand vous déclarez une `integration`, `service` quand vous déclarez un `service`, `filesystem` quand vous déclarez des motifs `filesystem`, et `conversation` quand une action de session demande les messages (voir [Actions, commandes et le badge](#actions-commandes-et-le-badge)).
+Cinq autres sont ajoutées pour vous : `network` quand vous déclarez une `integration`, `service` quand vous déclarez un `service`, `filesystem` quand vous déclarez des motifs `filesystem`, `origins` quand vous déclarez `origins`, et `conversation` quand une action de session demande les messages (voir [Actions, commandes et le badge](#actions-commandes-et-le-badge)).
 
 L'utilisateur voit la liste complète une seule fois, à l'installation de l'extension, et l'approuve ou supprime l'extension. Si une nouvelle version demande davantage, la boîte de dialogue réapparaît. Un appel qui a besoin d'une capacité non approuvée par l'utilisateur échoue avec `NOT_GRANTED`.
 
 ## Générer du texte
 
-Avec la capacité `model`, `host.generate` demande au Small Model de l'utilisateur une réponse ponctuelle : un résumé, un titre, un brouillon. Rien n'entre dans une session, aucun historique n'est conservé, et l'extension ne choisit jamais de fournisseur. OpenChamber utilise le même modèle que pour son propre travail en arrière-plan, choisi dans Paramètres → Sessions → Small Model, ou sélectionné automatiquement parmi les fournisseurs connectés de l'utilisateur.
+Avec la capacité `model`, `host.generate` demande au Small Model de l'utilisateur une réponse ponctuelle : un résumé, un titre, un brouillon. Rien n'entre dans une session, aucun historique n'est conservé, et l'extension ne choisit jamais de fournisseur. OpenChamber utilise le même modèle que pour son propre travail en arrière-plan, choisi dans Paramètres → Sessions → Small Model, ou le petit modèle du fournisseur avec lequel l'utilisateur travaille, ou le modèle par défaut de sa configuration OpenCode.
 
 ```ts
 const { text } = await host.generate({
@@ -130,7 +130,19 @@ Quand aucun modèle n'est disponible, l'appel échoue avec `NO_MODEL` ; un modè
 
 ## Comptes et réseau
 
-Votre page tourne dans un sandbox et ne peut pas appeler internet directement. Déclarez une `integration` et OpenChamber fait les appels pour vous via `host.request`, avec le token de l'utilisateur attaché. Le token n'atteint jamais votre page.
+Votre page tourne dans un sandbox et ne peut pas accéder au réseau d'elle-même : scripts, styles, images, polices et médias ne se chargent que depuis votre paquet, et `fetch` n'atteint que les fichiers de votre paquet. Livrez les polices et les images dans le paquet plutôt que de les charger depuis un CDN.
+
+Pour parler à un service extérieur, déclarez une `integration` et OpenChamber fait les appels pour vous via `host.request`, avec le token de l'utilisateur attaché. Le token n'atteint jamais votre page.
+
+Pour tout le reste dont votre page a besoin directement, comme des polices ou des images depuis un CDN ou une API publique, listez jusqu'à 8 origines https :
+
+```json
+"origins": ["https://fonts.example.com"]
+```
+
+L'utilisateur les voit dans la boîte de dialogue d'approbation comme des adresses auxquelles votre extension peut envoyer des données et dont elle peut en recevoir, et les approuve à nouveau si une mise à jour en ajoute une. Les origines approuvées sont ouvertes à `fetch`, aux images, aux polices, aux styles et aux médias, mais jamais aux scripts : le code doit être livré dans votre paquet. L'origine de la page est `null`, donc pour lire une réponse `fetch`, le serveur doit autoriser CORS pour cette origine.
+
+En [mode entreprise](/security/), une extension avec `origins`, une `integration` ou un `service` ne s'installe que depuis un dépôt Git listé par l'administrateur. Si votre extension peut s'en passer, elle reste installable pour ces équipes. Pour en développer une sur une telle machine, demandez à l'administrateur `allowLocalExtensions`, qui vous permet de l'installer depuis son dossier.
 
 - `token` : l'utilisateur colle un token d'API sur la carte Paramètres → Intégrations. `apiOrigin` est la seule origine que `request` peut appeler. `account` est optionnel : un chemin GET et un nom de champ, pour que la carte affiche qui est connecté. `scheme` indique comment le token est envoyé ; voir le tableau ci-dessous. Vérifiez dans la documentation de l'API du fournisseur quel en-tête elle attend.
 - `oauth` : l'utilisateur colle un client id, et OpenChamber exécute le flux d'autorisation. Nécessite `authorizeUrl`, `tokenUrl` et `apiOrigin`.

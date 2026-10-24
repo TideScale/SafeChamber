@@ -1,6 +1,7 @@
 /**
- * `/api/routing` — configuration, the Jev key and the classification provider
- * pick (`/api/routing/classifier`). Normal authenticated
+ * `/api/routing` — configuration, the Jev key, the classification provider
+ * pick (`/api/routing/classifier`) and the custom endpoint
+ * (`/api/routing/classifier/custom`). Normal authenticated
  * OpenChamber routes: do not add them to browser URL-token allowlists.
  *
  * The send-path rewrite, registered ahead of the generic OpenCode proxy. In
@@ -74,6 +75,34 @@ export function registerRoutingRoutes(app, runtime) {
       sendError(res, error);
     }
   });
+
+  app.put('/api/routing/classifier/custom', express.json({ limit: '16kb' }), async (req, res) => {
+    try {
+      res.json(await runtime.setCustomEndpoint({ url: req.body?.url, model: req.body?.model, key: req.body?.key }));
+    } catch (error) {
+      sendError(res, error);
+    }
+  });
+
+  // `custom` present: test those endpoint fields as typed, before saving.
+  app.post('/api/routing/classifier/test', express.json({ limit: '16kb' }), async (req, res) => {
+    try {
+      const custom = req.body?.custom;
+      res.json(await runtime.testClassifier(custom === undefined || custom === null
+        ? undefined
+        : { url: custom.url, model: custom.model, key: custom.key }));
+    } catch (error) {
+      sendError(res, error);
+    }
+  });
+
+  app.delete('/api/routing/classifier/custom', async (_req, res) => {
+    try {
+      res.json(await runtime.clearCustomEndpoint());
+    } catch (error) {
+      sendError(res, error);
+    }
+  });
 }
 
 export function registerRoutingPromptRewrite(app, runtime) {
@@ -89,9 +118,30 @@ export function registerRoutingPromptRewrite(app, runtime) {
     });
   };
 
+  // The UI SDK URI-encodes the directory header on every request and only
+  // marks the values that are not Latin-1, and OpenCode decodes the value once
+  // on its side — so read what OpenCode will read, the way requestedDirectories
+  // does for the space guards (../spaces/dispatcher.js). The runtime's own
+  // OpenCode calls encode once more, so an encoded value here would reach
+  // OpenCode double-encoded and fail its realPath.
+  const PERCENT_ESCAPE = /%[0-9a-fA-F]{2}/;
+  const safeDecode = (value) => {
+    try {
+      return decodeURIComponent(value);
+    } catch {
+      return value;
+    }
+  };
+
   const directoryOf = (req) => {
     const url = new URL(req.url, 'http://localhost');
-    return url.searchParams.get('directory') || req.get('x-opencode-directory') || undefined;
+    // searchParams values arrive percent-decoded already.
+    const query = url.searchParams.get('directory');
+    if (query) return query;
+    const header = req.get('x-opencode-directory');
+    if (!header) return undefined;
+    const encoded = req.get('x-opencode-directory-encoding') === 'uri' || PERCENT_ESCAPE.test(header);
+    return encoded ? safeDecode(header) : header;
   };
 
   // Session creation is the other v2 request that carries a model: flows that

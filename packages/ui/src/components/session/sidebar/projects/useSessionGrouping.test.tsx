@@ -161,6 +161,36 @@ describe('useSessionGrouping malformed hierarchy fallbacks', () => {
     expect(worktreeOrder('a-z')).toEqual(['alpha', 'zeta']);
   });
 
+  test('groups a session inside a worktree sub-folder under that worktree', () => {
+    const alpha: WorktreeMetadata = {
+      source: 'sdk', name: 'alpha', path: '/workspace/.wt/alpha', projectDirectory: '/workspace', branch: 'alpha', label: 'alpha',
+    };
+    const inSubfolder = { ...session('sub'), directory: '/workspace/.wt/alpha/ai', time: { created: 1, updated: 1 } };
+    type GroupingCapture = { buildGroupedSessions?: ReturnType<typeof useSessionGrouping>['buildGroupedSessions'] };
+    const state: GroupingCapture = {};
+    const Harness = () => {
+      state.buildGroupedSessions = useSessionGrouping({
+        homeDirectory: null,
+        worktreeMetadata: new Map(),
+        pinnedSessionIds: new Set(),
+        sessionOrderRanks: new Map(),
+        gitBranches: new Map(),
+        isVSCode: false,
+        worktreeSortOrder: 'recent' as const,
+      }).buildGroupedSessions;
+      return null;
+    };
+    renderToStaticMarkup(React.createElement(I18nProvider, null, React.createElement(Harness)));
+    if (!state.buildGroupedSessions) throw new Error('grouping callback was not mounted');
+
+    const groups = state.buildGroupedSessions([inSubfolder], '/workspace', [alpha], null, true);
+    const worktreeGroup = groups.find((group) => group.worktree);
+
+    expect(worktreeGroup?.directory).toBe('/workspace/.wt/alpha');
+    expect(collectIds(worktreeGroup?.sessions ?? [])).toEqual(['sub']);
+    expect(collectIds(groups.find((group) => group.isMain)?.sessions ?? [])).toEqual([]);
+  });
+
   test('uses the row-local descendant snapshot for archive and hard-delete actions', async () => {
     type ActionsCapture = { handleDeleteSession?: ReturnType<typeof useSessionActions>['handleDeleteSession'] };
     const state: ActionsCapture = {};
@@ -226,5 +256,48 @@ describe('useSessionGrouping malformed hierarchy fallbacks', () => {
 
     expect(groups.find((group) => group.isMain)?.sessions.map((node) => node.session.id)).toEqual(['restored']);
     expect(groups.some((group) => group.isArchivedBucket)).toBe(false);
+  });
+
+  test('shows subsessions only nested under an active parent, never in the archive or as rows of their own', () => {
+    type GroupingCapture = { buildGroupedSessions?: ReturnType<typeof useSessionGrouping>['buildGroupedSessions'] };
+    const state: GroupingCapture = {};
+    const Harness = () => {
+      state.buildGroupedSessions = useSessionGrouping({
+        homeDirectory: null,
+        worktreeMetadata: new Map(),
+        pinnedSessionIds: new Set(),
+        sessionOrderRanks: new Map(),
+        gitBranches: new Map(),
+        isVSCode: false,
+        worktreeSortOrder: 'recent' as const,
+      }).buildGroupedSessions;
+      return null;
+    };
+    renderToStaticMarkup(React.createElement(I18nProvider, null, React.createElement(Harness)));
+    const buildGroupedSessions = state.buildGroupedSessions;
+    if (!buildGroupedSessions) throw new Error('grouping callback was not mounted');
+
+    const archived = (value: Session): Session => ({ ...value, time: { ...value.time, archived: 2 } });
+    const groups = buildGroupedSessions(
+      [
+        session('active-parent'),
+        session('active-child', 'active-parent'),
+        archived(session('archived-child-of-active', 'active-parent')),
+        archived(session('archived-parent')),
+        archived(session('archived-child', 'archived-parent')),
+        session('live-child-of-archived', 'archived-parent'),
+        session('child-of-unloaded', 'not-loaded'),
+      ],
+      '/workspace',
+      [],
+      null,
+      false,
+    );
+
+    const rootGroup = groups.find((group) => group.isMain);
+    const archiveGroup = groups.find((group) => group.isArchivedBucket);
+    expect(rootGroup?.sessions.map((node) => node.session.id)).toEqual(['active-parent', 'child-of-unloaded']);
+    expect(collectIds(rootGroup?.sessions ?? [])).toEqual(['active-parent', 'active-child', 'child-of-unloaded']);
+    expect(collectIds(archiveGroup?.sessions ?? [])).toEqual(['archived-parent']);
   });
 });

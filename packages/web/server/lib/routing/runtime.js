@@ -16,10 +16,19 @@ import { OpenCode } from '@opencode/client';
 import { z } from 'zod';
 import { AUTO_MODEL_REF, BUILTIN_CATEGORIES, ZEN_JEV_PROMOTION_ACTIVE, isAutoModel } from './defaults.js';
 import { createRoutingStore, parseEffectiveConfig } from './store.js';
-import { buildPermissionRequest, buildRoutingRequest, createJevClient, decidePermission, decideRouting } from './jev.js';
-import { CLASSIFIER_SOURCES, classifierEndpoint, legacyClassifier, resolveClassifier } from './classifier.js';
+import { buildPermissionRequest, buildProbeRequest, buildRoutingRequest, createJevClient, decidePermission, decideRouting, isProbeAnswer } from './jev.js';
+import {
+  CLASSIFIER_SOURCES,
+  classifierEndpoint,
+  legacyClassifier,
+  parseCustomEndpointUrl,
+  readPinnedCustomEndpoint,
+  resolveClassifier,
+} from './classifier.js';
 import { loadRoutingHistory } from './history.js';
-import { readAuthFile } from '../opencode/auth.js';
+import { PROMPT_CACHE_TTL_MS, cacheHoldCategory, warmWindowMs } from './cache.js';
+import { readOpenCodeCredentials } from '../opencode/auth.js';
+import { ENTERPRISE_MODE_ERROR, isEnterpriseMode } from '../enterprise-mode.js';
 
 const HISTORY_TIMEOUT_MS = 2500;
 /** A held permission is remembered so reconnect reconciliation does not re-ask Jev. */
@@ -45,7 +54,55 @@ export const requestTextOf = (body) => {
   return (prompt.success ? prompt.data.text ?? '' : '').trim();
 };
 
+// The prompt body carries the attachments as `{ uri, name }` (`toPromptFile`
+// drops the mime), so an image is recognized from its data URL or its name.
+const attachmentFileSchema = z.object({ uri: z.string().nullish(), name: z.string().nullish() });
+const attachmentListSchema = z.array(attachmentFileSchema);
+const IMAGE_EXTENSIONS = new Set(['avif', 'bmp', 'gif', 'heic', 'heif', 'ico', 'jpeg', 'jpg', 'png', 'svg', 'webp']);
+
+const isImageFile = (file) => {
+  const uri = file.uri ?? '';
+  if (uri.startsWith('data:')) return uri.startsWith('data:image/');
+  const name = (file.name ?? '').toLowerCase();
+  const dot = name.lastIndexOf('.');
+  return dot > 0 && IMAGE_EXTENSIONS.has(name.slice(dot + 1));
+};
+
+/**
+ * The attachment fact for the classifier. Jev reads text only, so a pasted
+ * image has to be stated in the request it judges; without this the router
+ * discards the one cue that distinguishes "look at this screenshot" from
+ * "fix the image-upload endpoint". Kept beside `requestTextOf` rather than
+ * inside it, whose tests pin that the raw words stay untouched.
+ */
+export const attachmentHint = (body) => {
+  const files = attachmentListSchema.safeParse(body?.files).data ?? [];
+  const images = files.filter((file) => isImageFile(file));
+  if (images.length === 0) return '';
+  const names = images.map((file) => file.name).filter(Boolean).slice(0, 3);
+  const count = images.length === 1 ? 'an image' : `${images.length} images`;
+  return `\n\n[The user attached ${count}${names.length > 0 ? `: ${names.join(', ')}` : ''}]`;
+};
+
+/** What the classifier sees for this send: the user's words plus the attachment fact. */
+export const routingRequestTextOf = (body) => `${requestTextOf(body)}${attachmentHint(body)}`.trim();
+
 const agentBodySchema = z.object({ agent: z.string().trim().min(1) });
+
+// v2 serves one flat model catalogue; a model's thinking levels are `{ id }[]`.
+const catalogResponseSchema = z.object({
+  data: z.array(z.object({
+    providerID: z.string(),
+    modelID: z.string(),
+    variants: z.array(z.object({ id: z.string() })).default([]),
+  })),
+});
+
+const customEndpointInputSchema = z.object({
+  url: z.string().trim().min(1).max(2000),
+  model: z.string().trim().min(1).max(200),
+  key: z.string().trim().max(4000).nullable().optional(),
+});
 
 /** OpenChamber stores a model as `{ providerID, modelID }`; v2 wants a `Model.Ref`. */
 const toModelRef = (model, variant) => {
@@ -70,10 +127,10 @@ const envKeySchema = z.string().trim().min(1);
  */
 const PROVIDER_ENV_KEYS = { openrouter: 'OPENROUTER_API_KEY', vercel: 'AI_GATEWAY_API_KEY' };
 
-export const readOpenCodeKeys = ({ readAuth = readAuthFile, env = process.env } = {}) => {
+export const readOpenCodeKeys = async ({ readAuth = readOpenCodeCredentials, env = process.env } = {}) => {
   let auth = {};
   try {
-    auth = readAuth();
+    auth = await readAuth();
   } catch {
     // An unreadable credential store still leaves the environment.
   }
@@ -96,6 +153,13 @@ export function createRoutingRuntime({
   jev = createJevClient({ fetchImpl }),
   readProviderKeys = () => readOpenCodeKeys(),
   zenPromotionActive = ZEN_JEV_PROMOTION_ACTIVE,
+  enterpriseMode = isEnterpriseMode,
+  readPinnedEndpoint = readPinnedCustomEndpoint,
+  listCatalogModels = null,
+  readSessionHistory = null,
+  readConfigEntries = null,
+  // Whether OpenChamber keeps this session's cache warm itself (`session-warming`).
+  isSessionWarm = () => false,
   now = Date.now,
 }) {
   const permissionDecisions = new Map();
@@ -120,12 +184,33 @@ export function createRoutingRuntime({
 
   /** Which classification provider answers now, and where its requests go (null endpoint: no Jev). */
   const resolveAccess = async () => {
-    const [typesafeKey, selected] = await Promise.all([store.readToken(), store.readClassifierSource()]);
-    const keys = { typesafeKey, ...readProviderKeys() };
+    const [typesafeKey, stored, savedEndpoint] = await Promise.all([
+      store.readToken(),
+      store.readClassifierSource(),
+      store.readCustomEndpoint(),
+    ]);
+    // An endpoint the administrator pinned replaces the one saved in Settings.
+    const pinned = readPinnedEndpoint();
+    const customEndpoint = pinned ?? savedEndpoint;
+    const keys = { typesafeKey, customEndpoint, ...(await readProviderKeys()) };
+    // Enterprise mode overrides whatever was picked; the pick itself is kept.
+    // The pinned endpoint is the administrator's own, so there it is the
+    // default and Off the only other choice.
+    const selected = !enterpriseMode() ? stored : pinned && stored !== 'off' ? 'custom' : 'off';
     const classifier = resolveClassifier({ selected, ...keys, zenPromotionActive });
     const endpoint = classifier.effective ? classifierEndpoint(classifier.effective, keys) : null;
-    return { classifier, endpoint, tokenPresent: Boolean(typesafeKey) };
+    return { classifier, endpoint, tokenPresent: Boolean(typesafeKey), customEndpoint, pinned: pinned !== null };
   };
+
+  // What Settings shows of the custom endpoint: never the key itself.
+  const describeCustomEndpoint = (endpoint, pinned) => (endpoint
+    ? { url: endpoint.url, model: endpoint.model, keyPresent: Boolean(endpoint.key), pinned }
+    : null);
+
+  const pinnedEndpointError = () => Object.assign(
+    new Error('The custom endpoint is set by your administrator and cannot be changed here'),
+    { status: 409 },
+  );
 
   /** What the client needs to decide whether to offer Auto and the safety net, and what Settings shows. */
   const describe = async () => {
@@ -143,6 +228,8 @@ export function createRoutingRuntime({
       autoReady,
       jevAvailable,
       tokenPresent: access.tokenPresent,
+      customEndpoint: describeCustomEndpoint(access.customEndpoint, access.pinned),
+      enterpriseMode: enterpriseMode(),
       jevSource: access.classifier.effective === 'typesafe' ? 'typesafe' : 'zen-free',
       classifier: legacyClassifier(access.classifier),
       classification: access.classifier,
@@ -171,7 +258,7 @@ export function createRoutingRuntime({
     return OpenCode.make({ baseUrl: buildOpenCodeUrl('/', '').replace(/\/$/, ''), headers });
   };
 
-  const readHistory = async ({ sessionId, directory }) => {
+  const readHistory = readSessionHistory ?? (async ({ sessionId, directory }) => {
     const client = openCodeClient(directory);
     const signal = AbortSignal.timeout(HISTORY_TIMEOUT_MS);
     return loadRoutingHistory({
@@ -182,6 +269,33 @@ export function createRoutingRuntime({
         { signal },
       ),
     });
+  });
+
+  // v2 answers the effective config as its documents, lowest priority first.
+  const readConfig = readConfigEntries ?? ((directory) => openCodeClient(directory).config.get());
+
+  /**
+   * "Try to preserve cache usage": the category to stay on instead of a lower
+   * one while the model that wrote the last answer likely still holds a warm
+   * prompt cache, or null to switch as Jev said (`cache.js`). Once the plain
+   * cache lifetime has passed, a session OpenChamber keeps warm still holds,
+   * and otherwise OpenCode's warming config decides.
+   */
+  const cacheHold = async ({ config, chosen, composerAgent, lastAnswer, sessionId, directory }) => {
+    if (!config.preserveCache || !lastAnswer) return null;
+    const held = cacheHoldCategory({
+      categories: enabledCategories(config), fallback: config.fallback, composerAgent, chosen, current: lastAnswer,
+    });
+    if (!held) return null;
+    const idle = now() - lastAnswer.completed;
+    if (idle < PROMPT_CACHE_TTL_MS) return held;
+    if (isSessionWarm(sessionId, PROMPT_CACHE_TTL_MS)) return held;
+    try {
+      return idle < warmWindowMs(await readConfig(directory)) ? held : null;
+    } catch (error) {
+      console.warn('[routing] OpenCode config unavailable, treating the prompt cache as cold:', errorMessage(error));
+      return null;
+    }
   };
 
   // A category without a model of its own means "the fallback pair"; a variant
@@ -195,6 +309,36 @@ export function createRoutingRuntime({
       // A category agent replaces the composer's; an empty one keeps it.
       agent: choice?.agent || composerAgent || null,
       decision: { providerID: model.providerID, modelID: model.modelID, variant: variant ?? null, agent: choice?.agent ?? null },
+    };
+  };
+
+  const readCatalog = listCatalogModels
+    ?? (async (directory) => catalogResponseSchema.parse(await openCodeClient(directory).model.list()).data);
+
+  /**
+   * Drops a variant the model does not list, so the reply runs on the model's
+   * default thinking instead of OpenCode refusing it. Routing settings from
+   * before #4133 saved list positions ("0", "1", "2") as variants. A catalog
+   * that cannot be read, or does not know the model yet, keeps the variant.
+   */
+  const withKnownVariant = async (selection, directory) => {
+    const variant = selection.model.variant;
+    if (!variant) return selection;
+    let models;
+    try {
+      models = await readCatalog(directory);
+    } catch (error) {
+      console.warn('[routing] model catalog unavailable, keeping the saved variant:', errorMessage(error));
+      return selection;
+    }
+    const { providerID, id } = selection.model;
+    const entry = models.find((model) => model.providerID === providerID && model.modelID === id);
+    if (!entry || entry.variants.some((known) => known.id === variant)) return selection;
+    console.warn(`[routing] ${providerID}/${id} has no "${variant}" thinking level; using its default`);
+    return {
+      ...selection,
+      model: { providerID, id },
+      decision: { ...selection.decision, variant: null },
     };
   };
 
@@ -221,8 +365,9 @@ export function createRoutingRuntime({
     let selection;
     if (state.autoReady) {
       let history = [];
+      let lastAnswer = null;
       try {
-        history = await readHistory({ sessionId, directory });
+        ({ history, lastAnswer } = await readHistory({ sessionId, directory }));
       } catch (error) {
         console.warn('[routing] history unavailable, routing on the request alone:', errorMessage(error));
       }
@@ -236,7 +381,14 @@ export function createRoutingRuntime({
         decision.confidence = result.confidence;
         decision.reason = result.reason;
         decision.ms = ms;
-        selection = chooseSelection(config, result.category, agent);
+        const held = await cacheHold({ config, chosen: result.category, composerAgent: agent, lastAnswer, sessionId, directory });
+        if (held) {
+          // The send runs as the category the session is already on;
+          // `cacheHold.requested` keeps what Jev asked for.
+          decision.category = held.id;
+          decision.cacheHold = { requested: result.category.id };
+        }
+        selection = chooseSelection(config, held ?? result.category, agent);
       } catch (error) {
         decision.reason = 'error';
         decision.error = errorMessage(error);
@@ -245,6 +397,7 @@ export function createRoutingRuntime({
     } else {
       selection = chooseSelection(config, null, agent);
     }
+    selection = await withKnownVariant(selection, directory);
     Object.assign(decision, selection.decision);
     broadcast('openchamber:routing.decision', decision);
     return { model: selection.model, agent: selection.agent, decision };
@@ -285,7 +438,7 @@ export function createRoutingRuntime({
       directory,
       model: AUTO_MODEL_REF,
       agent: agentBodySchema.safeParse(body).data?.agent ?? null,
-      requestText: requestTextOf(body),
+      requestText: routingRequestTextOf(body),
     });
     if (!resolved) return null;
     // v2 prompt and command bodies carry neither model nor agent: switching
@@ -357,6 +510,7 @@ export function createRoutingRuntime({
   const setToken = async (token) => {
     const parsed = z.string().trim().min(1).max(4000).safeParse(token);
     if (!parsed.success) throw Object.assign(new Error('A Jev API key is required'), { status: 400 });
+    if (enterpriseMode()) throw Object.assign(new Error(ENTERPRISE_MODE_ERROR), { status: 403 });
     await store.writeToken(parsed.data);
     // Pasting a key is choosing it.
     await store.writeClassifierSource('typesafe');
@@ -371,8 +525,79 @@ export function createRoutingRuntime({
   const setClassifierSource = async (source) => {
     const parsed = z.enum(CLASSIFIER_SOURCES).safeParse(source);
     if (!parsed.success) throw Object.assign(new Error(`Unknown classification provider: ${String(source)}`), { status: 400 });
+    const allowedInEnterprise = parsed.data === 'off' || (parsed.data === 'custom' && readPinnedEndpoint() !== null);
+    if (enterpriseMode() && !allowedInEnterprise) throw Object.assign(new Error(ENTERPRISE_MODE_ERROR), { status: 403 });
     await store.writeClassifierSource(parsed.data);
     return publishUpdated();
+  };
+
+  /**
+   * Saves the custom System One endpoint and picks it, the way saving a
+   * TypeSafe key does. `key`: a string replaces the saved one, null removes
+   * it, absent keeps it, so the URL or model can change without retyping it.
+   */
+  const setCustomEndpoint = async (input) => {
+    if (readPinnedEndpoint()) throw pinnedEndpointError();
+    if (enterpriseMode()) throw Object.assign(new Error(ENTERPRISE_MODE_ERROR), { status: 403 });
+    const parsed = customEndpointInputSchema.safeParse(input);
+    if (!parsed.success) throw Object.assign(new Error('A URL and a model are required'), { status: 400 });
+    const { model, key } = parsed.data;
+    const url = parseCustomEndpointUrl(parsed.data.url);
+    // An empty key field is the same as leaving it out.
+    const keepKey = key === undefined || key === '';
+    const savedKey = keepKey ? (await store.readCustomEndpoint())?.key : key;
+    const endpoint = { url, model };
+    if (savedKey) endpoint.key = savedKey;
+    await store.writeCustomEndpoint(endpoint);
+    // Saving is choosing it; removing only the key is not a choice of anything.
+    if (key !== null) await store.writeClassifierSource('custom');
+    return publishUpdated();
+  };
+
+  const clearCustomEndpoint = async () => {
+    if (readPinnedEndpoint()) throw pinnedEndpointError();
+    await store.clearCustomEndpoint();
+    return publishUpdated();
+  };
+
+  /**
+   * Sends one small Jev request and reports what came back, so Settings can
+   * show a broken setup before a feature quietly falls back. Without `draft`
+   * it tests the provider answering now; with one it tests the custom endpoint
+   * fields as typed, before they are saved (an empty key reuses the saved
+   * one). Nothing is stored either way.
+   */
+  const testClassifier = async (draft) => {
+    let source;
+    let endpoint;
+    if (draft !== undefined) {
+      if (readPinnedEndpoint()) throw pinnedEndpointError();
+      if (enterpriseMode()) throw Object.assign(new Error(ENTERPRISE_MODE_ERROR), { status: 403 });
+      const parsed = customEndpointInputSchema.safeParse(draft);
+      if (!parsed.success) throw Object.assign(new Error('A URL and a model are required'), { status: 400 });
+      const key = parsed.data.key || (await store.readCustomEndpoint())?.key;
+      source = 'custom';
+      endpoint = classifierEndpoint('custom', {
+        customEndpoint: { url: parseCustomEndpointUrl(parsed.data.url), model: parsed.data.model, ...(key ? { key } : {}) },
+      });
+    } else {
+      const access = await resolveAccess();
+      source = access.classifier.effective;
+      endpoint = access.endpoint;
+    }
+    if (!source || !endpoint) return { ok: false, reason: 'unavailable' };
+    try {
+      const { answers, ms } = await jev.ask(buildProbeRequest(), endpoint);
+      if (!isProbeAnswer(answers.probe)) return { ok: false, reason: 'unparsable', source, model: endpoint.model };
+      return { ok: true, source, model: endpoint.model, ms };
+    } catch (error) {
+      if (error?.code === 'timeout') return { ok: false, reason: 'timeout', source, model: endpoint.model };
+      if (typeof error?.status === 'number') return { ok: false, reason: 'http', status: error.status, source, model: endpoint.model };
+      if (error instanceof SyntaxError || /no answers/.test(errorMessage(error))) {
+        return { ok: false, reason: 'unparsable', source, model: endpoint.model };
+      }
+      return { ok: false, reason: 'network', message: errorMessage(error), source, model: endpoint.model };
+    }
   };
 
   /** Where a Jev request goes right now, or null when no classification provider is usable. */
@@ -403,5 +628,8 @@ export function createRoutingRuntime({
     setToken,
     clearToken,
     setClassifierSource,
+    setCustomEndpoint,
+    clearCustomEndpoint,
+    testClassifier,
   };
 }

@@ -26,7 +26,7 @@ describe('space records', () => {
     expect(records.read(ID)).toEqual({ status: 'missing', record: null });
 
     const written = records.write(ID, { network: { mode: 'allowlist', domains: ['api.anthropic.com'] }, repository: '/home/me/project' });
-    expect(written).toEqual({ version: 1, network: { mode: 'allowlist', domains: ['api.anthropic.com'] }, repository: '/home/me/project', spacePath: null, base: null, history: 'pending', grants: [] });
+    expect(written).toEqual({ version: 1, placeId: 'docker', name: null, created: null, network: { mode: 'allowlist', domains: ['api.anthropic.com'] }, repository: '/home/me/project', spacePath: null, base: null, history: 'pending', grants: [], setup: null });
     const file = path.join(dataDir, 'spaces', 'records', `${ID}.json`);
     if (process.platform !== 'win32') expect(fs.statSync(file).mode & 0o777).toBe(0o600);
     expect(fs.readdirSync(path.dirname(file))).toEqual([`${ID}.json`]);
@@ -38,6 +38,7 @@ describe('space records', () => {
     records.remove(ID);
     expect(records.read(ID)).toEqual({ status: 'missing', record: null });
     records.remove(ID);
+    expect(records.list()).toEqual([]);
   });
 
   it('reports a file it cannot read as unreadable, never as a fresh record, and does not write over it', () => {
@@ -58,12 +59,20 @@ describe('space records', () => {
     const model = { kind: 'model', id: 'anthropic', provider: 'anthropic', upstream: 'https://api.anthropic.com/v1', header: 'x-api-key', source: { kind: 'env', name: 'ANTHROPIC_API_KEY' } };
     const typed = { ...model, id: 'openai', provider: 'openai', upstream: 'https://api.openai.com/v1', header: 'authorization', source: { kind: 'typed' } };
     const domain = { kind: 'domain', id: 'open-0a1b2c3d4e5f', upstream: 'https://registry.example.com/npm/' };
-    const written = records.write(ID, { network: { mode: 'open' }, grants: [model, typed, domain] });
-    expect(written.grants).toEqual([model, typed, domain]);
-    expect(records.read(ID).record.grants).toEqual([model, typed, domain]);
+    const login = { kind: 'login', id: 'openai', provider: 'openai', method: 'chatgpt-token-sharing' };
+    const custom = { kind: 'custom', id: 'ollama-local', provider: 'ollama-local' };
+    const written = records.write(ID, { network: { mode: 'open' }, grants: [model, typed, domain, login, custom] });
+    expect(written.grants).toEqual([model, typed, domain, login, custom]);
+    expect(records.read(ID).record.grants).toEqual([model, typed, domain, login, custom]);
 
     for (const bad of [
       { ...model, secret: 'sk-live-1' },
+      { ...login, access: 'eyJ-live' },
+      { ...login, upstream: 'https://api.openai.com/v1' },
+      { ...login, method: 'not a method' },
+      // A custom provider's address and key live on the host, never in the record.
+      { ...custom, upstream: 'http://localhost:11434/v1' },
+      { ...custom, secret: 'sk-live-1' },
       { ...model, value: 'sk-live-1' },
       { ...model, source: { kind: 'typed', value: 'sk-live-1' } },
       { ...model, source: { kind: 'env', name: 'ANTHROPIC_API_KEY', value: 'sk-live-1' } },
@@ -93,6 +102,23 @@ describe('space records', () => {
     expect(older.read(ID)).toEqual({ status: 'ok', record: expect.objectContaining({ grants: [] }) });
   });
 
+  it('keeps the last run of the setup commands, and forgets only a setup it cannot read', () => {
+    const dataDir = temporary();
+    const records = createSpaceRecords({ dataDir, logger: quiet });
+    records.write(ID, { network: { mode: 'open' }, grants: [] });
+    const failed = { state: 'failed', total: 2, index: 1, command: 'npm install', exitCode: 1, timedOut: false, output: 'npm ERR! 403', finishedAt: '2026-09-28T10:00:00.000Z' };
+    expect(records.update(ID, { setup: failed }).record.setup).toEqual(failed);
+    expect(records.read(ID).record.setup).toEqual(failed);
+    // A value the host never writes is refused rather than kept.
+    expect(() => records.update(ID, { setup: { ...failed, secret: 'x' } })).toThrow();
+    expect(() => records.update(ID, { setup: { ...failed, output: 'x'.repeat(40 * 1024) } })).toThrow();
+
+    // A setup from a later version leaves the network and the grants readable.
+    const file = path.join(dataDir, 'spaces', 'records', `${ID}.json`);
+    fs.writeFileSync(file, JSON.stringify({ version: 1, network: { mode: 'allowlist', domains: ['a.example.com'] }, setup: { state: 'paused' } }));
+    expect(records.read(ID)).toEqual({ status: 'ok', record: expect.objectContaining({ network: { mode: 'allowlist', domains: ['a.example.com'] }, setup: null }) });
+  });
+
   it('refuses a record that is not one, and an id that is not a space id', () => {
     const records = createSpaceRecords({ dataDir: temporary(), logger: quiet });
     expect(() => records.write(ID, { network: { mode: 'open', domains: ['not a name'] } })).toThrow();
@@ -109,5 +135,20 @@ describe('space records', () => {
     }
     expect(networkSchema.safeParse({ mode: 'open' }).data).toEqual({ mode: 'open', domains: [] });
     expect(networkSchema.safeParse({ mode: 'all' }).success).toBe(false);
+  });
+  it('lists every readable record with its place, name and time, and reads a record from before there were two places as the local Docker place', () => {
+    const dataDir = temporary();
+    const records = createSpaceRecords({ dataDir, logger: quiet });
+    expect(records.list()).toEqual([]);
+    records.write(ID, { placeId: 'docker-ssh', name: 'On the box', created: '2026-10-11T10:00:00.000Z', network: { mode: 'open' }, repository: '/home/me/project' });
+    // A record a host before this one wrote: no place, no name, no time.
+    fs.writeFileSync(path.join(dataDir, 'spaces', 'records', 'b1b2c3d4e5f6.json'), JSON.stringify({ version: 1, network: { mode: 'open', domains: [] }, repository: '/home/me/other' }));
+    // Not records: a half-written temporary file and a stranger's file.
+    fs.writeFileSync(path.join(dataDir, 'spaces', 'records', 'c1c2c3d4e5f6.json.1.tmp'), '{');
+    fs.writeFileSync(path.join(dataDir, 'spaces', 'records', 'notes.json'), '{}');
+    expect(records.list().map(({ id, record }) => [id, record.placeId, record.name, record.created]).sort()).toEqual([
+      [ID, 'docker-ssh', 'On the box', '2026-10-11T10:00:00.000Z'],
+      ['b1b2c3d4e5f6', 'docker', null, null],
+    ]);
   });
 });

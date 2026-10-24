@@ -17,8 +17,99 @@ import {
   SettingsCardSearch,
   type SettingsCardTone,
 } from '@/components/sections/shared/SettingsCards';
-import { getProviderCardStatus, readProviderApiKeySetting, type ProviderCardStatus } from './providerAuth';
+import { findIntegrationForProvider, getProviderCardStatus, readProviderApiKeySetting, usesMachineCredentials, type ProviderCardStatus } from './providerAuth';
+import { SETTINGS_CALLOUT_TITLE_CLASS, SettingsSection } from '@/components/sections/shared/SettingsSection';
+import { Button } from '@/components/ui/button';
+import { cn } from '@/lib/utils';
+import { useEnterpriseMode, useEnterprisePolicyStore } from '@/stores/useEnterprisePolicyStore';
 import { useRoutingStore } from '@/stores/useRoutingStore';
+import { opencodeClient } from '@/lib/opencode/client';
+import { openExternalUrl } from '@/lib/url';
+import { SettingsInlineLink } from '@/components/sections/classification/JevAccessNote';
+
+const PROVIDER_POLICIES_DOCS_URL = 'https://opencode.ai/v2/docs/policies/';
+
+/** Whether the OpenCode config denies any provider; null while unknown or when the read failed. */
+const useConfigDeniesAnyProvider = (directory: string | null): boolean | null => {
+  const [restricted, setRestricted] = React.useState<boolean | null>(null);
+  React.useEffect(() => {
+    let cancelled = false;
+    setRestricted(null);
+    opencodeClient.configDeniesAnyProvider(directory)
+      .then((value) => { if (!cancelled) setRestricted(value); })
+      .catch((error) => {
+        // Unknown is not "no policy": stay quiet, but leave a trace.
+        console.warn('[providers] could not read OpenCode provider policies:', error instanceof Error ? error.message : String(error));
+        if (!cancelled) setRestricted(null);
+      });
+    return () => { cancelled = true; };
+  }, [directory]);
+  return restricted;
+};
+
+/**
+ * Enterprise mode keeps OpenChamber from adding providers, but which ones
+ * OpenCode may use is its own `provider.use` policy. The config files are
+ * readable; rules from a connected OpenCode Console workspace are not (OpenCode
+ * keeps them in memory), and they arrive only through its `opencode`
+ * integration. So: no policy and no Console is a certain gap and a warning;
+ * no policy with Console connected is a maybe and an info line. Nothing extra
+ * is said while either answer is unknown.
+ */
+const EnterpriseProvidersNotice: React.FC<{ directory: string | null; integrations: readonly IntegrationInfo[] | null }> = ({ directory, integrations }) => {
+  const { t } = useI18n();
+  const restricted = useConfigDeniesAnyProvider(directory);
+  const organization = useEnterprisePolicyStore((state) => state.organization);
+  const policyUnreadable = useEnterprisePolicyStore((state) => state.policyError !== null);
+  const consoleConnected = integrations === null
+    ? null
+    : (findIntegrationForProvider(integrations, 'opencode')?.connections?.length ?? 0) > 0;
+  const gap = restricted !== false || consoleConnected === null
+    ? null
+    : consoleConnected ? 'console' : 'open';
+  const warning = gap === 'open';
+  const policyLink = (
+    <SettingsInlineLink onClick={() => { void openExternalUrl(PROVIDER_POLICIES_DOCS_URL); }}>
+      {t('settings.providers.enterprisePolicyLink')}
+    </SettingsInlineLink>
+  );
+
+  return (
+    <div
+      className={cn(
+        'mb-4 flex items-start gap-2 rounded-lg p-3',
+        warning
+          ? 'bg-[var(--status-warning)]/10'
+          : 'bg-[var(--status-info-background)]/60',
+      )}
+    >
+      <Icon
+        name={warning ? 'error-warning' : 'information'}
+        className={cn('mt-0.5 size-4 shrink-0', warning ? 'text-[var(--status-warning)]' : 'text-[var(--status-info)]')}
+      />
+      <div className="min-w-0 space-y-1.5">
+        <p className={SETTINGS_CALLOUT_TITLE_CLASS}>{t('settings.providers.enterpriseTitle')}</p>
+        {organization ? (
+          <p className="typography-meta text-foreground">{t('settings.providers.enterpriseManagedBy', { organization })}</p>
+        ) : null}
+        {policyUnreadable ? (
+          <p className="typography-meta text-foreground">{t('settings.providers.enterprisePolicyUnreadable')}</p>
+        ) : null}
+        <p className="typography-meta text-muted-foreground">{t('settings.providers.enterpriseMode')}</p>
+        {gap === 'open' ? (
+          <p className="typography-meta text-foreground">
+            {t('settings.providers.enterprisePolicyMissing')}{' '}{policyLink}
+          </p>
+        ) : null}
+        {gap === 'console' ? (
+          <p className="typography-meta text-muted-foreground">
+            {t('settings.providers.enterprisePolicyConsole')}{' '}{policyLink}
+          </p>
+        ) : null}
+      </div>
+    </div>
+  );
+};
 
 /**
  * Classification providers answer OpenChamber's own Jev decisions (safety
@@ -60,6 +151,9 @@ interface ProviderGridProps {
   onSelect: (providerId: string) => void;
   onConnect: () => void;
   onOpenClassification: () => void;
+  /** Providers turned off in the user's config; null where the runtime cannot tell. */
+  disabledProviders?: readonly string[] | null;
+  onEnableProvider?: (providerId: string) => void;
 }
 
 /**
@@ -101,14 +195,15 @@ const useProjectProviderIds = (providers: readonly GridProvider[], directory: st
 
 const StatusPill: React.FC<{ status: ProviderCardStatus }> = ({ status }) => {
   const { t } = useI18n();
-  const label = status.kind === 'accounts'
-    ? t('settings.providers.card.status.accounts', { count: status.count })
-    : status.kind === 'connected'
-      ? t('settings.providers.card.status.connected')
-      : status.kind === 'environment'
-        ? t('settings.providers.card.status.environment')
-        : t('settings.providers.card.status.signInNeeded');
-  const tone: SettingsCardTone = status.kind === 'signInNeeded'
+  let label: string;
+  switch (status.kind) {
+    case 'reauthNeeded': label = t('settings.providers.card.status.reauthNeeded'); break;
+    case 'accounts': label = t('settings.providers.card.status.accounts', { count: status.count }); break;
+    case 'connected': label = t('settings.providers.card.status.connected'); break;
+    case 'environment': label = t('settings.providers.card.status.environment'); break;
+    case 'signInNeeded': label = t('settings.providers.card.status.signInNeeded'); break;
+  }
+  const tone: SettingsCardTone = status.kind === 'signInNeeded' || status.kind === 'reauthNeeded'
     ? 'warning'
     : status.kind === 'environment'
       ? 'neutral'
@@ -117,19 +212,27 @@ const StatusPill: React.FC<{ status: ProviderCardStatus }> = ({ status }) => {
 };
 
 /** Browse view of the Providers page: one card per provider OpenCode reports. */
-export const ProviderGrid: React.FC<ProviderGridProps> = ({ providers, integrations, directory, onSelect, onConnect, onOpenClassification }) => {
+export const ProviderGrid: React.FC<ProviderGridProps> = ({ providers, integrations, directory, onSelect, onConnect, onOpenClassification, disabledProviders, onEnableProvider }) => {
   const { t } = useI18n();
   const [query, setQuery] = React.useState('');
   const projectIds = useProjectProviderIds(providers, directory);
-  const filtered = rankByQuery([...providers], query, (provider) => [provider.name || provider.id, provider.id]);
+  // Alphabetical by name, so a card is found by scanning rather than in the
+  // order the providers happened to be configured.
+  const alphabetical = React.useMemo(() => [...providers].sort((a, b) =>
+    (a.name || a.id).localeCompare(b.name || b.id, undefined, { sensitivity: 'base' })), [providers]);
+  const filtered = rankByQuery(alphabetical, query, (provider) => [provider.name || provider.id, provider.id]);
   const hasQuery = query.trim().length > 0;
+  // The server refuses new providers and keys; this only keeps the way in hidden.
+  const locked = useEnterpriseMode();
 
   return (
     <SettingsPageLayout
       title={t('settings.page.providers.title')}
       description={t('settings.providers.grid.description')}
       headerEnd={<SettingsProjectSelector className="w-full min-w-0 @xl:w-56" />}
+      className="[&>section:first-of-type]:pt-8"
     >
+      {locked ? <EnterpriseProvidersNotice directory={directory} integrations={integrations} /> : null}
       {providers.length > 0 ? (
         <SettingsCardSearch value={query} onChange={setQuery} placeholder={t('settings.providers.grid.searchPlaceholder')} />
       ) : null}
@@ -142,7 +245,7 @@ export const ProviderGrid: React.FC<ProviderGridProps> = ({ providers, integrati
 
       <div className={SETTINGS_CARD_GRID_CLASS}>
         {/* The one way in to connecting a provider, so it leads the grid. */}
-        {hasQuery ? null : (
+        {hasQuery || locked ? null : (
           <SettingsAddCard
             label={t('settings.providers.grid.connect')}
             hint={t('settings.providers.grid.connectHint')}
@@ -155,13 +258,13 @@ export const ProviderGrid: React.FC<ProviderGridProps> = ({ providers, integrati
             integrations,
             providerId: provider.id,
             optionsApiKey: readProviderApiKeySetting(provider),
+            machineCredentials: usesMachineCredentials(provider),
           });
           return (
             <SettingsCard
               key={provider.id}
               icon={<ProviderLogo providerId={provider.id} className="size-5" />}
               title={provider.name || provider.id}
-              subtitle={provider.id}
               badges={status ? <StatusPill status={status} /> : null}
               footer={(
                 <>
@@ -177,6 +280,23 @@ export const ProviderGrid: React.FC<ProviderGridProps> = ({ providers, integrati
           );
         })}
       </div>
+
+      {/* OpenCode drops a disabled provider from its list, so this is the only way back. */}
+      {disabledProviders && disabledProviders.length > 0 && onEnableProvider ? (
+        <SettingsSection title={t('settings.providers.disabled.title')} info={t('settings.providers.disabled.info')}>
+          <div className="space-y-1">
+            {disabledProviders.map((providerId) => (
+              <div key={providerId} className="flex items-center gap-2 py-1">
+                <ProviderLogo providerId={providerId} className="size-4 shrink-0 opacity-60" />
+                <span className="min-w-0 flex-1 truncate typography-ui-label text-muted-foreground">{providerId}</span>
+                <Button size="xs" variant="outline" className="!font-normal" onClick={() => onEnableProvider(providerId)}>
+                  {t('settings.providers.disabled.enable')}
+                </Button>
+              </div>
+            ))}
+          </div>
+        </SettingsSection>
+      ) : null}
     </SettingsPageLayout>
   );
 };

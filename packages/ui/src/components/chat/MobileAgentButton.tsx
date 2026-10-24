@@ -1,7 +1,7 @@
 import React from 'react';
 import { cn } from '@/lib/utils';
 import { useConfigStore } from '@/stores/useConfigStore';
-import { useSessionUIStore } from '@/sync/session-ui-store';
+import { useChatSessionSelection } from './chatColumnSession';
 import { useSelectionStore } from '@/sync/selection-store';
 import { getAgentDisplayName } from './mobileControlsUtils';
 import { useAgentColors } from '@/hooks/useAgentColors';
@@ -22,7 +22,7 @@ export const MobileAgentButton: React.FC<MobileAgentButtonProps> = ({ onCycleAge
     const currentProviderId = useConfigStore((state) => state.currentProviderId);
     const currentModelId = useConfigStore((state) => state.currentModelId);
     const getVisibleAgents = useConfigStore((state) => state.getVisibleAgents);
-    const currentSessionId = useSessionUIStore((state) => state.currentSessionId);
+    const currentSessionId = useChatSessionSelection().sessionId;
     const sessionAgentName = useSelectionStore((state) =>
         currentSessionId ? state.getSessionAgentSelection(currentSessionId) : null
     );
@@ -94,7 +94,7 @@ export const MobileAgentButton: React.FC<MobileAgentButtonProps> = ({ onCycleAge
                 'touch-none',
                 className
             )}
-            style={{ color: `var(${agentColor.var})` }}
+            style={{ color: agentColor.color }}
             title={agentLabel}
         >
             <span className="flex h-full w-full min-w-0 items-center">

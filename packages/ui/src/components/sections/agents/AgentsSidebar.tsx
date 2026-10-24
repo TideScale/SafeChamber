@@ -19,7 +19,8 @@ import {
 } from '@/components/ui/dropdown-menu';
 import { ContextMenu, ContextMenuContent, ContextMenuItem, ContextMenuTrigger } from '@/components/ui/context-menu';
 import { useSettingsDirectory } from '@/hooks/useSettingsDirectory';
-import { selectAgentsForDirectory, useAgentsStore, isAgentBuiltIn, isAgentHidden, type AgentScope, type AgentWithExtras } from '@/stores/useAgentsStore';
+import { selectAgentsForDirectory, selectDisabledAgentsForDirectory, useAgentsStore, isAgentBuiltIn, isAgentHidden, isAgentManageable, type AgentScope, type AgentWithExtras } from '@/stores/useAgentsStore';
+import { isPrimaryMode } from '@/components/chat/mobileControlsUtils';
 import { useShallow } from 'zustand/react/shallow';
 import { cn } from '@/lib/utils';
 import type { Agent } from '@/lib/opencode/model';
@@ -30,7 +31,7 @@ import { matchesRankQuery } from '@/lib/search/fuzzySearch';
 import { SidebarGroup } from '@/components/sections/shared/SidebarGroup';
 import { Icon } from "@/components/icon/Icon";
 import { useI18n } from '@/lib/i18n';
-import { SETTINGS_PANEL_TITLE_CLASS } from '@/components/sections/shared/SettingsSection';
+import { SETTINGS_SECTION_TITLE_CLASS } from '@/components/sections/shared/SettingsSection';
 
 interface AgentsSidebarProps {
   onItemSelect?: () => void;
@@ -41,9 +42,8 @@ export const AgentsSidebar: React.FC<AgentsSidebarProps> = ({ onItemSelect }) =>
   const [query, setQuery] = React.useState('');
   const [renameDialogAgent, setRenameDialogAgent] = React.useState<Agent | null>(null);
   const [renameNewName, setRenameNewName] = React.useState('');
-  const [confirmActionAgent, setConfirmActionAgent] = React.useState<Agent | null>(null);
-  const [confirmActionType, setConfirmActionType] = React.useState<'delete' | 'reset' | null>(null);
-  const [isConfirmActionPending, setIsConfirmActionPending] = React.useState(false);
+  const [confirmDeleteAgent, setConfirmDeleteAgent] = React.useState<Agent | null>(null);
+  const [isConfirmDeletePending, setIsConfirmDeletePending] = React.useState(false);
   const [openMenuAgent, setOpenMenuAgent] = React.useState<string | null>(null);
 
   const {
@@ -53,6 +53,8 @@ export const AgentsSidebar: React.FC<AgentsSidebarProps> = ({ onItemSelect }) =>
     createAgent,
     deleteAgent,
     loadAgents,
+    loadDisabledAgents,
+    updateAgent,
     fetchAgentEntity,
   } = useAgentsStore(useShallow((s) => ({
     selectedAgentName: s.selectedAgentName,
@@ -61,6 +63,8 @@ export const AgentsSidebar: React.FC<AgentsSidebarProps> = ({ onItemSelect }) =>
     createAgent: s.createAgent,
     deleteAgent: s.deleteAgent,
     loadAgents: s.loadAgents,
+    loadDisabledAgents: s.loadDisabledAgents,
+    updateAgent: s.updateAgent,
     fetchAgentEntity: s.fetchAgentEntity,
   })));
 
@@ -69,9 +73,37 @@ export const AgentsSidebar: React.FC<AgentsSidebarProps> = ({ onItemSelect }) =>
   const settingsDirectory = useSettingsDirectory();
   const agents = useAgentsStore((state) => selectAgentsForDirectory(state, settingsDirectory));
 
+  const disabledAgents = useAgentsStore((state) => selectDisabledAgentsForDirectory(state, settingsDirectory));
+  const [pendingToggleAgent, setPendingToggleAgent] = React.useState<string | null>(null);
+
   React.useEffect(() => {
     void loadAgents(settingsDirectory);
-  }, [loadAgents, settingsDirectory]);
+    void loadDisabledAgents(settingsDirectory);
+  }, [loadAgents, loadDisabledAgents, settingsDirectory]);
+
+  // Disabling keeps the agent's file; OpenCode just stops loading it. The last
+  // agent a chat can run as is never offered, so the composer keeps one.
+  const selectablePrimaryCount = agents.filter((agent) => isPrimaryMode(agent.mode) && !isAgentHidden(agent)).length;
+  const canDisable = (agent: Agent) => !(isPrimaryMode(agent.mode) && !isAgentHidden(agent) && selectablePrimaryCount <= 1);
+
+  const setAgentDisabled = async (name: string, disabled: boolean) => {
+    setPendingToggleAgent(name);
+    try {
+      // Throws when the write fails; a write whose list refresh lags still landed.
+      await updateAgent(name, { disabled }, settingsDirectory);
+      if (disabled && selectedAgentName === name) setSelectedAgent(null);
+      toast.success(disabled
+        ? t('settings.agents.sidebar.toast.agentDisabled', { name })
+        : t('settings.agents.sidebar.toast.agentEnabled', { name }));
+    } catch {
+      toast.error(disabled
+        ? t('settings.agents.sidebar.toast.disableFailed')
+        : t('settings.agents.sidebar.toast.enableFailed'));
+    } finally {
+      setPendingToggleAgent(null);
+    }
+  };
+  const shownDisabledAgents = disabledAgents.filter((agent) => matchesRankQuery([agent.name, agent.description], query));
 
   const bgClass = 'bg-background';
 
@@ -98,58 +130,39 @@ export const AgentsSidebar: React.FC<AgentsSidebarProps> = ({ onItemSelect }) =>
       return;
     }
 
-    setConfirmActionAgent(agent);
-    setConfirmActionType('delete');
+    setConfirmDeleteAgent(agent);
   };
 
-  const handleResetAgent = async (agent: Agent) => {
-    if (!isAgentBuiltIn(agent)) {
+  const closeConfirmDeleteDialog = () => {
+    setConfirmDeleteAgent(null);
+  };
+
+  const handleConfirmDelete = async () => {
+    if (!confirmDeleteAgent) {
       return;
     }
 
-    setConfirmActionAgent(agent);
-    setConfirmActionType('reset');
-  };
-
-  const closeConfirmActionDialog = () => {
-    setConfirmActionAgent(null);
-    setConfirmActionType(null);
-  };
-
-  const handleConfirmAction = async () => {
-    if (!confirmActionAgent || !confirmActionType) {
-      return;
-    }
-
-    setIsConfirmActionPending(true);
+    setIsConfirmDeletePending(true);
     try {
-      const result = await deleteAgent(confirmActionAgent.name, (confirmActionAgent as Agent & { scope?: AgentScope }).scope, settingsDirectory);
+      // SAFETY: the rows come from the agents store, whose entries are AgentWithExtras;
+      // `scope` is optional there and undefined means "look in every scope".
+      const result = await deleteAgent(confirmDeleteAgent.name, (confirmDeleteAgent as Agent & { scope?: AgentScope }).scope, settingsDirectory);
 
       if (result.ok) {
-        if (confirmActionType === 'delete') {
-          toast.success(t('settings.agents.sidebar.toast.agentDeleted', { name: confirmActionAgent.name }));
-        } else {
-          toast.success(t('settings.agents.sidebar.toast.agentReset', { name: confirmActionAgent.name }));
-        }
-        closeConfirmActionDialog();
-      } else if (confirmActionType === 'delete') {
-        toast.error(t('settings.agents.sidebar.toast.deleteFailed'));
+        toast.success(t('settings.agents.sidebar.toast.agentDeleted', { name: confirmDeleteAgent.name }));
+        closeConfirmDeleteDialog();
       } else {
-        toast.error(t('settings.agents.sidebar.toast.resetFailed'));
+        toast.error(t('settings.agents.sidebar.toast.deleteFailed'));
       }
     } catch (error) {
       const message = error instanceof Error ? error.message : '';
       const definitionMissing = /built-in|not deletable|not found/i.test(message);
-      if (confirmActionType === 'delete') {
-        toast.error(definitionMissing
-          ? t('settings.agents.sidebar.toast.definitionNotFound')
-          : t('settings.agents.sidebar.toast.deleteFailed'));
-      } else {
-        toast.error(t('settings.agents.sidebar.toast.resetFailed'));
-      }
+      toast.error(definitionMissing
+        ? t('settings.agents.sidebar.toast.definitionNotFound')
+        : t('settings.agents.sidebar.toast.deleteFailed'));
     }
 
-    setIsConfirmActionPending(false);
+    setIsConfirmDeletePending(false);
   };
 
   const handleDuplicateAgent = async (agent: Agent) => {
@@ -184,6 +197,7 @@ export const AgentsSidebar: React.FC<AgentsSidebarProps> = ({ onItemSelect }) =>
       top_p: body?.top_p,
       mode: envelope.config.mode ?? extAgent.mode,
       permissions: envelope.config.permissions ?? undefined,
+      hidden: envelope.config.hidden,
     });
     setSelectedAgent(newName);
     onItemSelect?.();
@@ -259,9 +273,12 @@ export const AgentsSidebar: React.FC<AgentsSidebarProps> = ({ onItemSelect }) =>
     }
   };
 
-  // Filter out hidden agents (internal agents like title, compaction, summary)
-  const visibleAgents = agents.filter((agent) => !isAgentHidden(agent));
-  const shownAgents = visibleAgents.filter((agent) => matchesRankQuery([agent.name, agent.description], query));
+  // Hidden custom agents stay manageable here even though pickers exclude them.
+  // OpenCode drops a disabled agent once it re-reads its config; until then
+  // the agent's own file already says disabled, so it shows only there.
+  const disabledNames = new Set(disabledAgents.map((agent) => agent.name));
+  const manageableAgents = agents.filter((agent) => isAgentManageable(agent) && !disabledNames.has(agent.name));
+  const shownAgents = manageableAgents.filter((agent) => matchesRankQuery([agent.name, agent.description], query));
   const builtInAgents = shownAgents.filter(isAgentBuiltIn);
   const customAgents = shownAgents.filter((agent) => !isAgentBuiltIn(agent));
 
@@ -287,10 +304,10 @@ export const AgentsSidebar: React.FC<AgentsSidebarProps> = ({ onItemSelect }) =>
   return (
     <div className={cn('flex h-full flex-col', bgClass)}>
       <div className="border-b px-3 pt-4 pb-3">
-        <h2 className={`${SETTINGS_PANEL_TITLE_CLASS} mb-3`}>{t('settings.agents.sidebar.title')}</h2>
+        <h2 className={`${SETTINGS_SECTION_TITLE_CLASS} mb-3`}>{t('settings.agents.sidebar.title')}</h2>
         <SettingsProjectSelector className="mb-3" />
         <div className="flex items-center justify-between gap-2">
-          <span className="typography-meta text-muted-foreground">{t('settings.agents.sidebar.total', { count: visibleAgents.length })}</span>
+          <span className="typography-meta text-muted-foreground">{t('settings.agents.sidebar.total', { count: manageableAgents.length })}</span>
           <Button size="sm"
             data-settings-item="agents.create"
             variant="ghost"
@@ -300,11 +317,11 @@ export const AgentsSidebar: React.FC<AgentsSidebarProps> = ({ onItemSelect }) =>
             <Icon name="add" className="h-3.5 w-3.5" />
           </Button>
         </div>
-        {visibleAgents.length > 0 ? <SettingsSidebarSearch value={query} onChange={setQuery} /> : null}
+        {manageableAgents.length > 0 ? <SettingsSidebarSearch value={query} onChange={setQuery} /> : null}
       </div>
 
       <ScrollableOverlay outerClassName="flex-1 min-h-0" className="space-y-1 px-3 py-2 overflow-x-hidden">
-        {visibleAgents.length === 0 ? (
+        {manageableAgents.length === 0 ? (
           <div className="py-12 px-4 text-center text-muted-foreground">
             <Icon name="robot-2" className="mx-auto mb-3 h-10 w-10 opacity-50" />
             <p className="typography-ui-label font-medium">{t('settings.agents.sidebar.empty.title')}</p>
@@ -329,8 +346,8 @@ export const AgentsSidebar: React.FC<AgentsSidebarProps> = ({ onItemSelect }) =>
                       onItemSelect?.();
 
                     }}
-                    onReset={() => handleResetAgent(agent)}
                     onDuplicate={() => void handleDuplicateAgent(agent)}
+                    onDisable={canDisable(agent) ? () => void setAgentDisabled(agent.name, true) : undefined}
                     getAgentModeIcon={getAgentModeIcon}
                     isMenuOpen={openMenuAgent === agent.name}
                     onMenuOpenChange={(open) => setOpenMenuAgent(open ? agent.name : null)}
@@ -366,6 +383,7 @@ export const AgentsSidebar: React.FC<AgentsSidebarProps> = ({ onItemSelect }) =>
                         onRename={() => handleOpenRenameDialog(agent)}
                         onDelete={() => handleDeleteAgent(agent)}
                         onDuplicate={() => void handleDuplicateAgent(agent)}
+                        onDisable={canDisable(agent) ? () => void setAgentDisabled(agent.name, true) : undefined}
                         getAgentModeIcon={getAgentModeIcon}
                         isMenuOpen={openMenuAgent === agent.name}
                         onMenuOpenChange={(open) => setOpenMenuAgent(open ? agent.name : null)}
@@ -388,6 +406,7 @@ export const AgentsSidebar: React.FC<AgentsSidebarProps> = ({ onItemSelect }) =>
                     onRename={() => handleOpenRenameDialog(agent)}
                     onDelete={() => handleDeleteAgent(agent)}
                     onDuplicate={() => void handleDuplicateAgent(agent)}
+                    onDisable={canDisable(agent) ? () => void setAgentDisabled(agent.name, true) : undefined}
                     getAgentModeIcon={getAgentModeIcon}
                     isMenuOpen={openMenuAgent === agent.name}
                     onMenuOpenChange={(open) => setOpenMenuAgent(open ? agent.name : null)}
@@ -397,36 +416,61 @@ export const AgentsSidebar: React.FC<AgentsSidebarProps> = ({ onItemSelect }) =>
             )}
           </>
         )}
+
+        {shownDisabledAgents.length > 0 && (
+          <>
+            <div className="px-2 pb-1.5 pt-3 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+              {t('settings.agents.sidebar.section.disabled')}
+            </div>
+            {shownDisabledAgents.map((agent) => (
+              <div key={agent.name} className="flex items-center gap-2 rounded-md px-1.5 py-1">
+                <div className="min-w-0 flex-1">
+                  <div className="typography-ui-label truncate text-muted-foreground">{agent.name}</div>
+                  {agent.description ? (
+                    <div className="typography-micro truncate leading-tight text-muted-foreground/60">{agent.description}</div>
+                  ) : null}
+                </div>
+                <Button
+                  size="xs"
+                  variant="outline"
+                  disabled={pendingToggleAgent === agent.name}
+                  onClick={() => void setAgentDisabled(agent.name, false)}
+                  aria-label={t('settings.agents.sidebar.actions.enableAria', { name: agent.name })}
+                >
+                  {t('settings.agents.sidebar.actions.enable')}
+                </Button>
+              </div>
+            ))}
+          </>
+        )}
       </ScrollableOverlay>
 
       <Dialog
-        open={confirmActionAgent !== null && confirmActionType !== null}
+        open={confirmDeleteAgent !== null}
         onOpenChange={(open) => {
-          if (!open && !isConfirmActionPending) {
-            closeConfirmActionDialog();
+          if (!open && !isConfirmDeletePending) {
+            closeConfirmDeleteDialog();
           }
         }}
       >
         <DialogContent className="max-w-md">
           <DialogHeader>
-            <DialogTitle>{confirmActionType === 'delete' ? t('settings.agents.sidebar.dialog.deleteTitle') : t('settings.agents.sidebar.dialog.resetTitle')}</DialogTitle>
+            <DialogTitle>{t('settings.agents.sidebar.dialog.deleteTitle')}</DialogTitle>
             <DialogDescription>
-              {confirmActionType === 'delete'
-                ? t('settings.agents.sidebar.dialog.deleteDescription', { name: confirmActionAgent?.name ?? '' })
-                : t('settings.agents.sidebar.dialog.resetDescription', { name: confirmActionAgent?.name ?? '' })}
+              {t('settings.agents.sidebar.dialog.deleteDescription', { name: confirmDeleteAgent?.name ?? '' })}
             </DialogDescription>
           </DialogHeader>
           <DialogFooter>
             <Button
               size="sm"
               variant="ghost"
-              onClick={closeConfirmActionDialog}
-              disabled={isConfirmActionPending}
+              onClick={closeConfirmDeleteDialog}
+              disabled={isConfirmDeletePending}
             >
               {t('settings.common.actions.cancel')}
             </Button>
-            <Button size="sm" onClick={handleConfirmAction} disabled={isConfirmActionPending}>
-              {confirmActionType === 'delete' ? t('settings.common.actions.delete') : t('settings.common.actions.reset')}
+            <Button size="sm" onClick={handleConfirmDelete} disabled={isConfirmDeletePending}>
+              {t('settings.common.actions.delete')}
             </Button>
           </DialogFooter>
         </DialogContent>
@@ -475,9 +519,10 @@ interface AgentListItemProps {
   isSelected: boolean;
   onSelect: () => void;
   onDelete?: () => void;
-  onReset?: () => void;
   onRename?: () => void;
   onDuplicate: () => void;
+  /** Absent when this agent cannot be switched off (the last one a chat can use). */
+  onDisable?: () => void;
   getAgentModeIcon: (mode?: string) => React.ReactNode;
   isMenuOpen: boolean;
   onMenuOpenChange: (open: boolean) => void;
@@ -488,9 +533,9 @@ const AgentListItem: React.FC<AgentListItemProps> = ({
   isSelected,
   onSelect,
   onDelete,
-  onReset,
   onRename,
   onDuplicate,
+  onDisable,
   getAgentModeIcon,
   isMenuOpen,
   onMenuOpenChange,
@@ -503,23 +548,23 @@ const AgentListItem: React.FC<AgentListItemProps> = ({
     <>
       {onRename && (
         <Item onClick={(e: React.MouseEvent) => { e.stopPropagation(); onRename(); }}>
-          <Icon name="edit" className="h-4 w-4 mr-px" />
+          <Icon name="edit" className="h-4 w-4 me-px" />
           {t('settings.common.actions.rename')}
         </Item>
       )}
       <Item onClick={(e: React.MouseEvent) => { e.stopPropagation(); onDuplicate(); }}>
-        <Icon name="file-copy" className="h-4 w-4 mr-px" />
+        <Icon name="file-copy" className="h-4 w-4 me-px" />
         {t('settings.common.actions.duplicate')}
       </Item>
-      {onReset && (
-        <Item onClick={(e: React.MouseEvent) => { e.stopPropagation(); onReset(); }}>
-          <Icon name="restart" className="h-4 w-4 mr-px" />
-          {t('settings.common.actions.reset')}
+      {onDisable && (
+        <Item onClick={(e: React.MouseEvent) => { e.stopPropagation(); onDisable(); }}>
+          <Icon name="eye-off" className="h-4 w-4 me-px" />
+          {t('settings.agents.sidebar.actions.disable')}
         </Item>
       )}
       {onDelete && (
         <Item onClick={(e: React.MouseEvent) => { e.stopPropagation(); onDelete(); }} className="text-destructive focus:text-destructive">
-          <Icon name="delete-bin" className="h-4 w-4 mr-px" />
+          <Icon name="delete-bin" className="h-4 w-4 me-px" />
           {t('settings.common.actions.delete')}
         </Item>
       )}
@@ -532,7 +577,7 @@ const AgentListItem: React.FC<AgentListItemProps> = ({
       <div className="flex min-w-0 flex-1 items-center">
         <button
           onClick={onSelect}
-          className="flex min-w-0 flex-1 flex-col gap-0 rounded-sm text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          className="flex min-w-0 flex-1 flex-col gap-0 rounded-sm text-start focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
           tabIndex={0}
         >
           <div className="flex items-center gap-1.5">
@@ -558,7 +603,7 @@ const AgentListItem: React.FC<AgentListItemProps> = ({
           <DropdownMenuTrigger asChild>
             <Button size="sm"
               variant="ghost"
-              className="h-6 w-6 px-0 flex-shrink-0 -mr-1 opacity-100 transition-opacity md:opacity-0 md:group-hover:opacity-100"
+              className="h-6 w-6 px-0 flex-shrink-0 -me-1 opacity-100 transition-opacity md:opacity-0 md:group-hover:opacity-100"
             >
               <Icon name="more-2" className="h-3.5 w-3.5" />
             </Button>

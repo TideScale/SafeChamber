@@ -4,6 +4,8 @@ import { cn } from '@/lib/utils';
 import { ScrollableOverlay } from './ScrollableOverlay';
 import { Icon } from "@/components/icon/Icon";
 import { useI18n } from '@/lib/i18n';
+import { isInsideOpenPopup, isTopmostBackLayer, registerBackLayer } from '@/lib/mobileBackLayers';
+import { isIMECompositionEvent } from '@/lib/ime';
 
 interface MobileOverlayPanelProps {
   open: boolean;
@@ -87,14 +89,31 @@ export const MobileOverlayPanel: React.FC<MobileOverlayPanelProps> = ({
     };
   }, [open]);
 
+  // One stable closer per panel: it is this panel's identity in the back
+  // layer stack, and always calls the latest onClose.
+  const onCloseRef = React.useRef(onClose);
+  React.useLayoutEffect(() => {
+    onCloseRef.current = onClose;
+  }, [onClose]);
+  const closeLayer = React.useCallback(() => onCloseRef.current(), []);
+
+  // The Android back button closes the newest open panel first.
+  React.useEffect(() => {
+    if (!open) return;
+    return registerBackLayer(closeLayer);
+  }, [open, closeLayer]);
+
   React.useEffect(() => {
     if (!open) {
       return;
     }
     const previousOverflow = document.body.style.overflow;
     document.body.style.overflow = 'hidden';
+    // Escape belongs to the newest layer: a select or dialog open inside the
+    // panel closes itself, and a panel under another panel stays open.
     const handleKeyDown = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') {
+      if (isIMECompositionEvent(event)) return;
+      if (event.key === 'Escape' && isTopmostBackLayer(closeLayer) && !isInsideOpenPopup(event.target)) {
         onClose();
       }
     };
@@ -103,7 +122,7 @@ export const MobileOverlayPanel: React.FC<MobileOverlayPanelProps> = ({
       document.body.style.overflow = previousOverflow;
       document.removeEventListener('keydown', handleKeyDown);
     };
-  }, [open, onClose]);
+  }, [open, onClose, closeLayer]);
 
   if (!open || !overlayRootRef.current) {
     return null;

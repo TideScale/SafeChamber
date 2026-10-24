@@ -42,7 +42,7 @@ export const getToolIcon = (toolName: string, presentation?: GuestToolRule | nul
     if (tool === 'execute') {
         return <Icon name="braces" className={iconClass} />;
     }
-    if (tool === 'shell' || tool === 'bash' || tool === 'cmd' || tool === 'terminal') {
+    if (tool === 'shell' || tool === 'bash' || tool === 'cmd' || tool === 'terminal' || tool === 'shell_command') {
         return <Icon name="terminal-box" className={iconClass} />;
     }
     if (tool === 'ls' || tool === 'dir' || tool === 'list_files') {
@@ -90,8 +90,17 @@ export const getToolIcon = (toolName: string, presentation?: GuestToolRule | nul
     if (tool === 'openchamber_web') {
         return <Icon name="global" className={iconClass} />;
     }
+    if (tool === 'openchamber_schedule') {
+        return <Icon name="calendar-schedule" className={iconClass} />;
+    }
     if (tool === 'openchamber_notify') {
         return <Icon name="notification-3" className={iconClass} />;
+    }
+    if (tool === 'openchamber_render') {
+        return <Icon name="bar-chart-box" className={iconClass} />;
+    }
+    if (tool === 'openchamber_knowledge') {
+        return <Icon name="sticky-note" className={iconClass} />;
     }
     if (tool === 'openchamber_memory') {
         return <Icon name="brain-4" className={iconClass} />;

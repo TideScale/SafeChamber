@@ -1,5 +1,6 @@
 export { applyHostReady, applyHostTheme } from './theme.ts';
 export type { ThemeRoot } from './theme.ts';
+export { GUEST_UI_LOOK_CSS } from './style.ts';
 export type { Handle } from './dom.ts';
 
 export { mountButton } from './button.ts';
@@ -48,3 +49,6 @@ export type { MenuHandle, MenuItem, MenuProps } from './menu.ts';
 
 export { mountText, splitTextMedia } from './text.ts';
 export type { TextHandle, TextPart, TextProps } from './text.ts';
+
+export { mountPopoverAnchor } from './popover-anchor.ts';
+export type { PopoverAnchorHandle, PopoverAnchorOptions } from './popover-anchor.ts';

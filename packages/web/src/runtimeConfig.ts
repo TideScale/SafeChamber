@@ -1,11 +1,10 @@
 import { getRuntimeExtraHeadersSync, refreshLocalRuntimeUrlAuthToken, refreshRuntimeUrlAuthToken, setRuntimeBearerToken, setRuntimeExtraHeaders } from '@openchamber/ui/lib/runtime-auth';
 import { installRuntimeFetchBridge } from '@openchamber/ui/lib/runtime-fetch';
-import { initializeRuntimeEndpoint, switchRuntimeEndpoint } from '@openchamber/ui/lib/runtime-switch';
+import { initializeRuntimeEndpoint } from '@openchamber/ui/lib/runtime-switch';
 import { warmDesktopHostStatuses } from '@openchamber/ui/lib/desktopHostStatus';
 import { restoreDesktopRelayRuntime } from '@openchamber/ui/lib/desktopRelayRestore';
 import { getInjectedBootOutcome } from '@openchamber/ui/lib/desktopBoot';
 import { configureRuntimeUrlResolver } from '@openchamber/ui/lib/runtime-url';
-import type { EmbeddedSessionRuntimeBootstrap } from '@openchamber/ui/components/layout/contextPanelEmbeddedChat';
 import { opencodeClient } from '@openchamber/ui/lib/opencode/client';
 import { createWebAPIs } from './api';
 
@@ -28,10 +27,20 @@ declare global {
     __OPENCHAMBER_RUNTIME_HEADERS__?: Record<string, string>;
     __OPENCHAMBER_LOCAL_ORIGIN__?: string;
     __OPENCHAMBER_RELAY_HOST_ID__?: string;
+    __OPENCHAMBER_EXPLICIT_RUNTIME__?: boolean;
   }
 }
 
-export const readRuntimeBootstrapConfig = (): EmbeddedSessionRuntimeBootstrap => {
+type RuntimeBootstrapConfig = {
+  apiBaseUrl: string;
+  clientToken: string;
+  localOrigin: string;
+  runtimeHeaders?: Record<string, string>;
+  relayHostId: string;
+  explicitRuntime: boolean;
+};
+
+export const readRuntimeBootstrapConfig = (): RuntimeBootstrapConfig => {
   const readString = (value: unknown): string => typeof value === 'string' ? value.trim() : '';
 
   return {
@@ -40,6 +49,7 @@ export const readRuntimeBootstrapConfig = (): EmbeddedSessionRuntimeBootstrap =>
     localOrigin: readString(window.__OPENCHAMBER_LOCAL_ORIGIN__),
     runtimeHeaders: window.__OPENCHAMBER_RUNTIME_HEADERS__,
     relayHostId: readString(window.__OPENCHAMBER_RELAY_HOST_ID__),
+    explicitRuntime: window.__OPENCHAMBER_EXPLICIT_RUNTIME__ === true,
   };
 };
 
@@ -48,9 +58,9 @@ export const readRuntimeBootstrapConfig = (): EmbeddedSessionRuntimeBootstrap =>
 let desktopRelayRestoreReady: Promise<void> = Promise.resolve();
 export const getDesktopRelayRestoreReady = (): Promise<void> => desktopRelayRestoreReady;
 
-export const createConfiguredWebAPIs = (bootstrap?: EmbeddedSessionRuntimeBootstrap | null) => {
-  const { apiBaseUrl, clientToken, localOrigin, runtimeHeaders, relayHostId, relay } = bootstrap ?? readRuntimeBootstrapConfig();
-  const bootOutcome = bootstrap ? null : getInjectedBootOutcome();
+export const createConfiguredWebAPIs = () => {
+  const { apiBaseUrl, clientToken, localOrigin, runtimeHeaders, relayHostId, explicitRuntime } = readRuntimeBootstrapConfig();
+  const bootOutcome = getInjectedBootOutcome();
   const desktopHostId = relayHostId || (bootOutcome?.target === 'remote' ? bootOutcome.hostId : '');
 
   const urls = configureRuntimeUrlResolver({
@@ -63,40 +73,37 @@ export const createConfiguredWebAPIs = (bootstrap?: EmbeddedSessionRuntimeBootst
   });
   setRuntimeBearerToken(clientToken || null);
   setRuntimeExtraHeaders(runtimeHeaders || null);
-  if (relay) {
-    switchRuntimeEndpoint({
-      apiBaseUrl,
-      clientToken: clientToken || null,
-      requestHeaders: runtimeHeaders || null,
-      runtimeKey: relayHostId ? `host:${relayHostId}` : null,
-      relay,
-    });
-  }
-  // createWebAPIs imports UI stores, which instantiate the SDK singleton before
-  // an embedded frame's asynchronous parent bootstrap is available.
+  // createWebAPIs imports UI stores, which instantiate the SDK singleton
+  // before the endpoint above is configured.
   opencodeClient.reconnectToRuntimeBaseUrl();
   void refreshRuntimeUrlAuthToken(apiBaseUrl || undefined).catch(() => {});
   if (localOrigin && !sameOrigin(apiBaseUrl, localOrigin) && Object.keys(getRuntimeExtraHeadersSync()).length > 0) {
     void refreshLocalRuntimeUrlAuthToken(localOrigin).catch(() => {});
   }
   installRuntimeFetchBridge();
-  // Desktop only: reconnect a relay-capable host now that the fetch bridge is
-  // installed — either the host this window was opened for (injected id) or the
-  // default host on relaunch. No-op elsewhere; resolves in milliseconds when no
-  // relay host is involved. main.tsx holds the app render on this promise so
-  // the user sees the splash instead of a transient auth screen against an
-  // endpoint that is still being selected.
-  desktopRelayRestoreReady = relay
-    ? Promise.resolve()
-    : Promise.race([
-        restoreDesktopRelayRuntime(relayHostId || undefined).catch(() => {}),
-        // Never hold the app hostage: a stuck probe/tunnel gives up to the UI.
-        new Promise<void>((resolve) => { window.setTimeout(resolve, 10_000); }),
-      ]).then(() => {
-        // Relay-capable windows may select a reachable direct leg before React
-        // subscribes to runtime-change events, so bind the SDK explicitly.
-        opencodeClient.reconnectToRuntimeBaseUrl();
-      });
+  // Desktop only: connect a relay-capable host now that the fetch bridge is
+  // installed. No-op elsewhere; resolves in milliseconds when no relay host is
+  // involved. main.tsx holds the app render on this promise so the user sees the
+  // splash instead of a transient auth screen against an endpoint still being
+  // selected.
+  const restoreRelayRuntime = (): Promise<void> => {
+    // Opened for this relay host. Boot already set its runtime key, so force the
+    // restore past its already-active check, or the tunnel never opens.
+    if (relayHostId) return restoreDesktopRelayRuntime(relayHostId, { reconnectActive: true });
+    // Opened for a specific direct instance: keep the injected endpoint.
+    if (explicitRuntime) return Promise.resolve();
+    // Main window and menu New Window: the default host on relaunch.
+    return restoreDesktopRelayRuntime();
+  };
+  desktopRelayRestoreReady = Promise.race([
+    restoreRelayRuntime().catch(() => {}),
+    // Never hold the app hostage: a stuck probe/tunnel gives up to the UI.
+    new Promise<void>((resolve) => { window.setTimeout(resolve, 10_000); }),
+  ]).then(() => {
+    // Relay-capable windows may select a reachable direct leg before React
+    // subscribes to runtime-change events, so bind the SDK explicitly.
+    opencodeClient.reconnectToRuntimeBaseUrl();
+  });
   // Learn every instance's reachability in the background, so the switcher opens
   // on real values instead of probing for the first time under the user's
   // cursor. After the endpoint is settled and past the app's own bootstrap:

@@ -4,18 +4,16 @@ import { describe, expect, test } from 'bun:test';
 import type { Session } from '@/lib/opencode/model';
 import type { WorktreeMetadata } from '@/types/worktree';
 import { getRuntimeKey } from '@/lib/runtime-switch';
-import { getGitHubPrStatusKey } from '@/stores/useGitHubPrStatusStore';
-import { getPinnedSessionKey } from '@/stores/useSessionPinnedStore';
+import { getPinnedSessionKey } from '@/lib/sessionPins';
 import {
   computeNodeStructureKey,
   canShowSessionWorktreeMenu,
   getSessionWorktreeMenuDisabled,
   nodeHasPinnedMembershipChange,
-  resolveSessionPrLookupKey,
+  resolveSessionPrLookup,
   resolveTooltipBranchLabel,
   selectFolderRootNodes,
-  selectFormBadgeSessionScopes,
-  selectRowBadgeVisibilityClass,
+  selectBlockingBadgeSessionScopes,
 } from './sessionNodeItemUtils';
 import type { SessionNode } from '../types';
 
@@ -46,7 +44,7 @@ describe('computeNodeStructureKey', () => {
   });
 });
 
-describe('selectFormBadgeSessionScopes', () => {
+describe('selectBlockingBadgeSessionScopes', () => {
   const withDirectory = (node: SessionNode, directory: string | null): SessionNode => ({
     ...node,
     session: { ...node.session, directory } as Session,
@@ -57,7 +55,7 @@ describe('selectFormBadgeSessionScopes', () => {
     const child = withDirectory({ session: session('child', 'Child'), children: [grandchild], worktree: null }, '/worktrees/feature');
     const root = withDirectory({ session: session('root', 'Root'), children: [child], worktree: null }, '/repo');
 
-    expect(selectFormBadgeSessionScopes(root, false, '/repo')).toEqual([
+    expect(selectBlockingBadgeSessionScopes(root, false, '/repo')).toEqual([
       { directory: '/repo', sessionIDs: ['root'] },
       { directory: '/worktrees/feature', sessionIDs: ['child', 'grandchild'] },
     ]);
@@ -67,7 +65,7 @@ describe('selectFormBadgeSessionScopes', () => {
     const child = withDirectory({ session: session('child', 'Child'), children: [], worktree: null }, '/worktrees/feature');
     const root = withDirectory({ session: session('root', 'Root'), children: [child], worktree: null }, '/repo');
 
-    expect(selectFormBadgeSessionScopes(root, true, '/repo')).toEqual([
+    expect(selectBlockingBadgeSessionScopes(root, true, '/repo')).toEqual([
       { directory: '/repo', sessionIDs: ['root'] },
     ]);
   });
@@ -75,7 +73,7 @@ describe('selectFormBadgeSessionScopes', () => {
   test('falls back to the group directory when the session has none', () => {
     const root: SessionNode = { session: session('root', 'Root'), children: [], worktree: null };
 
-    expect(selectFormBadgeSessionScopes(root, false, '/fallback')).toEqual([
+    expect(selectBlockingBadgeSessionScopes(root, false, '/fallback')).toEqual([
       { directory: '/fallback', sessionIDs: ['root'] },
     ]);
   });
@@ -173,44 +171,6 @@ describe('selectFolderRootNodes', () => {
   });
 });
 
-describe('selectRowBadgeVisibilityClass', () => {
-  const hideOnHoverClass = 'group-hover:opacity-0 group-focus-within:opacity-0';
-
-  test('defers to the caller hover rule so the badge fades with the date label (#2284)', () => {
-    const className = selectRowBadgeVisibilityClass({
-      actionsAlwaysVisible: false,
-      menuOpen: false,
-      hideOnHoverClass,
-    });
-
-    expect(className).toContain(hideOnHoverClass);
-  });
-
-  test('hides the badge unconditionally while the row menu keeps the actions visible without hover', () => {
-    const className = selectRowBadgeVisibilityClass({
-      actionsAlwaysVisible: false,
-      menuOpen: true,
-      hideOnHoverClass,
-    });
-
-    expect(className).not.toBe('');
-    expect(className).not.toContain(hideOnHoverClass);
-  });
-
-  test('keeps the badge always visible when actions have reserved permanent padding', () => {
-    expect(selectRowBadgeVisibilityClass({
-      actionsAlwaysVisible: true,
-      menuOpen: false,
-      hideOnHoverClass,
-    })).toBe('');
-    expect(selectRowBadgeVisibilityClass({
-      actionsAlwaysVisible: true,
-      menuOpen: true,
-      hideOnHoverClass,
-    })).toBe('');
-  });
-});
-
 describe('getSessionWorktreeMenuDisabled', () => {
   test('shares the parent trigger disabled contract with the new worktree action', () => {
     expect(getSessionWorktreeMenuDisabled({
@@ -275,20 +235,20 @@ describe('resolveTooltipBranchLabel', () => {
   });
 });
 
-describe('resolveSessionPrLookupKey', () => {
+describe('resolveSessionPrLookup', () => {
   const worktree = (path: string, branch: string): WorktreeMetadata => ({
     path, projectDirectory: '/repo', branch, label: branch,
   });
 
-  test('derives the PR key from the row worktree directory and branch', () => {
-    expect(resolveSessionPrLookupKey(worktree('/worktrees/feature', 'feature-1'), false))
-      .toBe(getGitHubPrStatusKey('/worktrees/feature', 'feature-1'));
+  test('takes the row worktree directory and branch', () => {
+    expect(resolveSessionPrLookup(worktree('/worktrees/feature', 'feature-1'), false))
+      .toEqual({ directory: '/worktrees/feature', branch: 'feature-1' });
   });
 
   test('rejects rows with no worktree, no branch, or a VS Code runtime', () => {
-    expect(resolveSessionPrLookupKey(null, false)).toBeNull();
-    expect(resolveSessionPrLookupKey(worktree('/worktrees/feature', '   '), false)).toBeNull();
-    expect(resolveSessionPrLookupKey(worktree('/worktrees/feature', 'feature-1'), true)).toBeNull();
+    expect(resolveSessionPrLookup(null, false)).toBeNull();
+    expect(resolveSessionPrLookup(worktree('/worktrees/feature', '   '), false)).toBeNull();
+    expect(resolveSessionPrLookup(worktree('/worktrees/feature', 'feature-1'), true)).toBeNull();
   });
 });
 

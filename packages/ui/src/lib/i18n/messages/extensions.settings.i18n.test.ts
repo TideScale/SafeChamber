@@ -2,7 +2,7 @@ import { describe, expect, test } from 'bun:test';
 
 import { extensionsSettingsI18n } from './extensions.settings.i18n';
 
-const locales = ['en', 'de', 'fr', 'es', 'ja', 'pt-BR', 'uk', 'ko', 'pl', 'zh-CN', 'zh-TW', 'tr'] as const;
+const locales = ['en', 'de', 'fr', 'nl', 'es', 'ja', 'pt-BR', 'uk', 'ko', 'pl', 'zh-CN', 'zh-TW', 'tr'] as const;
 
 const requiredKeys = [
   'settings.extensions.builtIn.info',
@@ -46,6 +46,7 @@ const requiredKeys = [
   'settings.extensions.toast.missingBuild',
   'settings.extensions.toast.hostTooOld',
   'settings.extensions.toast.cloneFailed',
+  'settings.extensions.toast.cloneNeedsSignIn',
   'settings.extensions.toast.extractFailed',
   'settings.extensions.toast.folderNeedsZip',
   'settings.extensions.toast.zipTooLarge',
@@ -54,6 +55,10 @@ const requiredKeys = [
   'settings.extensions.toast.loadFailed',
   'settings.extensions.service.permissions',
   'settings.extensions.status.needsApproval',
+  'settings.extensions.status.unreadable',
+  'settings.extensions.toast.installedUnreadable',
+  'settings.extensions.unreadable.hint',
+  'settings.extensions.unreadable.unnamed',
   'settings.extensions.review',
   'settings.extensions.review.aria',
   'settings.extensions.dialog.approveTitle',
@@ -76,6 +81,8 @@ const requiredKeys = [
   'settings.extensions.capability.model.detail',
   'settings.extensions.capability.filesystem',
   'settings.extensions.capability.filesystem.detail',
+  'settings.extensions.capability.origins',
+  'settings.extensions.capability.origins.detail',
   'settings.extensions.capability.conversation',
   'settings.extensions.capability.conversation.detail',
   'settings.extensions.toast.approved',
@@ -115,12 +122,17 @@ const requiredKeys = [
   'settings.extensions.toast.updateFailed',
   'settings.extensions.toast.notGit',
   'settings.extensions.toast.swapFailed',
+  'settings.extensions.browse.label',
+  'settings.extensions.browse.hint',
 ] as const;
 
 const allowEnglishLoanword = new Set([
   'settings.page.extensions.title',
   'settings.extensions.source.path',
   'settings.extensions.add.placeholder',
+  // "ZIP" is a file format and "Git" a product name; both stay as they are.
+  'settings.extensions.source.zip',
+  'settings.extensions.source.git',
 ]);
 
 describe('extensions settings translations', () => {

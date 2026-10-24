@@ -1,12 +1,15 @@
-// A space's state and its repair (DESIGN.md, user journey step 8): what the group's status line
+// A space's state and its repair (journey step 8): what the group's status line
 // says about a space that is stopped, broken or not answering, which actions its menu offers, and
 // the actions themselves, from soft to hard: start, restart OpenCode, restart the container, stop,
 // delete. What the host lists is the authority; this window only adds the action it has under way
-// or the one that failed, so the line can say so.
+// or the one that failed, so the line can say so. Since 5d-4 the menu of a running space also runs
+// the project's setup commands again.
 
 import { failureOfError } from '@/components/session/spaces/spaceFailureText';
-import { refreshGlobalSessions } from '@/stores/useGlobalSessionsStore';
+import { refreshSpaceArchives } from './space-archives';
+import { refreshGlobalSessions, useGlobalSessionsStore } from '@/stores/useGlobalSessionsStore';
 import {
+  SpacesRequestError,
   removeSpace,
   restartSpace,
   restartSpaceOpenCode,
@@ -15,7 +18,8 @@ import {
   type SpaceEntry,
   type SpaceFailure,
 } from './spaces-api';
-import { refreshSpacesJourney, spacesRuntimeGeneration, useSpacesStore, type SpaceAction, type SpaceActionState, type SpaceMark } from './spaces-store';
+import { refreshSpacesJourney, spacesRuntimeGeneration, useSpacesStore, type SpaceAction, type SpaceActionState, type SpaceMark, type SpaceUnsavedChats } from './spaces-store';
+import { runSpaceSetupAgain } from './space-setup';
 
 /**
  * What is wrong with a space that exists, in the order the status line tells it: an action under
@@ -28,8 +32,11 @@ export type SpaceCondition =
   | { kind: 'container_gone' }
   | { kind: 'gatekeeper_gone' }
   | { kind: 'stopped' }
+  | { kind: 'stopped_idle' }
   | { kind: 'damaged' }
-  | { kind: 'not_answering' };
+  | { kind: 'not_answering' }
+  /** The space's machine cannot be asked; `gone` when the machine left Settings, so only a delete, which forgets the record, is left. */
+  | { kind: 'unreachable'; machine: string | null; gone: boolean };
 
 export const spaceConditionOf = (
   entry: SpaceEntry | undefined,
@@ -43,8 +50,9 @@ export const spaceConditionOf = (
   // offering the same refused restart again and again.
   if (action?.kind === 'failed' && spaceMenuActionsOf(entry).includes(action.action)) return { kind: 'action_failed', action: action.action, failure: action.failure };
   if (entry.state === 'missing') return { kind: 'container_gone' };
+  if (entry.state === 'unreachable') return { kind: 'unreachable', machine: entry.machine, gone: entry.failure?.code === 'place_not_found' };
   if (entry.damage === 'gatekeeper_gone') return { kind: 'gatekeeper_gone' };
-  if (entry.state === 'exited') return { kind: 'stopped' };
+  if (entry.state === 'exited') return { kind: entry.stoppedIdle ? 'stopped_idle' : 'stopped' };
   if (entry.damage === 'repairable') return { kind: 'damaged' };
   // The session list did not get an answer from the space the last time the host asked.
   if (mark && (mark.state === 'stale' || mark.state === 'unknown')) return { kind: 'not_answering' };
@@ -52,26 +60,73 @@ export const spaceConditionOf = (
 };
 
 /**
+ * Whether the line under a space's group says what is wrong with it: being made, failed,
+ * stopped, out of reach, not answering, or an action under way. The group's stale mark shows
+ * only when it does not, so a stopped space gets no second warning that reads like a fault.
+ * It follows the state lines of `SpaceGroupStatus` only: the access and setup lines below them
+ * say nothing about the session list, so the mark may sit beside them.
+ */
+export const spaceLineSaysState = (
+  entry: SpaceEntry | undefined,
+  mark: SpaceMark | undefined,
+  action: SpaceActionState | undefined,
+): boolean => entry?.state === 'preparing' || entry?.state === 'failed' || spaceConditionOf(entry, mark, action) !== null;
+
+/**
  * The actions the group's menu offers for a space, in order. A restart needs a running space
  * with a gatekeeper that a start can bring back; one whose gatekeeper is gone can only be stopped
- * or deleted. Nothing for a space that is being made or whose making failed.
+ * or deleted. Nothing for a space that is being made or whose making failed, and nothing for one
+ * whose machine is off, since every action would fail there; one whose machine left Settings
+ * offers the delete that forgets its record.
  */
 export const spaceMenuActionsOf = (entry: SpaceEntry | undefined): SpaceAction[] => {
   if (!entry || entry.state === 'preparing' || entry.state === 'failed') return [];
+  if (entry.state === 'unreachable') return entry.failure?.code === 'place_not_found' ? ['remove'] : [];
   if (entry.state === 'missing') return ['remove'];
   const gone = entry.damage === 'gatekeeper_gone';
   if (entry.state === 'exited') return gone ? ['remove'] : ['start', 'remove'];
-  return gone ? ['stop', 'remove'] : ['restart_opencode', 'restart', 'stop', 'remove'];
+  return gone ? ['stop', 'remove'] : ['restart_opencode', 'restart', 'setup', 'stop', 'remove'];
 };
 
-const call = (spaceId: string, action: SpaceAction): Promise<SpaceFailure | null> => {
+/**
+ * Whether the space's work can be applied from its menu: a running space, or a stopped one that a
+ * start brings back, which the apply dialog offers. A stopped space whose gatekeeper is gone never
+ * starts again, so its work cannot be reached. Nor can a space whose project folder is gone from
+ * the host: its work has nowhere to go.
+ */
+export const isSpaceApplicable = (entry: SpaceEntry | undefined): boolean => entry?.projectFolder.found !== false
+  && (entry?.state === 'running' || (entry?.state === 'exited' && entry.damage !== 'gatekeeper_gone'));
+
+/** An action of the menu that cannot run now: the setup commands again while they still run. */
+export const isSpaceActionUnavailable = (entry: SpaceEntry | undefined, action: SpaceAction): boolean => (
+  action === 'setup' && entry?.setup?.state === 'running'
+);
+
+type SpaceActionOptions = { deleteUnsavedChats?: boolean };
+
+/** A removal went through: its chats are on the Archive page, and the notice says so. */
+export const noteRemoval = (spaceId: string, chats: { saved: number } | null): void => {
+  if (!chats || chats.saved === 0) return;
+  const store = useSpacesStore.getState();
+  store.noteChatsArchived(store.journey?.get(spaceId)?.name ?? null);
+};
+
+const call = (spaceId: string, action: SpaceAction, options: SpaceActionOptions): Promise<SpaceFailure | null> => {
   switch (action) {
     case 'start': return startSpace(spaceId).then(() => null);
     case 'stop': return stopSpace(spaceId).then(() => null);
     case 'restart': return restartSpace(spaceId).then(() => null);
     case 'restart_opencode': return restartSpaceOpenCode(spaceId).then(() => null);
+    case 'setup': {
+      const entry = useSpacesStore.getState().journey?.get(spaceId);
+      if (!entry) return Promise.resolve({ code: 'space_not_found', message: '' });
+      return runSpaceSetupAgain(entry).then(() => null);
+    }
     // A removal can go through in part; what stayed is the failure the line shows.
-    case 'remove': return removeSpace(spaceId).then((outcome) => outcome.failures[0] ?? null);
+    case 'remove': return removeSpace(spaceId, options).then((outcome) => {
+      noteRemoval(spaceId, outcome.chats);
+      return outcome.failures[0] ?? null;
+    });
   }
 };
 
@@ -81,32 +136,85 @@ const call = (spaceId: string, action: SpaceAction): Promise<SpaceFailure | null
  * stopped. A start or a restart that went through answered once the server inside was ready, so
  * the space is reachable again. The failure stays on the status line until the next action.
  */
-export const runSpaceAction = async (spaceId: string, action: SpaceAction): Promise<void> => {
+export const runSpaceAction = async (spaceId: string, action: SpaceAction, options: SpaceActionOptions = {}): Promise<void> => {
   const store = useSpacesStore.getState();
   if (store.actions.get(spaceId)?.kind === 'running') return;
   const generation = spacesRuntimeGeneration();
   store.noteAction(spaceId, { kind: 'running', action });
   let failure: SpaceFailure | null;
+  let unsaved: SpaceUnsavedChats | null = null;
   try {
-    failure = await call(spaceId, action);
+    failure = await call(spaceId, action, options);
   } catch (error) {
     if (!(error instanceof Error)) throw error;
     failure = failureOfError(error);
+    if (error instanceof SpacesRequestError && error.code === 'chats_not_saved') {
+      unsaved = { tooLarge: error.details.tooLarge ?? [], failed: error.details.failed ?? 0 };
+    }
   }
   // An action a runtime switch overtook belongs to the runtime it ran on; nothing of it is kept.
   if (generation !== spacesRuntimeGeneration()) return;
   const after = useSpacesStore.getState();
-  after.noteAction(spaceId, failure ? { kind: 'failed', action, failure } : null);
-  if (!failure && action === 'remove') {
-    after.noteCreationAccess(spaceId, null);
-    if (after.accessDialog?.spaceId === spaceId) after.closeAccessDialog();
-    if (after.actionsSheet === spaceId) after.closeActionsSheet();
+  // The space stayed because its chats could not be saved: the confirmation asks again.
+  if (unsaved) {
+    after.noteAction(spaceId, null);
+    after.openDeleteDialog(spaceId, unsaved);
+    return;
   }
-  if (!failure && action !== 'stop' && action !== 'remove') after.noteReachable(spaceId);
-  // The action's outcome stands on its own: a list that cannot be read now is read at the next turn.
+  if (failure) {
+    after.noteAction(spaceId, { kind: 'failed', action, failure });
+    // The action's outcome stands on its own: a list that cannot be read now is read at the next turn.
+    await refreshSpacesJourney().catch(() => {});
+    return;
+  }
+  if (action === 'remove') {
+    await forgetRemovedSpace(spaceId);
+    return;
+  }
+  if (action !== 'stop' && action !== 'setup') after.noteReachable(spaceId);
+  // The line keeps saying what is under way until the lists say what the action did: the journey
+  // list, which a start just moved to "running", and for a start or a restart the session list
+  // too, whose mark the host sets stale when the space did not answer during its own restart,
+  // and sets again when the host reads the space for that list. Shown as they came, the lists
+  // of before showed "stopped" with its Start, or "not answering" with its restart, for a moment
+  // after an action that had gone through.
+  await Promise.all([
+    refreshSpacesJourney().catch(() => {}),
+    action === 'start' || action === 'restart' || action === 'restart_opencode' ? readSessionListAfterAction() : Promise.resolve(),
+  ]);
+  if (generation !== spacesRuntimeGeneration()) return;
+  useSpacesStore.getState().noteAction(spaceId, null);
+};
+
+/**
+ * The session list read after an action answered. A load already under way when the action
+ * answered may carry the marks of a read the host made during the restart, so it is let finish
+ * first and the list is read once more; the common case is one load.
+ */
+const readSessionListAfterAction = async (): Promise<void> => {
+  if (useGlobalSessionsStore.getState().status === 'loading') await refreshGlobalSessions().then(() => {}, () => {});
+  await refreshGlobalSessions().then(() => {}, () => {});
+};
+
+/**
+ * What this window drops once the host removed a space, by a delete or after an apply: its
+ * dialogs, then the host's lists read again. The group says "deleting" meanwhile: until the
+ * session list's mark goes, the host's own view of the space, a container that is gone, read as
+ * "not answering" with a restart to offer.
+ */
+export const forgetRemovedSpace = async (spaceId: string): Promise<void> => {
+  const store = useSpacesStore.getState();
+  const generation = spacesRuntimeGeneration();
+  store.noteAction(spaceId, { kind: 'running', action: 'remove' });
+  if (store.accessDialog?.spaceId === spaceId) store.closeAccessDialog();
+  if (store.actionsSheet === spaceId) store.closeActionsSheet();
+  if (store.applyDialog === spaceId) store.closeApplyDialog();
   await refreshSpacesJourney().catch(() => {});
+  // Its chats are on the Archive page now, under the space's name.
+  await refreshSpaceArchives().catch(() => {});
   // The sidebar's group of a space comes from the session list's mark as well, which the host
   // drops only in its next complete list; without asking for it now, a space the user just
   // deleted stayed in the sidebar for about forty seconds, measured.
-  if (!failure && action === 'remove') await refreshGlobalSessions().then(() => {}, () => {});
+  await refreshGlobalSessions().then(() => {}, () => {});
+  if (generation === spacesRuntimeGeneration()) useSpacesStore.getState().noteAction(spaceId, null);
 };

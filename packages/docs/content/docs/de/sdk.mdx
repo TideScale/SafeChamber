@@ -110,13 +110,13 @@ Ein Panel zeichnen und die aktuelle Session lesen braucht keine Berechtigung. Al
 | `files` | Dateien innerhalb des offenen Projekts lesen und schreiben (`readFile`, `writeFile`, `listDir`, `stat` mit einem relativen Pfad) |
 | `model` | einmalige Textgenerierung mit dem Small Model des Nutzers (`generate`), außerhalb jeder Session |
 
-Vier weitere kommen automatisch dazu: `network`, wenn du eine `integration` deklarierst, `service`, wenn du einen `service` deklarierst, `filesystem`, wenn du `filesystem`-Muster deklarierst, und `conversation`, wenn eine Session-Aktion die Nachrichten anfordert (siehe [Aktionen, Befehle und das Badge](#aktionen-befehle-und-das-badge)).
+Fünf weitere kommen automatisch dazu: `network`, wenn du eine `integration` deklarierst, `service`, wenn du einen `service` deklarierst, `filesystem`, wenn du `filesystem`-Muster deklarierst, `origins`, wenn du `origins` deklarierst, und `conversation`, wenn eine Session-Aktion die Nachrichten anfordert (siehe [Aktionen, Befehle und das Badge](#aktionen-befehle-und-das-badge)).
 
 Der Nutzer sieht die vollständige Liste einmal, bei der Installation der Erweiterung, und bestätigt sie oder entfernt die Erweiterung. Fordert eine neue Version mehr an, erscheint der Dialog erneut. Ein Aufruf, der eine nicht bestätigte Berechtigung braucht, schlägt mit `NOT_GRANTED` fehl.
 
 ## Text erzeugen
 
-Mit der Berechtigung `model` bittet `host.generate` das Small Model des Nutzers um eine einmalige Antwort: eine Zusammenfassung, einen Titel, einen Entwurf. Nichts landet in einer Session, es wird kein Verlauf gespeichert, und die Erweiterung wählt nie einen Anbieter. OpenChamber nutzt dasselbe Modell, das es für seine eigene Hintergrundarbeit verwendet, eingestellt unter Einstellungen → Sessions → Small Model, oder automatisch aus den angemeldeten Anbietern des Nutzers gewählt.
+Mit der Berechtigung `model` bittet `host.generate` das Small Model des Nutzers um eine einmalige Antwort: eine Zusammenfassung, einen Titel, einen Entwurf. Nichts landet in einer Session, es wird kein Verlauf gespeichert, und die Erweiterung wählt nie einen Anbieter. OpenChamber nutzt dasselbe Modell, das es für seine eigene Hintergrundarbeit verwendet, eingestellt unter Einstellungen → Sessions → Small Model, oder das Small Model des Anbieters, mit dem der Nutzer gerade arbeitet, oder das Standardmodell aus seiner OpenCode-Konfiguration.
 
 ```ts
 const { text } = await host.generate({
@@ -130,7 +130,19 @@ Ist kein Modell verfügbar, schlägt der Aufruf mit `NO_MODEL` fehl; ein Modell,
 
 ## Konten und Netzwerk
 
-Deine Seite läuft in einer Sandbox und kann nicht direkt ins Internet. Deklariere eine `integration`, und OpenChamber macht die Aufrufe über `host.request` für dich, mit dem Token des Nutzers. Der Token erreicht deine Seite nie.
+Deine Seite läuft in einer Sandbox und kommt nicht von selbst ins Netz: Skripte, Styles, Bilder, Schriften und Medien laden nur aus deinem Paket, und `fetch` erreicht nur die Dateien deines Pakets. Liefere Schriften und Bilder im Paket mit, statt sie von einem CDN zu laden.
+
+Um mit einem externen Dienst zu sprechen, deklariere eine `integration`, und OpenChamber macht die Aufrufe über `host.request` für dich, mit dem Token des Nutzers. Der Token erreicht deine Seite nie.
+
+Für alles andere, was deine Seite direkt braucht, etwa Schriften oder Bilder von einem CDN oder eine öffentliche API, listest du bis zu 8 https-Origins auf:
+
+```json
+"origins": ["https://fonts.example.com"]
+```
+
+Der Nutzer sieht sie im Bestätigungsdialog als Adressen, an die deine Erweiterung Daten senden und von denen sie Daten empfangen kann, und bestätigt sie erneut, wenn ein Update eine neue hinzufügt. Bestätigte Origins sind für `fetch`, Bilder, Schriften, Styles und Medien offen, aber nie für Skripte: Code muss in deinem Paket mitkommen. Der Origin der Seite ist `null`, daher muss der Server CORS für diesen Origin erlauben, damit du eine `fetch`-Antwort lesen kannst.
+
+Im [Enterprise-Modus](/security/) lässt sich eine Erweiterung mit `origins`, einer `integration` oder einem `service` nur aus einem Git-Repository installieren, das der Administrator freigegeben hat. Wenn deine Erweiterung ohne sie auskommt, bleibt sie für solche Teams installierbar. Um eine Erweiterung auf so einem Rechner zu entwickeln, bitte den Administrator um `allowLocalExtensions`; damit kannst du sie aus ihrem Ordner installieren.
 
 - `token`: Der Nutzer fügt auf der Karte unter Einstellungen → Integrationen einen API-Token ein. `apiOrigin` ist der einzige Origin, den `request` aufrufen darf. `account` ist optional: ein GET-Pfad und ein Feldname, damit die Karte anzeigen kann, wer verbunden ist. `scheme` sagt, wie der Token gesendet wird; siehe Tabelle unten. Prüfe in der API-Dokumentation des Anbieters, welchen Header sie erwartet.
 - `oauth`: Der Nutzer fügt eine Client-ID ein, und OpenChamber führt den Authorize-Flow durch. Braucht `authorizeUrl`, `tokenUrl` und `apiOrigin`.

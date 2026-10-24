@@ -5,7 +5,7 @@ description: Skonfiguruj Jev, mały model klasyfikacji, który podejmuje decyzje
 
 # Dostawcy klasyfikacji (Jev)
 
-Niektóre funkcje OpenChamber potrzebują szybkiej decyzji, zanim zaczną działać: czy to polecenie jest ryzykowne, jakiego rodzaju zadaniem jest ten prompt, czy użytkownik właśnie zabrał się do prawdziwej pracy? Na takie pytania odpowiada Jev, mały model decyzyjny od TypeSafe. Ta strona pokazuje, jak dać OpenChamber dostęp do Jev.
+Niektóre funkcje OpenChamber potrzebują szybkiej decyzji, zanim zaczną działać: czy to polecenie jest ryzykowne, jakiego rodzaju zadaniem jest ten prompt, czy ta praca wygląda na skończoną? Na takie pytania odpowiada Jev, mały model decyzyjny od TypeSafe. Ta strona pokazuje, jak dać OpenChamber dostęp do Jev.
 
 Jev nie pisze kodu i nie odpowiada na Twoim czacie. Zwraca tylko werdykt, a OpenChamber działa zgodnie z nim. Na odpowiedź OpenChamber czeka najwyżej cztery sekundy.
 
@@ -15,14 +15,14 @@ Jev nie pisze kodu i nie odpowiada na Twoim czacie. Zwraca tylko werdykt, a Open
 | --- | --- |
 | [Uprawnienia i siatka bezpieczeństwa](/pl/permissions/) | Czy agent powinien Cię zapytać, zanim wykona to działanie? |
 | [Automatyczny wybór modelu](/pl/auto-model-routing/) | Do której z Twoich kategorii należy ten prompt? |
-| [Sesje w toku](/pl/sessions-in-work/) | Czy właśnie poprosiłeś o prawdziwą pracę? Czy ta tura wygląda na jej koniec? |
+| [Sesje w toku](/pl/sessions-in-work/) | Czy ta tura wygląda na koniec pracy? |
 | [Podsumowanie i podpowiedź następnej wiadomości](/pl/sessions-in-work/) | Czy po tej turze warto wygenerować podsumowanie albo podpowiedź? |
 
-Bez dostawcy siatka bezpieczeństwa i Auto są ukryte, a sesje trafiają do toku tylko wtedy, gdy sam je tam przeniesiesz. Podsumowania i podpowiedzi dalej działają, tylko bez filtra.
+Bez dostawcy siatka bezpieczeństwa i Auto są ukryte, a sesje w toku nie dostają wskazówki „wygląda na skończoną”. Sesje i tak trafiają do toku, gdy wyślesz wiadomość. Podsumowania i podpowiedzi dalej działają, tylko bez filtra.
 
 ## Konfiguracja
 
-Jev jest wyłączony, dopóki go nie włączysz: nic z Twoich rozmów nie trafia do dostawcy klasyfikacji, dopóki go nie wybierzesz. Otwórz **Ustawienia → Dostawcy → Dostawcy klasyfikacji** i wybierz, dokąd trafiają zapytania do Jev. Oprócz **Wyłączone** jest pięć możliwości.
+Jev jest wyłączony, dopóki go nie włączysz: nic z Twoich rozmów nie trafia do dostawcy klasyfikacji, dopóki go nie wybierzesz. Otwórz **Ustawienia → Dostawcy → Dostawcy klasyfikacji** i wybierz, dokąd trafiają zapytania do Jev. Oprócz **Wyłączone** jest sześć możliwości.
 
 ### Promocja OpenCode Zen
 
@@ -62,28 +62,52 @@ Twój własny klucz i limit TypeSafe.
 
 Zapisany klucz od razu zostaje wybrany. Leży na serwerze OpenChamber w osobnym pliku i nigdy nie trafia do przeglądarki.
 
+### Własny endpoint
+
+Dowolna usługa obsługująca API System One od TypeSafe: samodzielnie hostowana bramka, firmowe proxy albo dostawca, którego tu nie ma.
+
+1. W sekcji **Własny endpoint** wpisz **URL endpointu** i **Model** (na przykład `jev-latest`).
+2. Dodaj **Klucz API**, jeśli usługa go wymaga. Jest wysyłany jako token `Bearer`.
+3. Kliknij **Zapisz**.
+
+Wklej pełny adres, pod którym odpowiada usługa, np. `https://api.typesafe.ai/v1/systemone` albo `https://proxy.company.internal/v1/decision` w przypadku firmowego proxy. OpenChamber wysyła zapytania dokładnie pod wklejony adres i niczego nie dopisuje do ścieżki. Działają tylko `http` i `https`, a klucz wpisuje się w osobne pole, nigdy w URL.
+
+Zapisanie od razu wybiera ten endpoint. Tak jak klucz TypeSafe, endpoint i jego klucz leżą na serwerze OpenChamber w osobnym pliku, a klucz nigdy nie trafia do przeglądarki.
+
+Serwer może też pobrać endpoint ze zmiennych środowiskowych, co przydaje się, gdy konfigurujesz OpenChamber dla zespołu:
+
+```bash
+OPENCHAMBER_JEV_URL=https://jev.example.com/v1/systemone
+OPENCHAMBER_JEV_MODEL=jev-latest        # opcjonalne, to wartość domyślna
+OPENCHAMBER_JEV_API_KEY=...             # opcjonalne
+```
+
+Na laptopach, którymi zarządzasz, wpisz zamiast tego ten sam endpoint pod kluczem `jev` w [pliku polityki](/pl/security/) maszyny. Ma on pierwszeństwo przed środowiskiem.
+
+Tak czy inaczej, ten endpoint zastępuje ten zapisany w Ustawieniach, a Ustawienia pokazują go bez możliwości edycji. W [trybie enterprise](/pl/security/) to jedyne dozwolone źródło Jev oprócz **Wyłączone** i jest wybrane domyślnie.
+
 Gdy dostawca zacznie działać, karta w **Ustawienia → Dostawcy** pokaże **Gotowe**.
 
 ## Kiedy Twój wybór przestaje działać
 
-Jeśli z wybranego dostawcy nie da się skorzystać (promocja się skończyła, klucz usunięto), OpenChamber przechodzi na pierwszy działający z Twoich własnych kluczy: klucz TypeSafe, potem OpenRouter, potem Vercel AI Gateway, potem klucz Zen. Nigdy nie przechodzi na promocję, a **Wyłączone** pozostaje wyłączone. Strona pokazuje, którego używa w tej chwili.
+Jeśli z wybranego dostawcy nie da się skorzystać (promocja się skończyła, klucz usunięto), OpenChamber przechodzi na pierwszy działający z Twoich własnych kluczy: klucz TypeSafe, potem Twój własny endpoint, potem OpenRouter, potem Vercel AI Gateway, potem klucz Zen. Nigdy nie przechodzi na promocję, a **Wyłączone** pozostaje wyłączone. Strona pokazuje, którego używa w tej chwili.
 
 Jeśli Jev odpowiada wolno albo zawodzi przy pojedynczym zapytaniu, nic się nie psuje. Każda funkcja ma na ten wypadek bezpieczną odpowiedź:
 
 - Siatka bezpieczeństwa zostawia działanie, żeby czekało na Twoją decyzję.
 - Auto wysyła prompt do Twojego modelu zapasowego.
-- Sesje w toku zostają bez zmian.
+- Wskazówka „wygląda na skończoną” nie pojawia się przy sesjach w toku.
 - Podsumowanie i podpowiedź powstają tak, jakby Jev nie istniał.
 
 ## Co widzi Jev
 
 Jev dostaje krótkie fragmenty Twojej rozmowy: Twoją ostatnią wiadomość i, jako kontekst, do trzech poprzednich tur, przyciętych do kilkuset pierwszych znaków. Dla siatki bezpieczeństwa dostaje też sprawdzane działanie w takiej postaci, w jakiej opisuje je OpenCode: polecenie, które agent chce uruchomić, albo plik i zmianę przy edycji. Nigdy nie dostaje całych plików ani obrazów.
 
-Zapytania idą z serwera OpenChamber prosto do OpenCode Zen, OpenRouter, Vercel AI Gateway albo TypeSafe, zależnie od Twojego wyboru.
+Zapytania idą z serwera OpenChamber prosto do OpenCode Zen, OpenRouter, Vercel AI Gateway, TypeSafe albo Twojego własnego endpointu, zależnie od Twojego wyboru.
 
 ## Gdzie to działa
 
-Jev działa na serwerze OpenChamber, więc jest dostępny w aplikacji desktopowej, w aplikacji webowej i na telefonie połączonym z którąkolwiek z nich. Rozszerzenie VS Code rozmawia z OpenCode bezpośrednio i nie ma Jev: nie ma tam siatki bezpieczeństwa ani Auto, a sesje trafiają do toku tylko ręcznie.
+Jev działa na serwerze OpenChamber, więc jest dostępny w aplikacji desktopowej, w aplikacji webowej i na telefonie połączonym z którąkolwiek z nich. Rozszerzenie VS Code rozmawia z OpenCode bezpośrednio i nie ma Jev: nie ma tam siatki bezpieczeństwa, Auto ani wskazówki „wygląda na skończoną”.
 
 ## Powiązane
 

@@ -2,7 +2,7 @@
 // host answers with the gatekeeper's own view: which provider has a key, which needs it again after
 // a restart, and what a blocked attempt in the gatekeeper's journal was refused for.
 
-import type { SpaceEntry, SpaceJournalRecord } from './spaces-api';
+import { providerGrantOf, type SpaceEntry, type SpaceJournalRecord } from './spaces-api';
 
 // The allowlist's rule for a name, the server's own (`space-records.js`): labels of letters,
 // digits and hyphens, with a real last label.
@@ -13,9 +13,9 @@ export const isDomainName = (value: string): boolean => DOMAIN_PATTERN.test(valu
 
 type ProviderAccess = 'granted' | 'needs_again' | 'none';
 
-/** Whether the space holds a key for a provider now, per the gatekeeper, or needs it again. */
+/** Whether the space holds a key or the host's login for a provider now, per the gatekeeper, or needs it again. */
 export const providerAccessOf = (entry: SpaceEntry, providerId: string): ProviderAccess => {
-  const grant = entry.grants.find((candidate) => candidate.kind === 'model' && candidate.provider === providerId);
+  const grant = providerGrantOf(entry.grants, providerId);
   if (!grant) return 'none';
   return entry.needsAccess.includes(grant.id) ? 'needs_again' : 'granted';
 };
@@ -33,7 +33,9 @@ type SpaceAccessNotice =
 export const spaceAccessNoticeOf = (entry: SpaceEntry | undefined): SpaceAccessNotice | null => {
   if (!entry || entry.state !== 'running') return null;
   if (entry.access === 'unknown') return { kind: 'unknown' };
-  const models = entry.grants.filter((grant) => grant.kind === 'model');
+  const models = entry.grants.filter((grant) => grant.kind === 'model' || grant.kind === 'login' || grant.kind === 'custom');
+  // Whatever the network: OpenCode's free models refuse a request from inside a space, measured
+  // on 2026-10-14 with the open internet ("free tier can only be used from within OpenCode").
   if (models.length === 0) return { kind: 'no_model' };
   const providers = models.filter((grant) => entry.needsAccess.includes(grant.id)).map((grant) => grant.provider);
   return providers.length > 0 ? { kind: 'needs_again', providers } : null;
@@ -77,4 +79,28 @@ export const blockedAttemptsOf = (records: readonly SpaceJournalRecord[]): Block
     }
   }
   return Array.from(byKey.values()).sort((a, b) => (a.last < b.last ? 1 : a.last > b.last ? -1 : 0));
+};
+
+// The gatekeeper stamps its journal with the clock of its container, the host stamps the setup run
+// with its own; this much apart still counts as the same moment.
+const CLOCK_SLACK_MS = 2_000;
+
+/**
+ * The domains a failed setup run could not reach: those the journal shows refused as not on the
+ * list between the run's start and its failure, each once, in the order first tried. The journal
+ * does not say which process asked, so an attempt of the agent's within the span is listed too.
+ * Nothing when the run's span is unknown, from a host before it was kept.
+ */
+export const setupBlockedDomainsOf = (records: readonly SpaceJournalRecord[], span: { startedAt: string | null; finishedAt: string | null }): string[] => {
+  if (span.startedAt === null || span.finishedAt === null) return [];
+  const from = Date.parse(span.startedAt) - CLOCK_SLACK_MS;
+  const to = Date.parse(span.finishedAt) + CLOCK_SLACK_MS;
+  const domains: string[] = [];
+  for (const record of [...records].sort((a, b) => Date.parse(a.at) - Date.parse(b.at))) {
+    const at = Date.parse(record.at);
+    if (!(at >= from && at <= to)) continue;
+    if (reasonOf(record.decision) !== 'not_on_list' || !isDomainName(record.host) || domains.includes(record.host)) continue;
+    domains.push(record.host);
+  }
+  return domains;
 };

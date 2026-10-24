@@ -18,7 +18,7 @@ the web server and survives UI disconnects.
   tokensUsed,              // tokensCommitted + current segment (snapshot - baseline)
   tokensBaseline,          // segment start snapshot (pre-goal turn; 0 after compaction)
   tokensCommitted,         // closed segments' total (one segment per compaction)
-  turnsUsed,               // auto-continuations sent (capped at MAX_AUTO_TURNS)
+  turnsUsed,               // auto-continuations sent (capped at the Settings turn limit)
   auditFailStreak,         // consecutive progress checks that could not run
   statusReason,            // why settled; 'resumed' is a kickoff signal from UI
   evaluationProviderID,    // provider of the latest check; '' when Jev answered
@@ -35,7 +35,10 @@ target button arms "the next prompt is the objective", and the run-as-goal
 flows (fork-from-answer dialog, plan implement dialog) arm the same way —
 the plan flow additionally supplies an objective OVERRIDE carrying the plan
 content, since "Implement this plan: X" alone gives the audit nothing to
-judge against. The armed send also attaches a synthetic system-reminder
+judge against. Queueing a message consumes the arm too: the goal travels on
+that queued item (`goal` in `../message-queue`) and starts when that item is
+delivered, by the server queue or by a send from the queue row, and a queued
+item without a goal never consumes the composer's arm. The armed send also attaches a synthetic system-reminder
 part telling the agent goal mode is active and that each turn should end
 with a factual done/verified/remaining statement for the independent audit.
 Freshness/stale-write protection is by `id`: every runtime write re-reads the
@@ -89,13 +92,25 @@ before touching the filesystem). Rationale: metadata rides every
    ~250ms for an explicit Resume so the nudge feels immediate — since setting
    a goal on an idle session emits no status transition.
 3. On fire (`tick`), gated by the `sessionGoalEnabled` setting:
-   - fetch session (skip sub-agent sessions), require an `active` goal;
+   - fetch session (skip sub-agent sessions), require an `active` goal.
+     A failed session read skips the audit and continuation. It retries after
+     15, 30, then 60 seconds. After another failure, it re-reads goal metadata
+     and settles a still-active goal as `blocked` with a reason and the usual
+     settlement notification. A successful session read resets the counter.
+     Updates for paused, cleared or settled goals and fresh or resumed active
+     goals cancel the old retry window, as do session status events and a user
+     abort with no tick in flight. A mid-goal edit leaves the counter, the
+     armed retry timer and an in-flight read alone, since that tick is the
+     goal's only pending work; an abort during an in-flight read lets the tick
+     reach its own abort check and pause the goal;
    - authoritative live-activity check after the quiet window: re-read
      `/api/session/active`, bail if the parent resumed; then list the
-     parent's subagent sessions through `GET /api/session?parentID=` (cursor
-     paged) and bail while any of them is active. A status or children fetch
-     failure is unknown, not empty, so it skips the audit and retries after
-     another quiet window;
+      parent's subagent sessions through `GET /api/session?parentID=` (cursor
+      paged) and bail while any of them is active. The loop rechecks after
+      another quiet window so a missed parent idle event cannot strand the
+      goal when the child finishes. A status or children fetch failure is
+      unknown, not empty, so it skips the audit and retries after another quiet
+      window;
      both reads live in `../opencode/session-activity.js`, shared with the
      notification runtime;
    - messages come from `/api/session/:id/message` as v2's flat records
@@ -128,7 +143,7 @@ before touching the filesystem). Rationale: metadata rides every
      tail skips the audit and goes straight to a continuation nudge;
     - terminal checks, cheapest first: assistant turn error → `blocked`;
       `tokensUsed >= tokenBudget` → `budgetLimited`;
-      `turnsUsed >= MAX_AUTO_TURNS` (20) → `blocked`;
+      `turnsUsed >= ` the turn limit (Settings → Goal, `sessionGoalMaxAutoTurns`, 1–200, default 20; read on every tick) → `blocked`;
     - error classification is independent of `finish`: `MessageAbortedError`
       keeps the pause/resume behavior; only a `finish: "length"` with no
       error, or `MessageOutputLengthError`, is an in-progress truncation that
@@ -157,10 +172,12 @@ before touching the filesystem). Rationale: metadata rides every
      small model answers the same questions as JSON booleans read as 1/0, so
      there is one format and one decision. The long turn is cut to its head
      and, mostly, its tail, where the report sits.
-     Who answers: Jev when `sessionGoalChecker` is `classifier` (the default)
-     and a classification provider can run it (`classifierEndpoint`, owned by
+     Who answers: Jev when `sessionGoalChecker` is `classifier` (an explicit
+     pick; the default is `small-model`, since a classification provider set
+     up for another feature is not consent to audit goals with Jev) and a
+     classification provider can run it (`classifierEndpoint`, owned by
      `../routing`); the small model otherwise, and also when Jev fails this
-     time (`restrictToPreferredProvider`, session's own provider/model
+     time (the session's own provider/model
      preferred). The check is the SOLE termination authority besides the hard
      stops above — the working agent has no channel to settle its own goal.
      `complete` and `blocked` settle on the first such answer: a blocked turn
@@ -216,8 +233,8 @@ sees only that final turn, so the report is its evidence.
   execution.
 - `hooks/useSessionGoal.ts` — live goal state.
 - `components/chat/SessionGoalButton.tsx` — composer target button
-  (arm / status color / cancel confirm); `SessionGoalRow.tsx` — goal strip
-  above the composer; `SessionGoalDialog.tsx` — manage dialog
+  (arm / status color / cancel confirm); `SessionGoalRow.tsx` — goal row
+  among the composer's top rows; `SessionGoalDialog.tsx` — manage dialog
   (edit/pause/resume/complete/clear).
 - Sidebar glyph next to the date in `SessionNodeItem`.
 - `components/sections/openchamber/SessionGoalCheckerField.tsx` — Settings →
@@ -259,6 +276,10 @@ ordering used by create and scheduled goals.
 
 ## Limitations
 
+- If goal metadata cannot be read or saved at retry exhaustion, settlement
+  cannot be persisted or notified. The tick logs the failure and stops until
+  another event or Resume arms it.
+
 - Web-server feature: VS Code (extension-only) renders goal state via
   `session.updated` but does not run the loop.
 - A goal on a session with no assistant reply yet starts after the first
@@ -266,3 +287,22 @@ ordering used by create and scheduled goals.
 - `tokensUsed` only counts completed assistant messages seen within the
   40-message fetch window per tick; extremely long busy stretches between
   idles undercount (acceptable: budget is a guardrail, not billing).
+
+## Decisions
+
+### Why failed session reads retry before blocking
+
+The activity checks already retry unknown reads after a quiet window. The
+initial session read follows that policy so a transient transport failure does
+not leave an active goal without a scheduled tick. The bounded backoff allows
+recovery without sending a continuation from unknown state. At exhaustion, the
+runtime attempts to block with a resumable reason because an unscheduled active
+goal gives the user no explanation for the stopped turns.
+
+Retry settlement passes a write-time predicate through `persistSessionGoal`.
+The server checks it inside the metadata store's existing per-session write
+queue, so a queued pause, clear, completion or replacement cannot be overwritten.
+The predicate also rejects a retry window invalidated by a goal change, session
+status event, user abort or runtime stop.
+A rejected write returns `false` and emits no settlement notification. Direct
+OpenCode writes outside this store still lack a cross-process compare-and-set.

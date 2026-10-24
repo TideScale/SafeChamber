@@ -132,6 +132,19 @@ describe('createSessionOwnershipIndex', () => {
     });
   });
 
+  test('does not file a session bound to the global project id under a sibling project', () => {
+    const ownership = createSessionOwnershipIndex(
+      [ownershipSession('leaked', { projectID: 'global', directory: '/parent/plain-b' })],
+      [{ id: 'repo-a', normalizedPath: '/parent/repo-a' }],
+      new Map(),
+      false,
+      [],
+      [{ id: 'global', worktree: '/parent/repo-a' }],
+    );
+
+    expect(ownership.bySessionId.has('leaked')).toBe(false);
+  });
+
   test('resolves a bare session projectID from authoritative global project metadata', () => {
     const ownership = createSessionOwnershipIndex(
       [ownershipSession('restored', { projectID: 'opencode-app', directory: '/deleted/worktrees/feature' })],
@@ -274,4 +287,19 @@ describe('createSessionOwnershipIndex', () => {
     // VS Code never has spaces.
     expect(createSessionOwnershipIndex(sessions, projects, new Map(), true, [], [], spaces).bySessionId.has('in-space')).toBe(false);
   });
+
+  test('lists only top-level sessions as archived', () => {
+    const archivedParent = ownershipSession('archived-parent');
+    const archivedChild: SessionOwnershipRecord = { ...ownershipSession('archived-child'), parentID: 'archived-parent' };
+    const ownership = createSessionOwnershipIndex(
+      [],
+      [{ id: 'workspace', normalizedPath: '/workspace' }],
+      new Map(),
+      false,
+      [archivedParent, archivedChild],
+    );
+
+    expect(ownership.archivedSessionsByProject.get('workspace')?.map((session) => session.id)).toEqual(['archived-parent']);
+  });
 });
+

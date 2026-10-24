@@ -1,7 +1,8 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 
 import { useGlobalSessionsStore } from '@/stores/useGlobalSessionsStore';
-import { runSpaceAction, spaceConditionOf, spaceMenuActionsOf } from './space-repair';
+import { isSpaceActionUnavailable, isSpaceApplicable, runSpaceAction, spaceConditionOf, spaceLineSaysState, spaceMenuActionsOf } from './space-repair';
+import { getSharedTrustConfirmationSnapshot, settleSharedTrustConfirmation } from '@/lib/sharedTrustConfirmation';
 import type { SpaceEntry } from './spaces-api';
 import { useSpacesStore, type SpaceMark } from './spaces-store';
 
@@ -12,19 +13,39 @@ const originalLoadSessions = useGlobalSessionsStore.getState().loadSessions;
 const entry = (change: Partial<SpaceEntry> = {}): SpaceEntry => ({
   id: ID,
   name: 'Fix login',
+  placeId: 'docker', machine: null,
   projectDirectory: '/home/me/app',
+  projectFolder: { path: '/home/me/app', found: true },
   directory: `/spaces/${ID}/app`,
   state: 'running',
+  stoppedIdle: false,
   step: null,
   failure: null,
   network: { mode: 'allowlist', domains: [] },
   grants: [],
   access: null,
   needsAccess: [],
+  accessFailures: [],
   damage: null,
+  setup: null,
   ...change,
 });
 const mark = (state: SpaceMark['state']): SpaceMark => ({ id: ID, name: 'Fix login', state, projectDirectory: '/home/me/app', directory: `/spaces/${ID}/app` });
+
+describe('whether a space\'s work can be applied', () => {
+  test('from a running space, or a stopped one a start brings back', () => {
+    expect(isSpaceApplicable(entry())).toBe(true);
+    expect(isSpaceApplicable(entry({ state: 'exited' }))).toBe(true);
+    expect(isSpaceApplicable(entry({ damage: 'gatekeeper_gone' }))).toBe(true);
+    expect(isSpaceApplicable(entry({ state: 'exited', damage: 'gatekeeper_gone' }))).toBe(false);
+    for (const state of ['preparing', 'failed', 'missing'] as const) expect(isSpaceApplicable(entry({ state }))).toBe(false);
+    expect(isSpaceApplicable(undefined)).toBe(false);
+    // The folder the space was made for is gone from the host: the work has nowhere to go.
+    expect(isSpaceApplicable(entry({ projectDirectory: null, projectFolder: { path: '/home/me/app', found: false } }))).toBe(false);
+    // Not looked at, or a host before 5e-3 that names none: the apply dialog decides.
+    expect(isSpaceApplicable(entry({ projectDirectory: null, projectFolder: { path: null, found: null } }))).toBe(true);
+  });
+});
 
 describe('the state of a space', () => {
   test('says nothing for a space that runs and answers, or one the creation line covers', () => {
@@ -36,12 +57,31 @@ describe('the state of a space', () => {
 
   test('names what the host lists, the lost gatekeeper before a stop, a stop before a repairable damage', () => {
     expect(spaceConditionOf(entry({ state: 'missing' }), undefined, undefined)).toEqual({ kind: 'container_gone' });
+    // The machine is off: nothing to do; the machine left Settings: a delete forgets the record.
+    expect(spaceConditionOf(entry({ state: 'unreachable', machine: 'box', failure: { code: 'place_unreachable', message: 'box did not answer' } }), undefined, undefined)).toEqual({ kind: 'unreachable', machine: 'box', gone: false });
+    expect(spaceConditionOf(entry({ state: 'unreachable', machine: null, failure: { code: 'place_not_found', message: '' } }), undefined, undefined)).toEqual({ kind: 'unreachable', machine: null, gone: true });
     expect(spaceConditionOf(entry({ state: 'exited', damage: 'gatekeeper_gone' }), undefined, undefined)).toEqual({ kind: 'gatekeeper_gone' });
     expect(spaceConditionOf(entry({ state: 'exited' }), undefined, undefined)).toEqual({ kind: 'stopped' });
+    expect(spaceConditionOf(entry({ state: 'exited', stoppedIdle: true }), mark('stale'), undefined)).toEqual({ kind: 'stopped_idle' });
+    expect(spaceMenuActionsOf(entry({ state: 'exited', stoppedIdle: true }))).toEqual(['start', 'remove']);
     expect(spaceConditionOf(entry({ damage: 'repairable' }), mark('stale'), undefined)).toEqual({ kind: 'damaged' });
     expect(spaceConditionOf(entry(), mark('stale'), undefined)).toEqual({ kind: 'not_answering' });
     expect(spaceConditionOf(entry(), mark('unknown'), undefined)).toEqual({ kind: 'not_answering' });
     expect(spaceConditionOf(entry(), mark('partial'), undefined)).toBeNull();
+  });
+
+  test('the group line speaks for every state but a running space whose list came back in part', () => {
+    // The stale mark beside the name shows only where this is false.
+    expect(spaceLineSaysState(entry({ state: 'exited', stoppedIdle: true }), mark('stale'), undefined)).toBe(true);
+    expect(spaceLineSaysState(entry({ state: 'unreachable', machine: 'box', failure: { code: 'place_unreachable', message: '' } }), mark('stale'), undefined)).toBe(true);
+    expect(spaceLineSaysState(entry({ state: 'preparing', step: 'creating' }), mark('unknown'), undefined)).toBe(true);
+    expect(spaceLineSaysState(entry({ state: 'failed' }), mark('unknown'), undefined)).toBe(true);
+    expect(spaceLineSaysState(entry(), mark('stale'), undefined)).toBe(true);
+    expect(spaceLineSaysState(entry(), mark('complete'), { kind: 'running', action: 'restart' })).toBe(true);
+    expect(spaceLineSaysState(entry(), mark('stale'), { kind: 'failed', action: 'restart', failure: { code: 'space_unreachable', message: 'no' } })).toBe(true);
+    expect(spaceLineSaysState(entry(), mark('partial'), undefined)).toBe(false);
+    expect(spaceLineSaysState(entry(), mark('complete'), undefined)).toBe(false);
+    expect(spaceLineSaysState(undefined, mark('stale'), undefined)).toBe(false);
   });
 
   test('an action under way or failed in this window comes first', () => {
@@ -61,14 +101,23 @@ describe('the state of a space', () => {
 
 describe('the actions of a space', () => {
   test('offers the restarts only for a running space whose gatekeeper can come back', () => {
-    expect(spaceMenuActionsOf(entry())).toEqual(['restart_opencode', 'restart', 'stop', 'remove']);
-    expect(spaceMenuActionsOf(entry({ damage: 'repairable' }))).toEqual(['restart_opencode', 'restart', 'stop', 'remove']);
+    expect(spaceMenuActionsOf(entry())).toEqual(['restart_opencode', 'restart', 'setup', 'stop', 'remove']);
+    expect(spaceMenuActionsOf(entry({ damage: 'repairable' }))).toEqual(['restart_opencode', 'restart', 'setup', 'stop', 'remove']);
     expect(spaceMenuActionsOf(entry({ damage: 'gatekeeper_gone' }))).toEqual(['stop', 'remove']);
     expect(spaceMenuActionsOf(entry({ state: 'exited' }))).toEqual(['start', 'remove']);
     expect(spaceMenuActionsOf(entry({ state: 'exited', damage: 'gatekeeper_gone' }))).toEqual(['remove']);
     expect(spaceMenuActionsOf(entry({ state: 'missing' }))).toEqual(['remove']);
+    expect(spaceMenuActionsOf(entry({ state: 'unreachable', failure: { code: 'place_unreachable', message: '' } }))).toEqual([]);
+    expect(spaceMenuActionsOf(entry({ state: 'unreachable', failure: { code: 'place_not_found', message: '' } }))).toEqual(['remove']);
     expect(spaceMenuActionsOf(entry({ state: 'preparing' }))).toEqual([]);
     expect(spaceMenuActionsOf(undefined)).toEqual([]);
+  });
+
+  test('offers the setup commands again only while they do not run', () => {
+    expect(isSpaceActionUnavailable(entry({ setup: { state: 'running', index: 0, total: 2, command: 'npm ci' } }), 'setup')).toBe(true);
+    expect(isSpaceActionUnavailable(entry({ setup: { state: 'running', index: 0, total: 2, command: 'npm ci' } }), 'restart')).toBe(false);
+    expect(isSpaceActionUnavailable(entry({ setup: { state: 'failed', index: 0, total: 2, command: 'npm ci', exitCode: 1, timedOut: false, startedAt: null, finishedAt: null } }), 'setup')).toBe(false);
+    expect(isSpaceActionUnavailable(entry(), 'setup')).toBe(false);
   });
 
   describe('running one', () => {
@@ -90,13 +139,23 @@ describe('the actions of a space', () => {
       useGlobalSessionsStore.setState({ loadSessions: originalLoadSessions });
     });
 
-    test('restarts, reads the list again, and marks the space reachable once the server inside is ready', async () => {
+    test('restarts, marks the space reachable once the server inside is ready, and stays "restarting" until both lists are read again', async () => {
       useSpacesStore.getState().applyMarks([mark('stale')]);
+      // The session list's own load, held: its mark is what the host sets stale during a restart.
+      let releaseList: () => void = () => undefined;
+      const listHeld = new Promise<void>((resolve) => { releaseList = resolve; });
+      useGlobalSessionsStore.setState({ loadSessions: () => listHeld.then(() => ({ activeSessions: [], archivedSessions: [] })) });
       host((path) => (path.endsWith('/restart') ? new Response(JSON.stringify(entry()), { status: 200 }) : listAnswer([entry()])));
       const run = runSpaceAction(ID, 'restart');
       expect(useSpacesStore.getState().actions.get(ID)).toEqual({ kind: 'running', action: 'restart' });
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      // The list read brings the project's own providers with it, for the composer's rule.
+      expect(requests).toEqual([`POST /api/openchamber/spaces/${ID}/restart`, 'GET /api/openchamber/spaces', 'GET /api/openchamber/spaces/custom-providers']);
+      // The restart went through and the journey list came back; the line still says "restarting".
+      expect(useSpacesStore.getState().journey?.get(ID)?.state).toBe('running');
+      expect(useSpacesStore.getState().actions.get(ID)).toEqual({ kind: 'running', action: 'restart' });
+      releaseList();
       await run;
-      expect(requests).toEqual([`POST /api/openchamber/spaces/${ID}/restart`, 'GET /api/openchamber/spaces']);
       expect(useSpacesStore.getState().actions.has(ID)).toBe(false);
       expect(useSpacesStore.getState().spaces.get(ID)?.state).toBe('complete');
     });
@@ -150,6 +209,80 @@ describe('the actions of a space', () => {
       expect(useSpacesStore.getState().actions.has(ID)).toBe(false);
       expect(useSpacesStore.getState().accessDialog).toBeNull();
       expect(reloads).toBe(1);
+    });
+
+    test('a delete whose chats could not be saved opens the confirmation again; "Delete anyway" says so, and saved chats are announced', async () => {
+      useGlobalSessionsStore.setState({ loadSessions: async () => ({ activeSessions: [], archivedSessions: [] }) });
+      useSpacesStore.getState().applyJourney([entry({ name: 'Fix login' })], 0);
+      const asked: string[] = [];
+      host((path) => {
+        if (!path.endsWith(ID)) return listAnswer([entry({ name: 'Fix login' })]);
+        return new Response(JSON.stringify({ code: 'chats_not_saved', message: 'not saved', details: { tooLarge: ['Big one'], failed: 0 } }), { status: 409 });
+      });
+      await runSpaceAction(ID, 'remove');
+      expect(useSpacesStore.getState().actions.has(ID)).toBe(false);
+      expect(useSpacesStore.getState().deleteDialog).toBe(ID);
+      expect(useSpacesStore.getState().deleteUnsaved).toEqual({ tooLarge: ['Big one'], failed: 0 });
+
+      globalThis.fetch = Object.assign(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = new URL(String(input), 'http://host');
+        asked.push(`${init?.method ?? 'GET'} ${url.pathname}${url.search}`);
+        return url.pathname.endsWith(ID)
+          ? new Response(JSON.stringify({ id: ID, removed: true, failures: [], chats: { saved: 1 } }), { status: 200 })
+          : listAnswer([]);
+      }, originalFetch);
+      useSpacesStore.getState().closeDeleteDialog();
+      await runSpaceAction(ID, 'remove', { deleteUnsavedChats: true });
+      expect(asked[0]).toBe(`DELETE /api/openchamber/spaces/${ID}?unsavedChats=delete`);
+      expect(useSpacesStore.getState().archivedNotice).toBe('Fix login');
+    });
+
+    // The project's setup as the host's project route answers it: personal commands only, so no trust prompt.
+    const projectSetup = (commands: string[]) => ({
+      trust: { hash: null, trusted: true }, setupWorktree: commands, setupWorktreeWait: false, projectActions: [], projectActionsPrimaryId: null, draftStarters: [],
+      shared: { status: 'missing', path: '.openchamber/project.json', setupWorktree: [], setupWorktreeWait: null, projectActions: [], draftStarters: [], plansDir: null },
+      personal: { setupWorktree: commands, setupWorktreeWait: null, setupWorktreeMode: 'append', projectActions: [], projectActionsPrimaryId: null, draftStarters: [], hiddenSharedActionIds: [], sharedTrust: null },
+    });
+
+    test('runs the setup commands again as the project has them now', async () => {
+      useSpacesStore.getState().applyJourney([entry()], 0);
+      const bodies: unknown[] = [];
+      host((path) => {
+        if (path.startsWith('/api/projects/')) return new Response(JSON.stringify(projectSetup(['npm ci'])), { status: 200 });
+        if (path.endsWith('/setup')) return new Response(JSON.stringify(entry({ setup: { state: 'running', index: 0, total: 1, command: 'npm ci' } })), { status: 200 });
+        return listAnswer([entry()]);
+      });
+      const originalFetchWithBodies = globalThis.fetch;
+      globalThis.fetch = Object.assign(async (input: RequestInfo | URL, init?: RequestInit) => {
+        if (String(input).endsWith('/setup')) bodies.push(JSON.parse(String(init?.body)));
+        return originalFetchWithBodies(input, init);
+      }, originalFetch);
+      await runSpaceAction(ID, 'setup');
+      expect(requests.filter((request) => request.startsWith('POST'))).toEqual([`POST /api/openchamber/spaces/${ID}/setup`]);
+      expect(bodies).toEqual([{ commands: ['npm ci'] }]);
+      expect(useSpacesStore.getState().actions.has(ID)).toBe(false);
+    });
+
+    test('says so when the project has no setup commands, and asks the space nothing', async () => {
+      useSpacesStore.getState().applyJourney([entry()], 0);
+      host((path) => (path.startsWith('/api/projects/') ? new Response(JSON.stringify(projectSetup([])), { status: 200 }) : listAnswer([entry()])));
+      await runSpaceAction(ID, 'setup');
+      expect(requests.some((request) => request.startsWith('POST'))).toBe(false);
+      expect(useSpacesStore.getState().actions.get(ID)).toMatchObject({ kind: 'failed', action: 'setup', failure: { code: 'space_setup_no_commands' } });
+    });
+
+    test('tells a skipped trust prompt apart from a project with no setup commands', async () => {
+      useSpacesStore.getState().applyJourney([entry()], 0);
+      // Shared commands the user has not trusted, no personal ones: the prompt opens, and "skip" leaves nothing.
+      const untrusted = { ...projectSetup([]), trust: { hash: 'sha256:x', trusted: false }, setupWorktree: ['npm ci'], shared: { ...projectSetup([]).shared, status: 'ok', setupWorktree: ['npm ci'] } };
+      host((path) => (path.startsWith('/api/projects/') ? new Response(JSON.stringify(untrusted), { status: 200 }) : listAnswer([entry()])));
+      const run = runSpaceAction(ID, 'setup');
+      for (let i = 0; i < 50 && !getSharedTrustConfirmationSnapshot(); i += 1) await new Promise((resolve) => { setTimeout(resolve, 5); });
+      expect(getSharedTrustConfirmationSnapshot()?.runsIn).toBe('space');
+      settleSharedTrustConfirmation('skip');
+      await run;
+      expect(requests.some((request) => request.startsWith('POST'))).toBe(false);
+      expect(useSpacesStore.getState().actions.get(ID)).toMatchObject({ kind: 'failed', action: 'setup', failure: { code: 'space_setup_shared_skipped' } });
     });
   });
 });

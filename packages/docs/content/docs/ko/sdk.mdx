@@ -110,13 +110,13 @@ OpenChamber가 매니페스트를 읽고, 확장이 요구하는 항목을 나�
 | `files` | 열린 프로젝트 안의 파일 읽고 쓰기(상대 경로를 쓰는 `readFile`, `writeFile`, `listDir`, `stat`) |
 | `model` | 세션 밖에서 사용자의 Small Model로 일회성 텍스트 생성(`generate`) |
 
-네 가지가 자동으로 추가됩니다. `integration`을 선언하면 `network`, `service`를 선언하면 `service`, `filesystem` 패턴을 선언하면 `filesystem`, 세션 작업이 메시지를 요청하면 `conversation`입니다([작업, 명령, 배지](#작업-명령-배지) 참고).
+다섯 가지가 자동으로 추가됩니다. `integration`을 선언하면 `network`, `service`를 선언하면 `service`, `filesystem` 패턴을 선언하면 `filesystem`, `origins`를 선언하면 `origins`, 세션 작업이 메시지를 요청하면 `conversation`입니다([작업, 명령, 배지](#작업-명령-배지) 참고).
 
 사용자는 확장을 설치할 때 전체 목록을 한 번 보고, 승인하거나 확장을 제거합니다. 새 버전이 더 많은 권한을 요구하면 대화상자가 다시 나타납니다. 사용자가 승인하지 않은 권한이 필요한 호출은 `NOT_GRANTED`로 실패합니다.
 
 ## 텍스트 생성
 
-`model` 권한이 있으면 `host.generate`는 사용자의 Small Model에 요약, 제목, 초안 같은 일회성 답변을 요청합니다. 세션에는 아무것도 들어가지 않고 기록도 남지 않으며, 확장이 프로바이더를 고르는 일도 없습니다. OpenChamber는 자신의 백그라운드 작업에 쓰는 것과 같은 모델을 사용합니다. 설정 → 세션 → Small Model 에서 고르거나, 사용자가 로그인한 프로바이더 중에서 자동으로 선택됩니다.
+`model` 권한이 있으면 `host.generate`는 사용자의 Small Model에 요약, 제목, 초안 같은 일회성 답변을 요청합니다. 세션에는 아무것도 들어가지 않고 기록도 남지 않으며, 확장이 프로바이더를 고르는 일도 없습니다. OpenChamber는 자신의 백그라운드 작업에 쓰는 것과 같은 모델을 사용합니다. 설정 → 세션 → Small Model 에서 고른 모델, 사용자가 작업 중인 프로바이더의 small model, 또는 사용자의 OpenCode 설정에 있는 기본 모델입니다.
 
 ```ts
 const { text } = await host.generate({
@@ -130,7 +130,19 @@ const { text } = await host.generate({
 
 ## 계정과 네트워크
 
-페이지는 샌드박스에서 실행되며 인터넷을 직접 호출할 수 없습니다. `integration`을 선언하면 OpenChamber가 `host.request`를 통해 사용자의 토큰을 붙여 대신 호출합니다. 토큰은 절대 페이지에 도달하지 않습니다.
+페이지는 샌드박스에서 실행되며 스스로 네트워크에 접근할 수 없습니다. 스크립트, 스타일, 이미지, 글꼴, 미디어는 패키지에서만 불러오고, `fetch`도 패키지 안의 파일에만 닿습니다. 글꼴과 이미지는 CDN에서 불러오지 말고 패키지에 포함하세요.
+
+외부 서비스와 통신하려면 `integration`을 선언하세요. OpenChamber가 `host.request`를 통해 사용자의 토큰을 붙여 대신 호출합니다. 토큰은 절대 페이지에 도달하지 않습니다.
+
+CDN의 글꼴이나 이미지, 공개 API처럼 페이지가 직접 필요로 하는 그 밖의 것에는 https origin을 최대 8개까지 나열하세요.
+
+```json
+"origins": ["https://fonts.example.com"]
+```
+
+사용자는 승인 대화상자에서 이를 확장이 데이터를 보내고 받을 수 있는 주소로 보게 되며, 업데이트로 origin이 추가되면 다시 승인합니다. 승인된 origin은 `fetch`, 이미지, 글꼴, 스타일, 미디어에는 열리지만 스크립트에는 절대 열리지 않습니다. 코드는 패키지에 포함되어야 합니다. 페이지의 origin은 `null`이므로 `fetch` 응답을 읽으려면 서버가 그 origin에 대해 CORS를 허용해야 합니다.
+
+[엔터프라이즈 모드](/security/)에서는 `origins`, `integration`, `service` 중 하나라도 있는 확장은 관리자가 목록에 넣은 Git 저장소에서만 설치됩니다. 이것들 없이도 동작하는 확장이라면 그런 팀에서도 설치할 수 있습니다. 그런 컴퓨터에서 확장을 개발하려면 관리자에게 `allowLocalExtensions`를 요청하세요. 그러면 확장을 폴더에서 바로 설치할 수 있습니다.
 
 - `token`: 사용자가 설정 → 통합 카드에 API 토큰을 붙여넣습니다. `apiOrigin`은 `request`가 호출할 수 있는 유일한 origin입니다. `account`는 선택 사항으로, GET 경로와 필드 이름을 지정하면 카드에 누가 연결되어 있는지 표시할 수 있습니다. `scheme`은 토큰을 보내는 방식을 지정합니다. 아래 표를 참고하세요. 어떤 헤더를 기대하는지는 프로바이더의 API 문서에서 확인하세요.
 - `oauth`: 사용자가 클라이언트 ID를 붙여넣고, OpenChamber가 인증 흐름을 실행합니다. `authorizeUrl`, `tokenUrl`, `apiOrigin`이 필요합니다.

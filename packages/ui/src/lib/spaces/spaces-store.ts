@@ -6,7 +6,9 @@ import React from 'react';
 import { create } from 'zustand';
 import { z } from 'zod';
 
-import { listSpaces, type SpaceEntry, type SpaceFailure, type SpaceGrant } from './spaces-api';
+import { listSpaces, readSpaceCustomProviders, type SpaceCustomProvider, type SpaceEntry, type SpaceFailure, type SpaceGrant } from './spaces-api';
+import { spaceIdOfDirectory } from './space-route';
+import { normalizePath } from '@/lib/pathNormalization';
 import type { SpaceProgress } from '@/sync/event-pipeline';
 
 /**
@@ -34,13 +36,14 @@ export const spaceMarkSchema = z.object({
   directory: z.string().nullable().default(null),
 });
 
-export type SpaceAccessFailure = { provider: string; code: string; message: string };
+/** The actions on a space the user can take from its group, from soft to hard; `setup` runs the project's setup commands again. */
+export type SpaceAction = 'start' | 'stop' | 'restart_opencode' | 'restart' | 'setup' | 'remove';
 
-/** The model access a creation in this window gives once the space is ready, while and after it does. */
-type SpaceCreationAccess = { kind: 'giving' } | { kind: 'failed'; failures: readonly SpaceAccessFailure[] };
-
-/** The actions on a space the user can take from its group, from soft to hard. */
-export type SpaceAction = 'start' | 'stop' | 'restart_opencode' | 'restart' | 'remove';
+/**
+ * Chats a delete could not save to the Archive page: the titles of those too large to save and
+ * how many others failed. The confirmation asks again, with "Delete anyway".
+ */
+export type SpaceUnsavedChats = { tooLarge: readonly string[]; failed: number };
 
 /** An action this window started on a space: under way, or failed with the server's reason. */
 export type SpaceActionState =
@@ -64,19 +67,17 @@ type SpacesState = {
   /** A creation this window started, shown at once, before the next read of the list. */
   addJourneyEntry: (entry: SpaceEntry) => void;
   /**
-   * The model access a creation in this window is giving or could not give, per space. Only this
-   * window knows it: the host keeps no grant it could not deliver.
-   */
-  creationAccess: ReadonlyMap<string, SpaceCreationAccess>;
-  noteCreationAccess: (spaceId: string, access: SpaceCreationAccess | null) => void;
-  /** A provider the grant dialog gave: it no longer counts among the creation's failures. */
-  noteProviderGranted: (spaceId: string, providerId: string) => void;
-  /**
    * A grant the host just accepted, entered into the space's entry at once and counted like a
    * step, so a read of the list that began before it cannot take it away; the next read that
    * begins after it is the host's word again.
    */
   noteGrantGiven: (spaceId: string, grant: SpaceGrant) => void;
+  /**
+   * The providers of the user's own per project directory, read from the host for the dialogs
+   * and for the composer's rule on a model the space has no access to; absent until read.
+   */
+  customProviders: ReadonlyMap<string, readonly SpaceCustomProvider[]>;
+  noteCustomProviders: (projectDirectory: string, providers: readonly SpaceCustomProvider[]) => void;
   /** The grant dialog, open on one space and, when opened for a missing key, on its provider. */
   accessDialog: { spaceId: string; providerId: string | null } | null;
   openAccessDialog: (spaceId: string, providerId?: string | null) => void;
@@ -84,10 +85,23 @@ type SpacesState = {
   /** The action under way or failed per space, in this window, for the group's status line and menu. */
   actions: ReadonlyMap<string, SpaceActionState>;
   noteAction: (spaceId: string, state: SpaceActionState | null) => void;
+  /** The apply dialog, open on one space. */
+  applyDialog: string | null;
+  openApplyDialog: (spaceId: string) => void;
+  closeApplyDialog: () => void;
   /** The confirmation before a space is deleted, open on one space. */
   deleteDialog: string | null;
-  openDeleteDialog: (spaceId: string) => void;
+  /** Set when the confirmation opened again because the space's chats could not be saved. */
+  deleteUnsaved: SpaceUnsavedChats | null;
+  openDeleteDialog: (spaceId: string, unsaved?: SpaceUnsavedChats | null) => void;
   closeDeleteDialog: () => void;
+  /** The name of a space whose chats just went to the Archive page, for the notice that says so. */
+  archivedNotice: string | null;
+  noteChatsArchived: (name: string | null) => void;
+  /** The window with the end of a failed setup command's output, open on one space. */
+  setupOutputDialog: string | null;
+  openSetupOutputDialog: (spaceId: string) => void;
+  closeSetupOutputDialog: () => void;
   /** The phone's sheet of a space's actions, where the desktop has the group's menu. */
   actionsSheet: string | null;
   openActionsSheet: (spaceId: string) => void;
@@ -141,22 +155,6 @@ export const useSpacesStore = create<SpacesState>((set, get) => ({
     journey.set(entry.id, entry);
     return { journey, progressRevision };
   }),
-  creationAccess: new Map(),
-  noteCreationAccess: (spaceId, access) => set((current) => {
-    const creationAccess = new Map(current.creationAccess);
-    if (access) creationAccess.set(spaceId, access);
-    else creationAccess.delete(spaceId);
-    return { creationAccess };
-  }),
-  noteProviderGranted: (spaceId, providerId) => set((current) => {
-    const access = current.creationAccess.get(spaceId);
-    if (access?.kind !== 'failed') return current;
-    const failures = access.failures.filter((failure) => failure.provider !== providerId);
-    const creationAccess = new Map(current.creationAccess);
-    if (failures.length > 0) creationAccess.set(spaceId, { kind: 'failed', failures });
-    else creationAccess.delete(spaceId);
-    return { creationAccess };
-  }),
   noteGrantGiven: (spaceId, grant) => set((current) => {
     const entry = current.journey?.get(spaceId);
     if (!entry) return current;
@@ -167,8 +165,16 @@ export const useSpacesStore = create<SpacesState>((set, get) => ({
       ...entry,
       grants: [...entry.grants.filter((known) => known.id !== grant.id), grant],
       needsAccess: entry.needsAccess.filter((id) => id !== grant.id),
+      // The host takes the provider's creation failure off its list with the grant; so does this copy.
+      accessFailures: grant.kind === 'domain' ? entry.accessFailures : entry.accessFailures.filter((failure) => failure.provider !== grant.provider),
     });
     return { journey, progressRevision };
+  }),
+  customProviders: new Map(),
+  noteCustomProviders: (projectDirectory, providers) => set((current) => {
+    const customProviders = new Map(current.customProviders);
+    customProviders.set(projectDirectory, providers);
+    return { customProviders };
   }),
   accessDialog: null,
   openAccessDialog: (spaceId, providerId = null) => set({ accessDialog: { spaceId, providerId } }),
@@ -180,9 +186,18 @@ export const useSpacesStore = create<SpacesState>((set, get) => ({
     else actions.delete(spaceId);
     return { actions };
   }),
+  applyDialog: null,
+  openApplyDialog: (spaceId) => set({ applyDialog: spaceId }),
+  closeApplyDialog: () => set({ applyDialog: null }),
   deleteDialog: null,
-  openDeleteDialog: (spaceId) => set({ deleteDialog: spaceId }),
-  closeDeleteDialog: () => set({ deleteDialog: null }),
+  deleteUnsaved: null,
+  openDeleteDialog: (spaceId, unsaved = null) => set({ deleteDialog: spaceId, deleteUnsaved: unsaved }),
+  closeDeleteDialog: () => set({ deleteDialog: null, deleteUnsaved: null }),
+  archivedNotice: null,
+  noteChatsArchived: (name) => set({ archivedNotice: name }),
+  setupOutputDialog: null,
+  openSetupOutputDialog: (spaceId) => set({ setupOutputDialog: spaceId }),
+  closeSetupOutputDialog: () => set({ setupOutputDialog: null }),
   actionsSheet: null,
   openActionsSheet: (spaceId) => set({ actionsSheet: spaceId }),
   closeActionsSheet: () => set({ actionsSheet: null }),
@@ -213,7 +228,7 @@ export const useSpacesStore = create<SpacesState>((set, get) => ({
   resetForRuntimeSwitch: () => {
     progressAt.clear();
     journeyGeneration += 1;
-    set({ spaces: EMPTY, journey: null, progressRevision: 0, creationAccess: new Map(), accessDialog: null, actions: new Map(), deleteDialog: null, actionsSheet: null });
+    set({ spaces: EMPTY, journey: null, progressRevision: 0, customProviders: new Map(), accessDialog: null, actions: new Map(), applyDialog: null, deleteDialog: null, deleteUnsaved: null, archivedNotice: null, setupOutputDialog: null, actionsSheet: null });
   },
   forgetForSwitchOff: () => get().resetForRuntimeSwitch(),
 }));
@@ -233,12 +248,88 @@ export const refreshSpacesJourney = async (): Promise<void> => {
   const entries = await listSpaces();
   if (generation !== journeyGeneration) return;
   useSpacesStore.getState().applyJourney(entries, revision);
+  // The composer judges a model of the user's own provider by this list, so it is read once per
+  // project the spaces belong to, before any dialog opens.
+  for (const directory of new Set(entries.flatMap((entry) => (entry.projectDirectory ? [entry.projectDirectory] : [])))) {
+    if (!useSpacesStore.getState().customProviders.has(directory)) void loadSpaceCustomProviders(directory);
+  }
+};
+
+const customProviderReads = new Map<string, Promise<void>>();
+
+/**
+ * Reads the providers of the user's own for a project from the host and keeps them in the
+ * store; one read per project at a time. A read that fails keeps what the store has, and a
+ * project never read stays absent, so the composer refuses nothing on a guess.
+ */
+export const loadSpaceCustomProviders = (projectDirectory: string): Promise<void> => {
+  const pending = customProviderReads.get(projectDirectory);
+  if (pending) return pending;
+  const generation = journeyGeneration;
+  const read = readSpaceCustomProviders(projectDirectory)
+    .then((providers) => { if (generation === journeyGeneration) useSpacesStore.getState().noteCustomProviders(projectDirectory, providers); })
+    .catch(() => undefined)
+    .finally(() => { customProviderReads.delete(projectDirectory); });
+  customProviderReads.set(projectDirectory, read);
+  return read;
 };
 
 /** Whether this runtime has any isolated space at all, reachable or not. */
 export const hasIsolatedSpaces = (): boolean => useSpacesStore.getState().spaces.size > 0;
 
 export const getSpaceMark = (spaceId: string): SpaceMark | null => useSpacesStore.getState().spaces.get(spaceId) ?? null;
+
+/**
+ * Whether the journey list says the space that owns a directory is stopped, or its container is
+ * gone: nothing inside can answer, so a poll of it is a refusal and a log line on the host for
+ * nothing. False for a host directory, for a space the list does not know, and for one being
+ * made, so an unknown state never silences a poll.
+ */
+const isStoppedEntry = (entry: SpaceEntry | undefined): boolean => entry?.state === 'exited' || entry?.state === 'missing' || entry?.state === 'unreachable';
+
+export const isSpaceStopped = (spaceId: string): boolean => isStoppedEntry(useSpacesStore.getState().journey?.get(spaceId));
+
+/**
+ * Whether a space's group offers no new session: its making failed, here or in a host that quit
+ * before the code arrived, its container is gone, or its machine cannot be reached. A new session
+ * there would open in an empty folder or fail, so the group offers none.
+ */
+const spaceTakesNoNewSession = (entry: SpaceEntry | undefined): boolean => entry?.state === 'failed' || entry?.state === 'missing' || entry?.state === 'unreachable';
+
+export const useSpaceTakesNoNewSession = (spaceId: string | null | undefined): boolean =>
+  useSpacesStore((state) => spaceId != null && spaceTakesNoNewSession(state.journey?.get(spaceId)));
+
+export const isSpaceDirectoryStopped = (directory: string | null | undefined): boolean => {
+  const spaceId = spaceIdOfDirectory(directory);
+  return spaceId !== null && isSpaceStopped(spaceId);
+};
+
+/** The spaces this window knows: those the session list marked and those the journey list holds. */
+export const knownSpaceIds = (state: Pick<SpacesState, 'spaces' | 'journey'>): ReadonlySet<string> => (
+  new Set([...state.spaces.keys(), ...(state.journey?.keys() ?? [])])
+);
+
+/**
+ * Whether a directory may seed from this browser's cache: a host directory always, a space's
+ * directory only while this window knows the space. The chats of a deleted space moved to the
+ * archive, so a cached list of its directory would show them where the space was and address
+ * them through a prefix the host answers with 404; and at start-up, before the first lists, a
+ * space's list is a few hundred milliseconds away rather than painted from the cache.
+ */
+export const isDirectoryOfKnownSpace = (directory: string | null | undefined): boolean => {
+  const spaceId = spaceIdOfDirectory(directory);
+  return spaceId === null || knownSpaceIds(useSpacesStore.getState()).has(spaceId);
+};
+
+/** The spaces `previous` knew that `next` knows no more: deleted here, or from another window. */
+export const spaceIdsGone = (previous: ReadonlySet<string>, next: ReadonlySet<string>): string[] => (
+  Array.from(previous).filter((spaceId) => !next.has(spaceId))
+);
+
+export const useSpaceDirectoryStopped = (directory: string | null | undefined): boolean => {
+  const spaceId = spaceIdOfDirectory(directory);
+  return useSpacesStore((state) => spaceId !== null && isStoppedEntry(state.journey?.get(spaceId)));
+};
 
 /**
  * The spaces the sidebar shows a group for: every space the session list marked, and the ones
@@ -254,8 +345,44 @@ const mergeSidebarSpaces = (marks: ReadonlyMap<string, SpaceMark>, journey: Read
   return merged;
 };
 
-export const useSidebarSpaces = (): SpaceMark[] => {
-  const marks = useSpacesStore((state) => state.spaces);
-  const journey = useSpacesStore((state) => state.journey);
+/** `enabled: false` reads nothing and returns no spaces, for a caller that needs them only some of the time. */
+export const useSidebarSpaces = (enabled = true): SpaceMark[] => {
+  const marks = useSpacesStore((state) => (enabled ? state.spaces : EMPTY));
+  const journey = useSpacesStore((state) => (enabled ? state.journey : null));
   return React.useMemo(() => mergeSidebarSpaces(marks, journey), [journey, marks]);
+};
+
+/** The spaces of one registered project, in the host's order, for its spaces page (journey step 9). */
+export const spacesOfProject = (journey: ReadonlyMap<string, SpaceEntry>, projectPath: string): SpaceEntry[] => {
+  const project = normalizePath(projectPath);
+  return Array.from(journey.values()).filter((entry) => project !== null && normalizePath(entry.projectDirectory) === project);
+};
+
+/**
+ * The spaces whose project is no longer registered on this host: removed from OpenChamber, or
+ * added again under another path. Nothing else lists them, so Settings does.
+ */
+export const spacesWithoutProject = (journey: ReadonlyMap<string, SpaceEntry>): SpaceEntry[] => (
+  Array.from(journey.values()).filter((entry) => entry.projectDirectory === null)
+);
+
+/**
+ * How a screen that lists spaces stands with the journey list: it asks for a fresh read when it
+ * opens, shows what the store already holds meanwhile, and a read that failed is kept apart from
+ * the list, so it never reads as "no spaces".
+ */
+type SpacesJourneyRead = { journey: ReadonlyMap<string, SpaceEntry> | null; error: Error | null };
+
+export const useSpacesJourneyRead = (): SpacesJourneyRead => {
+  const journey = useSpacesStore((state) => state.journey);
+  const [error, setError] = React.useState<Error | null>(null);
+  React.useEffect(() => {
+    let current = true;
+    refreshSpacesJourney().then(
+      () => { if (current) setError(null); },
+      (failure: Error) => { if (current) setError(failure); },
+    );
+    return () => { current = false; };
+  }, []);
+  return { journey, error };
 };

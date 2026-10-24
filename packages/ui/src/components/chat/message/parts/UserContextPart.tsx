@@ -3,8 +3,11 @@ import React from 'react';
 import { Icon } from '@/components/icon/Icon';
 import type { IconName } from '@/components/icon/icons';
 import { useI18n } from '@/lib/i18n';
+import { changeRequestCopy } from '@/lib/source-control/changeRequestCopy';
+import { useChangeRequestTerm } from '@/lib/source-control/providers/registry';
 import type { ContextPartPayload } from '@/lib/messages/contextParts';
 import { cn } from '@/lib/utils';
+import { withAttachmentChips } from './attachmentCitationChips';
 import { legacyChatQuoteAnchor } from '@/lib/chatQuoteAnchor';
 import { useChatQuoteHighlightApi } from '../../hooks/chatQuoteHighlightStore';
 
@@ -38,7 +41,9 @@ const ContextCard: React.FC<{
     onExpand?: () => void;
     /** Scroll to where the quote came from, with the button's label. */
     reveal?: { label: string; onReveal: () => void };
-}> = ({ icon, summary, title, body, text, mono, collapsed, onExpand, reveal }) => {
+    /** The message's file names: `[name]` in the user's comment renders as a file chip. */
+    attachmentFilenames: readonly string[];
+}> = ({ icon, summary, title, body, text, mono, collapsed, onExpand, reveal, attachmentFilenames }) => {
     const [expanded, setExpanded] = React.useState(false);
     const hasBody = body.trim().length > 0;
     const hasText = text.trim().length > 0;
@@ -49,19 +54,28 @@ const ContextCard: React.FC<{
         // that settles it"). Attachments without a comment (terminal output
         // and the like) collapse to the caption alone.
         const comment = text.trim();
+        const handleKeyDown = (event: React.KeyboardEvent): void => {
+            if (event.key !== 'Enter' && event.key !== ' ') return;
+            event.preventDefault();
+            onExpand?.();
+        };
         return (
             <div
-                className="my-1 flex min-w-0 max-w-full cursor-pointer items-center gap-1.5 border-l-2 border-[var(--interactive-border)] pl-3 text-xs text-muted-foreground"
+                className="my-1 flex min-w-0 max-w-full cursor-pointer items-center gap-1.5 border-s-2 border-[var(--interactive-border)] ps-3 text-xs text-muted-foreground"
+                role="button"
+                tabIndex={0}
                 onClick={onExpand}
+                onKeyDown={handleKeyDown}
                 title={title}
             >
                 <Icon name={icon} className="h-3.5 w-3.5 shrink-0" />
                 <span className="truncate">
                     {comment.length > 0 ? `${summary}: ` : summary}
                     {comment.length > 0 ? (
-                        <span className="text-sm text-[var(--surface-foreground)]">{comment}</span>
+                        <span className="text-sm text-[var(--surface-foreground)]">{withAttachmentChips(comment, attachmentFilenames, 'comment')}</span>
                     ) : null}
                 </span>
+                <Icon name="arrow-down-s" className="ms-auto h-3.5 w-3.5 shrink-0 text-muted-foreground/70" />
             </div>
         );
     }
@@ -69,7 +83,7 @@ const ContextCard: React.FC<{
     return (
         <div className="my-1.5 min-w-0 max-w-full">
             <div
-                className={cn('min-w-0 border-l-2 border-[var(--interactive-border)] pl-3', hasBody && 'cursor-pointer')}
+                className={cn('min-w-0 border-s-2 border-[var(--interactive-border)] ps-3', hasBody && 'cursor-pointer')}
                 onClick={hasBody ? () => setExpanded((value) => !value) : undefined}
                 title={title}
             >
@@ -105,7 +119,9 @@ const ContextCard: React.FC<{
                 ) : null}
             </div>
             {hasText ? (
-                <div className="mt-1.5 whitespace-pre-wrap break-words font-sans text-sm text-[var(--surface-foreground)]">{text}</div>
+                <div className="mt-1.5 whitespace-pre-wrap break-words font-sans text-sm text-[var(--surface-foreground)]">
+                    {withAttachmentChips(text, attachmentFilenames, 'comment')}
+                </div>
             ) : null}
         </div>
     );
@@ -121,10 +137,13 @@ const UserContextPart: React.FC<{
     /** Message-level collapse state, shared with the text parts. */
     collapsed?: boolean;
     onExpand?: () => void;
-}> = ({ payload, collapsed, onExpand }) => {
+    attachmentFilenames: readonly string[];
+}> = ({ payload, collapsed, onExpand, attachmentFilenames }) => {
     const { t } = useI18n();
     const quoteHighlights = useChatQuoteHighlightApi();
-    const shared = { collapsed, onExpand };
+    // A part without a provider was written before providers other than GitHub existed: a pull request.
+    const changeRequestTerm = useChangeRequestTerm(payload.kind === 'pr-comment' || payload.kind === 'pr-check' ? payload.provider : null);
+    const shared = { collapsed, onExpand, attachmentFilenames };
 
     switch (payload.kind) {
         case 'code-comment': {
@@ -167,7 +186,7 @@ const UserContextPart: React.FC<{
             return (
                 <ContextCard
                     icon="git-pull-request"
-                    summary={t('chat.message.context.prComment', { label: payload.label })}
+                    summary={t(changeRequestCopy('chat.message.context.prComment', changeRequestTerm), { label: payload.label })}
                     body={payload.body}
                     text={payload.text}
                     {...shared}
@@ -177,7 +196,7 @@ const UserContextPart: React.FC<{
             return (
                 <ContextCard
                     icon="close-circle"
-                    summary={t('chat.message.context.prCheck', { label: payload.label })}
+                    summary={t(changeRequestCopy('chat.message.context.prCheck', changeRequestTerm), { label: payload.label })}
                     body={payload.output}
                     text={payload.text}
                     mono
@@ -211,9 +230,9 @@ const UserContextPart: React.FC<{
                 />
             );
         }
-        case 'github-issue':
-        case 'github-pr':
-        case 'linear-issue':
+        case 'repository-issue':
+        case 'change-request':
+        case 'tracker-item':
         case 'guest-issue':
         case 'guest-pr':
             // Rendered as link attachments by normalizeUserDisplayParts.

@@ -51,6 +51,21 @@ afterEach(async () => {
 });
 
 describe('ElectronSshManager', () => {
+  test('bounds local diagnostic snapshots without reading any remote host', () => {
+    const manager = new ElectronSshManager({
+      settingsFilePath: path.join(os.tmpdir(), 'unused-settings.json'),
+      appVersion: '0.0.0-test', emit: () => undefined,
+    });
+    for (let index = 0; index < 22; index++) {
+      manager.appendLog(`connection-${index}`, 'Starting SSH connection');
+    }
+    manager.setStatus('connection-21', 'ready', 'private host name');
+    const snapshots = manager.diagnosticLogSnapshots();
+    expect(snapshots.omittedSources).toBe(2);
+    expect(snapshots.entries).toHaveLength(20);
+    expect(snapshots.entries.at(-1).phase).toBe('ready');
+    expect(snapshots.entries.at(-1)).not.toHaveProperty('detail');
+  });
   for (const scenario of ['explicit XDG with spaces', 'unset XDG', 'missing XDG with home fallback']) {
     test.skipIf(process.platform === 'win32')(`executes remote discovery, install and launch with ${scenario}`, async () => {
       const home = fs.mkdtempSync(path.join(os.tmpdir(), 'openchamber ssh paths-'));
@@ -191,7 +206,8 @@ printf '4321\\n'`);
     expect(calls[1].args).toContain('-D');
   });
 
-  test('keeps ControlMaster-backed forwarding on non-Windows platforms', async () => {
+  // The fake exits like `ssh -O forward` does: stderr first, then close.
+  const createControlMasterManager = ({ code, stderr = '' }) => {
     const calls = [];
     const manager = new ElectronSshManager({
       settingsFilePath: path.join(os.tmpdir(), 'unused-settings.json'),
@@ -200,17 +216,82 @@ printf '4321\\n'`);
       platform: 'darwin',
       spawn: (command, args, options) => {
         calls.push({ command, args, options });
-        return createChild();
+        const child = createChild();
+        setImmediate(() => {
+          if (stderr) child.stderr.write(stderr);
+          child.exitCode = code;
+          child.emit('close', code);
+        });
+        return child;
       },
+    });
+    return { calls, manager };
+  };
+
+  test('hands the main forward to the ControlMaster instead of keeping an SSH client running', async () => {
+    const { calls, manager } = createControlMasterManager({ code: 0 });
+    const parsed = { destination: 'user@example.test', args: [] };
+
+    const child = await manager.spawnMainForward(parsed, '/tmp/control.sock', '127.0.0.1', 3000, 4000);
+
+    expect(child).toBeNull();
+    expect(calls).toHaveLength(1);
+    const { args, options } = calls[0];
+    expect(args).toContain('ControlPath=/tmp/control.sock');
+    expect(args).not.toContain('ControlPath=none');
+    // `-N -L` through a mux opens a remote login shell and exits with its
+    // status, which is how an exit 1 was mistaken for a dead tunnel (#4132).
+    expect(args).not.toContain('-N');
+    expect(args.slice(args.indexOf('-O'), args.indexOf('-O') + 4)).toEqual(['-O', 'forward', '-L', '127.0.0.1:3000:127.0.0.1:4000']);
+    expect(options.windowsHide).toBeUndefined();
+  });
+
+  test('fails the connection with the master\'s reason when it cannot take the main forward', async () => {
+    const { manager } = createControlMasterManager({
+      code: 255,
+      stderr: 'mux_client_forward: forwarding request failed: Port forwarding failed\nmuxclient: master forward request failed\n',
     });
     const parsed = { destination: 'user@example.test', args: [] };
 
-    await manager.spawnMainForward(parsed, '/tmp/control.sock', '127.0.0.1', 3000, 4000);
+    await expect(manager.spawnMainForward(parsed, '/tmp/control.sock', '127.0.0.1', 3000, 4000))
+      .rejects.toThrow('muxclient: master forward request failed');
+  });
 
-    expect(calls).toHaveLength(1);
-    expect(calls[0].args).toContain('ControlPath=/tmp/control.sock');
-    expect(calls[0].args).not.toContain('ControlPath=none');
-    expect(calls[0].options.windowsHide).toBeUndefined();
+  test('keeps a master-held forward while its port answers and drops it once the master is gone', async () => {
+    // Every ssh call here is `-O check`, answered as a dead master.
+    const { manager } = createControlMasterManager({ code: 255 });
+    const statuses = [];
+    manager.emit = (_event, status) => statuses.push(status);
+    manager.connect = async () => undefined;
+    const liveServer = http.createServer();
+    const livePort = Number(new URL(await listen(liveServer)).port);
+    const deadServer = http.createServer();
+    const deadPort = Number(new URL(await listen(deadServer)).port);
+    await new Promise((resolve) => deadServer.close(resolve));
+    servers.splice(servers.indexOf(deadServer), 1);
+    for (const [id, localPort] of [['ssh-live', livePort], ['ssh-dead', deadPort]]) {
+      manager.sessions.set(id, {
+        instance: { id, remoteOpenchamber: { mode: 'external' } },
+        parsed: { destination: 'user@example.test', args: [] },
+        controlPath: '/unused.sock',
+        askpassCleanupPaths: [],
+        localPort,
+        master: null,
+        mainForward: null,
+        extraForwards: [],
+      });
+      manager.spawnMonitor(id);
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, 2600));
+    for (const id of ['ssh-live', 'ssh-dead']) {
+      clearTimeout(manager.monitorTimers.get(id));
+    }
+
+    expect(manager.sessions.has('ssh-live')).toBe(true);
+    expect(statuses.filter((status) => status.id === 'ssh-live')).toEqual([]);
+    expect(statuses.find((status) => status.id === 'ssh-dead' && status.phase === 'degraded')?.detail)
+      .toBe('SSH ControlMaster is not reachable. Reconnecting');
   });
 
   test('stops in-flight commands and forwards when disconnecting Windows SSH', async () => {
@@ -307,6 +388,23 @@ printf '4321\\n'`);
       expect(error.message).not.toContain('\u0007');
       expect(error.message.length).toBeLessThanOrEqual(2000);
     }
+  });
+
+  test('identifies only a ready SSH forward as a remote API', () => {
+    const manager = new ElectronSshManager({
+      settingsFilePath: path.join(os.tmpdir(), 'unused-settings.json'),
+      appVersion: '0.0.0-test',
+      emit: () => undefined,
+    });
+    const forwarded = 'http://127.0.0.1:54000';
+    manager.setStatus('ssh-1', 'ready', null, forwarded, 54000);
+
+    expect(manager.isForwardedApiUrl(forwarded, 'ssh-1')).toBe(true);
+    expect(manager.isForwardedApiUrl(forwarded)).toBe(true);
+    expect(manager.isForwardedApiUrl(forwarded, 'other-host')).toBe(false);
+    expect(manager.isForwardedApiUrl('http://127.0.0.1:3901')).toBe(false);
+    manager.setStatus('ssh-1', 'degraded');
+    expect(manager.isForwardedApiUrl(forwarded)).toBe(false);
   });
 
   test('stores a client token for forwarded OpenChamber hosts when UI password is configured', async () => {

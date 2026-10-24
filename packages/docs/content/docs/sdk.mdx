@@ -109,14 +109,15 @@ Drawing a panel and reading the current session need no permission. Anything tha
 | `sessions` | list projects, worktrees, and session states; create and open sessions across registered projects |
 | `files` | read and write files inside the open project (`readFile`, `writeFile`, `listDir`, `stat` with a relative path) |
 | `model` | one-off text generation with the user's Small Model (`generate`), outside any session |
+| `shells` | watch the shell commands your agents run in the background, read their output, and stop them (`onRunningShells`, `readShellOutput`, `stopShell`) |
 
-Four more are added for you: `network` when you declare an `integration`, `service` when you declare a `service`, `filesystem` when you declare `filesystem` patterns, and `conversation` when a session action asks for the messages (see [Actions, commands, and the badge](#actions-commands-and-the-badge)).
+Five more are added for you: `network` when you declare an `integration`, `service` when you declare a `service`, `filesystem` when you declare `filesystem` patterns, `origins` when you declare `origins`, and `conversation` when a session action asks for the messages (see [Actions, commands, and the badge](#actions-commands-and-the-badge)).
 
 The user sees the full list once, when they install the extension, and approves it or removes the extension. If a new version asks for more, the dialog appears again. A call that needs a capability the user has not approved fails with `NOT_GRANTED`.
 
 ## Generate text
 
-With the `model` capability, `host.generate` asks the user's Small Model for a one-off answer: a summary, a title, a draft. Nothing enters a session, no history is kept, and the extension never picks a provider. OpenChamber uses the same model it uses for its own background work, chosen in Settings → Sessions → Small Model, or picked automatically from the user's signed-in providers.
+With the `model` capability, `host.generate` asks the user's Small Model for a one-off answer: a summary, a title, a draft. Nothing enters a session, no history is kept, and the extension never picks a provider. OpenChamber uses the same model it uses for its own background work, chosen in Settings → Sessions → Small Model, or the small model of the provider the user is working with, or the default model from their OpenCode config.
 
 ```ts
 const { text } = await host.generate({
@@ -126,11 +127,24 @@ const { text } = await host.generate({
 });
 ```
 
-When no model is available the call fails with `NO_MODEL`; a model that errored is `MODEL_FAILED`. Prompts are limited to 64,000 characters, and the call waits up to 90 seconds. The user sees this permission as "Use your Small Model" and it costs them tokens, so keep prompts short and call it on a click, not on every keystroke.
+When no model is available the call fails with `NO_MODEL`; a model that errored is `MODEL_FAILED`. Prompts are limited to 64,000 characters, and the call waits up to 960 seconds. The user sees this permission as "Use your Small Model" and it costs them tokens, so keep prompts short and call it on a click, not on every keystroke.
 
 ## Accounts and network
 
-Your page runs in a sandbox and cannot call the internet directly. Declare an `integration` and OpenChamber makes the calls for you through `host.request`, with the user's token attached. The token never reaches your page.
+Your page runs in a sandbox and cannot reach the network on its own: scripts, styles, images, fonts and media load only from your package, and `fetch` reaches only your package's files. Ship fonts and images inside the package rather than loading them from a CDN.
+
+To talk to an outside service, declare an `integration` and OpenChamber makes the calls for you through `host.request`, with the user's token attached. The token never reaches your page.
+
+For anything else your page needs directly, such as fonts or images from a CDN or a public API, list up to 8 https origins:
+
+```json
+"origins": ["https://fonts.example.com"]
+```
+
+The user sees them on the approval dialog as addresses your extension can send data to and receive data from, and approves them again if an update adds one. Approved origins are open to `fetch`, images, fonts, styles and media, but never to scripts: code has to ship in your package. The page's origin is `null`, so to read a `fetch` response the server must allow CORS for that origin.
+
+In [enterprise mode](/security/#enterprise-mode), an extension with `origins`, an `integration` or a `service` installs only from a Git repository the administrator listed. If your extension can work without them, it stays installable for those teams. To build one on such a machine, ask the administrator for `allowLocalExtensions`, which lets you install it from its folder.
+
 
 - `token`: the user pastes an API token on the Settings → Integrations card. `apiOrigin` is the only origin `request` may call. `account` is optional: a GET path and a field name, so the card can show who is connected. `scheme` says how the token is sent; see the table below. Check the provider's API docs for which header it expects.
 - `oauth`: the user pastes a client id, and OpenChamber runs the authorize flow. Needs `authorizeUrl`, `tokenUrl`, and `apiOrigin`.

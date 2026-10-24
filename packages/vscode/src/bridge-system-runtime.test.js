@@ -9,6 +9,8 @@ const updateWorkspaceFolders = mock(async (start, deleteCount, ...foldersToAdd) 
 });
 let currentWorkspaceFolders = [];
 
+const activateQuotaGiftReset = mock(async () => undefined);
+
 class Position {
   constructor(line, character) {
     this.line = line;
@@ -39,6 +41,7 @@ mock.module('vscode', () => ({
 }));
 
 mock.module('./opencodeConfig', () => ({
+  readConfig: mock(() => ({})),
   removeProviderConfig: mock(),
   getProviderSources: mock(),
   getStoredProviderConfig: mock(),
@@ -49,6 +52,7 @@ mock.module('./opencodeAuth', () => ({
   removeProviderAuth: mock(),
 }));
 mock.module('./quotaProviders', () => ({
+  activateQuotaGiftReset,
   fetchQuotaForProvider: mock(),
   listConfiguredQuotaProviders: mock(),
 }));
@@ -58,7 +62,7 @@ mock.module('./quotaCredentials', () => ({
   deleteCredential: mock(),
   importCursorCredential: mock(),
   normalizeCredential: mock(),
-  readCredential: mock(),
+  readCredential: mock(() => null),
   validateCredential: mock(),
   writeCredential: mock(),
 }));
@@ -221,6 +225,65 @@ describe('VS Code system bridge api:workspace:addFolder', () => {
   });
 });
 
+describe('VS Code system bridge api:quota:giftReset:use', () => {
+  beforeEach(() => {
+    activateQuotaGiftReset.mockClear();
+    activateQuotaGiftReset.mockResolvedValue(undefined);
+  });
+
+  test('activates a gift reset through the quota provider', async () => {
+    const response = await handleSystemBridgeMessage({
+      id: 'gift-use',
+      type: 'api:quota:giftReset:use',
+      payload: { providerId: 'zai-coding-plan', recordId: 462029, resetType: 'FIVE_HOUR' },
+    }, undefined, deps);
+
+    expect(response).toEqual({
+      id: 'gift-use',
+      type: 'api:quota:giftReset:use',
+      success: true,
+      data: { success: true },
+    });
+    expect(activateQuotaGiftReset).toHaveBeenCalledWith('zai-coding-plan', {
+      recordId: 462029,
+      resetType: 'FIVE_HOUR',
+    });
+  });
+
+  test('rejects a payload without a recordId', async () => {
+    const response = await handleSystemBridgeMessage({
+      id: 'gift-missing',
+      type: 'api:quota:giftReset:use',
+      payload: { providerId: 'zai-coding-plan', resetType: 'FIVE_HOUR' },
+    }, undefined, deps);
+
+    expect(response).toEqual({
+      id: 'gift-missing',
+      type: 'api:quota:giftReset:use',
+      success: false,
+      error: 'Invalid gift reset request',
+    });
+    expect(activateQuotaGiftReset).not.toHaveBeenCalled();
+  });
+
+  test('returns the provider failure as a bridge error', async () => {
+    activateQuotaGiftReset.mockRejectedValue(new Error('API error: 429'));
+
+    const response = await handleSystemBridgeMessage({
+      id: 'gift-failed',
+      type: 'api:quota:giftReset:use',
+      payload: { providerId: 'zai-coding-plan', recordId: 1, resetType: 'WEEK' },
+    }, undefined, deps);
+
+    expect(response).toEqual({
+      id: 'gift-failed',
+      type: 'api:quota:giftReset:use',
+      success: false,
+      error: 'API error: 429',
+    });
+  });
+});
+
 describe('VS Code v2 migration bridge', () => {
   test('waits for the manager to finish installing and restarting', async () => {
     let completed = false;
@@ -235,5 +298,31 @@ describe('VS Code v2 migration bridge', () => {
     expect(response.success).toBe(false);
     const manager = { installV2: async () => { throw new Error('Installation failed'); } };
     await expect(handleSystemBridgeMessage({ id: 'failed', type: 'api:opencode/install-v2' }, { manager }, deps)).rejects.toThrow('Installation failed');
+  });
+});
+
+describe('VS Code system bridge api:sessions/metadata:set', () => {
+  const manager = { getApiUrl: () => 'http://127.0.0.1:9', getOpenCodeAuthHeaders: () => ({}) };
+  const failingWith = (error) => ({ ...deps, sessionState: { setMetadata: async () => { throw error; } } });
+  const message = { id: 'meta', type: 'api:sessions/metadata:set', payload: { sessionId: 'ses_a', patch: { openchamber: { work: { state: 'done' } } } } };
+
+  test('codes a write OpenCode refused because the session folder is gone', async () => {
+    const locationNotFound = Object.assign(new Error('Location not found: /repo/wt-gone'), { name: 'LocationNotFoundError' });
+
+    const response = await handleSystemBridgeMessage(message, { manager }, failingWith(locationNotFound));
+
+    expect(response).toEqual({
+      id: 'meta',
+      type: 'api:sessions/metadata:set',
+      success: false,
+      error: 'Location not found: /repo/wt-gone',
+      code: 'SESSION_DIRECTORY_MISSING',
+    });
+  });
+
+  test('leaves any other failed write uncoded', async () => {
+    const response = await handleSystemBridgeMessage(message, { manager }, failingWith(new Error('OpenCode is down')));
+
+    expect(response).toEqual({ id: 'meta', type: 'api:sessions/metadata:set', success: false, error: 'OpenCode is down' });
   });
 });

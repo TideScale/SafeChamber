@@ -12,6 +12,7 @@
 import { z, type ZodType } from 'zod';
 
 import type { ProjectEntry } from '@/lib/api/types';
+import { isCustomProviderIcon, type CustomProviderIcon } from '@/lib/customProviderIcons';
 import { createProjectIdFromPath } from '@/lib/projectId';
 import { normalizePath } from '@/lib/pathNormalization';
 
@@ -126,6 +127,16 @@ const stringListRecord = looseObject.transform((record) => {
 export const parseStringRecordOfStringLists = fromSchema(
   stringListRecord.pipe(z.record(z.string(), z.array(z.string())).refine((record) => Object.keys(record).length > 0)),
 );
+
+export const parseCustomProviderIcons: SettingsParser<Record<string, CustomProviderIcon>> = (value) => {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const result: Record<string, CustomProviderIcon> = {};
+  for (const [providerID, icon] of Object.entries(value)) {
+    const normalizedProviderID = providerID.trim();
+    if (normalizedProviderID && isCustomProviderIcon(icon)) result[normalizedProviderID] = icon;
+  }
+  return result;
+};
 
 const modelRefSchema = z.object({
   providerID: nonEmptyTrimmed,
@@ -383,6 +394,19 @@ export const parseFollowUpBehavior: SettingsParser<'steer' | 'queue'> = (value, 
   const legacy = z.boolean().safeParse(raw.queueModeEnabled);
   if (!legacy.success) return undefined;
   return legacy.data ? 'queue' : 'steer';
+};
+
+const activityRenderModeSchema = trimmed.pipe(z.enum(['collapsed', 'summary']));
+
+/**
+ * The removed Sorted chat mode (`chatRenderMode: 'sorted'`) showed only the
+ * answers with the work folded away; Collapsed is its closest match, so it
+ * wins over a stored mode until the user picks one (which retires the key).
+ */
+export const parseActivityRenderMode: SettingsParser<'collapsed' | 'summary'> = (value, raw) => {
+  if (raw.chatRenderMode === 'sorted') return 'collapsed';
+  const direct = activityRenderModeSchema.safeParse(value);
+  return direct.success ? direct.data : undefined;
 };
 
 /** Legacy provider names: 'server' was the OpenAI-compatible endpoint; 'browser'/'wasm' the local one. */

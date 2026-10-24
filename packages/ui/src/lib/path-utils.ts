@@ -12,8 +12,13 @@ export const normalizeFilePath = (value: string | null | undefined): string => {
   }
 
   const withSlashes = trimmed.replace(/\\/g, '/');
-  const hadUncPrefix = withSlashes.startsWith('//');
-  let normalized = withSlashes.replace(/\/+/g, '/');
+  // A markdown href can carry a bare Windows drive reference in RFC 8089
+  // E.2.1 form (`/C:/...`); Windows would read the leading slash as part of
+  // the path (`C:\C:\...`). Drop it the same way a `file:///C:/` URL is
+  // handled. UNC (`//server/share`) and `\\?\` device paths keep their prefix.
+  const withoutDriveSlash = /^\/[A-Za-z]:\//.test(withSlashes) ? withSlashes.slice(1) : withSlashes;
+  const hadUncPrefix = withoutDriveSlash.startsWith('//');
+  let normalized = withoutDriveSlash.replace(/\/+/g, '/');
 
   if (hadUncPrefix && !normalized.startsWith('//')) {
     normalized = `/${normalized}`;
@@ -128,6 +133,48 @@ export const getRelativeFilePath = (filePath: string | null | undefined, directo
   }
 
   return normalizedFilePath.slice(normalizedDirectory.length + 1);
+};
+
+const sameParts = (a: readonly string[], b: readonly string[]): boolean => (
+  a.length === b.length && a.every((part, index) => part === b[index])
+);
+
+/**
+ * Folders that tell apart open files sharing a name, keyed by the given path.
+ * Each path gets the shortest run of its closest folders no other same-named
+ * path ends with ("docs", "ui/src"). Files with a unique name, and a file that
+ * has no folders of its own (the project root), get no entry. Pass paths
+ * relative to the project, or the whole absolute path becomes the folder.
+ */
+export const getDisambiguatingFolders = (paths: readonly string[]): Map<string, string> => {
+  const byName = new Map<string, { path: string; folders: string[] }[]>();
+  for (const path of new Set(paths)) {
+    const parts = splitPathParts(normalizeFilePath(path));
+    const name = parts.pop();
+    if (!name) continue;
+    const group = byName.get(name) ?? [];
+    group.push({ path, folders: parts });
+    byName.set(name, group);
+  }
+
+  const result = new Map<string, string>();
+  for (const group of byName.values()) {
+    if (group.length < 2) continue;
+    for (const entry of group) {
+      const { folders } = entry;
+      let depth = 1;
+      while (depth < folders.length) {
+        const tail = folders.slice(-depth);
+        const clashes = group.some((other) => other !== entry && sameParts(other.folders.slice(-depth), tail));
+        if (!clashes) break;
+        depth += 1;
+      }
+      if (folders.length > 0) {
+        result.set(entry.path, folders.slice(-depth).join('/'));
+      }
+    }
+  }
+  return result;
 };
 
 export const getDirectoryForFilePath = (currentDirectory: string | null | undefined, filePath: string | null | undefined): string => {

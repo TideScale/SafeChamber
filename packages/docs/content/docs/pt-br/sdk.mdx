@@ -110,13 +110,13 @@ Desenhar um painel e ler a sessão atual não exige permissão. Tudo que age em 
 | `files` | ler e escrever arquivos dentro do projeto aberto (`readFile`, `writeFile`, `listDir`, `stat` com um caminho relativo) |
 | `model` | geração de texto avulsa com o Small Model do usuário (`generate`), fora de qualquer sessão |
 
-Outras quatro são adicionadas por você automaticamente: `network` quando você declara uma `integration`, `service` quando declara um `service`, `filesystem` quando declara padrões `filesystem`, e `conversation` quando uma ação de sessão pede as mensagens (veja [Ações, comandos e o selo](#ações-comandos-e-o-selo)).
+Outras cinco são adicionadas por você automaticamente: `network` quando você declara uma `integration`, `service` quando declara um `service`, `filesystem` quando declara padrões `filesystem`, `origins` quando declara `origins`, e `conversation` quando uma ação de sessão pede as mensagens (veja [Ações, comandos e o selo](#ações-comandos-e-o-selo)).
 
 O usuário vê a lista completa uma vez, ao instalar a extensão, e aprova ou remove a extensão. Se uma versão nova pedir mais, o diálogo aparece de novo. Uma chamada que precisa de uma capacidade que o usuário não aprovou falha com `NOT_GRANTED`.
 
 ## Gerar texto
 
-Com a capacidade `model`, `host.generate` pede ao Small Model do usuário uma resposta avulsa: um resumo, um título, um rascunho. Nada entra em uma sessão, nenhum histórico é mantido, e a extensão nunca escolhe um provedor. O OpenChamber usa o mesmo modelo que usa para seu próprio trabalho em segundo plano, escolhido em Configurações → Sessões → Small Model, ou escolhido automaticamente entre os provedores conectados do usuário.
+Com a capacidade `model`, `host.generate` pede ao Small Model do usuário uma resposta avulsa: um resumo, um título, um rascunho. Nada entra em uma sessão, nenhum histórico é mantido, e a extensão nunca escolhe um provedor. O OpenChamber usa o mesmo modelo que usa para seu próprio trabalho em segundo plano, escolhido em Configurações → Sessões → Small Model, ou o modelo pequeno do provedor com que o usuário está trabalhando, ou o modelo padrão da configuração do OpenCode dele.
 
 ```ts
 const { text } = await host.generate({
@@ -130,7 +130,19 @@ Quando nenhum modelo está disponível, a chamada falha com `NO_MODEL`; um model
 
 ## Contas e rede
 
-Sua página roda em um ambiente isolado e não consegue chamar a internet diretamente. Declare uma `integration` e o OpenChamber faz as chamadas por você através de `host.request`, com o token do usuário anexado. O token nunca chega à sua página.
+Sua página roda em um ambiente isolado e não consegue acessar a rede por conta própria: scripts, estilos, imagens, fontes e mídia carregam só do seu pacote, e `fetch` alcança só os arquivos do seu pacote. Inclua fontes e imagens dentro do pacote em vez de carregá-las de um CDN.
+
+Para falar com um serviço externo, declare uma `integration` e o OpenChamber faz as chamadas por você através de `host.request`, com o token do usuário anexado. O token nunca chega à sua página.
+
+Para qualquer outra coisa de que sua página precise diretamente, como fontes ou imagens de um CDN ou uma API pública, liste até 8 origens https:
+
+```json
+"origins": ["https://fonts.example.com"]
+```
+
+O usuário as vê no diálogo de aprovação como endereços para os quais sua extensão pode enviar dados e dos quais pode recebê-los, e as aprova de novo se uma atualização adicionar uma. Origens aprovadas ficam abertas para `fetch`, imagens, fontes, estilos e mídia, mas nunca para scripts: o código precisa vir no seu pacote. A origem da página é `null`, então para ler uma resposta de `fetch` o servidor precisa permitir CORS para essa origem.
+
+No [modo empresarial](/security/), uma extensão com `origins`, uma `integration` ou um `service` só é instalada a partir de um repositório Git que o administrador listou. Se a sua extensão funciona sem eles, ela continua instalável para essas equipes. Para desenvolver uma numa máquina assim, peça ao administrador `allowLocalExtensions`, que deixa você instalá-la a partir da pasta dela.
 
 - `token`: o usuário cola um token de API no card de Configurações → Integrações. `apiOrigin` é a única origem que `request` pode chamar. `account` é opcional: um caminho GET e um nome de campo, para o card mostrar quem está conectado. `scheme` diz como o token é enviado; veja a tabela abaixo. Confira na documentação da API do provedor qual header ela espera.
 - `oauth`: o usuário cola um client id, e o OpenChamber executa o fluxo de autorização. Precisa de `authorizeUrl`, `tokenUrl` e `apiOrigin`.

@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, mock, spyOn, test } from 'bun:test';
 import { Window } from 'happy-dom';
-import type { GitWorktreeCreateResult } from '@/lib/api/types';
+import type { GitNetworkOperation, GitNetworkOperationPlan, GitWorktreeCreateResult, RemoveGitWorktreePayload, SourceControlBindingRead } from '@/lib/api/types';
 import { switchRuntimeEndpoint } from '@/lib/runtime-switch';
 import type { WorktreeMetadata } from '@/types/worktree';
 
@@ -15,6 +15,7 @@ const listCalls: string[] = [];
 const listResolvers: Array<(value: WorktreeListEntry[]) => void> = [];
 const listRejecters: Array<(reason: Error) => void> = [];
 let listImplementation: ((directory: string) => Promise<WorktreeListEntry[]>) | undefined;
+let removeImplementation: (() => Promise<{ success: boolean }>) | undefined;
 const createPayloads: unknown[] = [];
 const validatePayloads: unknown[] = [];
 const createdWorktree = {
@@ -29,6 +30,8 @@ let createdWorktreeResult: GitWorktreeCreateResult = createdWorktree;
 const bootstrapWatcherCalls: string[] = [];
 const bootstrapWatcherOptions: Array<{ onReady?: () => void }> = [];
 const warningToasts: string[] = [];
+const infoToasts: string[] = [];
+const removeCalls: Array<{ directory: string; payload: RemoveGitWorktreePayload }> = [];
 
 const sessionState = {
   availableWorktreesByProject: new Map<string, WorktreeMetadata[]>(),
@@ -46,11 +49,12 @@ mock.module('@/lib/openchamberConfig', () => ({
 mock.module('@/components/ui', () => ({
   toast: {
     warning: (message: string) => warningToasts.push(message),
+    info: (message: string) => infoToasts.push(message),
   },
 }));
 
 mock.module('@/lib/i18n', () => ({
-  formatMessage: () => 'session.newWorktree.toast.fetchSourceFailed',
+  formatMessage: (_dictionary: unknown, key: string) => key,
   useI18nStore: { getState: () => ({ dictionary: {} }) },
 }));
 
@@ -110,16 +114,23 @@ mock.module('@/lib/gitApi', () => ({
         validatePayloads.push(payload);
         return Promise.resolve({ ok: true, errors: [] });
       }),
-      remove: mock(() => Promise.resolve({ success: true })),
+      remove: mock((directory: string, payload: RemoveGitWorktreePayload) => {
+        removeCalls.push({ directory, payload });
+        return removeImplementation?.() ?? Promise.resolve({ success: true });
+      }),
     },
   },
 }));
 
-// The manager subscribes to runtime switches at import, which needs a window.
+// The manager subscribes to runtime switches at import, which needs a window;
+// pending Git operations are recorded in its session storage.
 const dom = new Window({ url: 'http://instance-a.test' });
 for (const [name, value] of Object.entries({ window: dom, CustomEvent: dom.CustomEvent })) {
   Object.defineProperty(globalThis, name, { configurable: true, writable: true, value });
 }
+beforeEach(() => {
+  dom.sessionStorage.clear();
+});
 
 const {
   createWorktree,
@@ -132,6 +143,7 @@ const {
   validateWorktreeCreate,
   worktreeMapsEqual,
 } = await import('./worktreeManager');
+const { isWorktreeRemoving } = await import('./worktreeRemovalState');
 
 const waitForListCallCount = async (count: number): Promise<void> => {
   for (let attempt = 0; attempt < 10; attempt += 1) {
@@ -154,6 +166,8 @@ describe('worktreeManager list invalidation', () => {
     bootstrapWatcherCalls.length = 0;
     bootstrapWatcherOptions.length = 0;
     warningToasts.length = 0;
+    infoToasts.length = 0;
+    removeCalls.length = 0;
     createdWorktreeResult = createdWorktree;
     sessionState.availableWorktreesByProject = new Map();
     sessionState.availableWorktrees = [];
@@ -170,6 +184,29 @@ describe('worktreeManager list invalidation', () => {
     });
 
     expect(warningToasts).toEqual(['session.newWorktree.toast.fetchSourceFailed']);
+  });
+
+  test('says the repository access needs attention when that is why the fetch failed', async () => {
+    createdWorktreeResult = { ...createdWorktree, sourceFetchFailed: true, sourceFetchReason: 'access' };
+
+    await createWorktree({ id: 'project-fetch-access', path: '/repo' }, {
+      branchName: 'feature',
+      worktreeName: 'feature',
+    });
+
+    expect(warningToasts).toEqual(['session.newWorktree.toast.fetchSourceAccess']);
+  });
+
+  test('says where a diverged leftover branch was kept', async () => {
+    createdWorktreeResult = { ...createdWorktree, branchBackup: 'feature-backup-1234567' };
+
+    await createWorktree({ id: 'project-branch-backup', path: '/repo' }, {
+      branchName: 'feature',
+      worktreeName: 'feature',
+    });
+
+    expect(infoToasts).toEqual(['session.newWorktree.toast.branchBackup']);
+    expect(warningToasts).toEqual([]);
   });
 
   test('retries an in-flight list when a worktree is created before it resolves', async () => {
@@ -501,6 +538,48 @@ describe('worktreeManager list invalidation', () => {
     expect(sessionState.worktreeMetadata.has('removed-session')).toBe(false);
     expect(sessionState.worktreeMetadata.get('sibling-session')).toBe(sibling);
   });
+
+  describe('removal shown on the row', () => {
+    const target: WorktreeMetadata = {
+      path: '/worktrees/target',
+      projectDirectory: '/repo',
+      branch: 'target',
+      label: 'target',
+    };
+
+    beforeEach(() => {
+      sessionState.availableWorktreesByProject = new Map([['/repo', [target]]]);
+      sessionState.availableWorktrees = [target];
+    });
+
+    test('the row shows the removal until git answers, then leaves with it', async () => {
+      let answerGit: (value: { success: boolean }) => void = () => undefined;
+      removeImplementation = () => new Promise((resolve) => { answerGit = resolve; });
+      try {
+        const removal = removeProjectWorktree({ id: 'path:/repo', path: '/repo' }, target);
+        expect(isWorktreeRemoving(target.path)).toBe(true);
+        expect(sessionState.availableWorktrees).toEqual([target]);
+
+        answerGit({ success: true });
+        await removal;
+        expect(isWorktreeRemoving(target.path)).toBe(false);
+        expect(sessionState.availableWorktrees).toEqual([]);
+      } finally {
+        removeImplementation = undefined;
+      }
+    });
+
+    test('a failed removal clears the state and keeps the row', async () => {
+      removeImplementation = () => Promise.reject(new Error('folder in use'));
+      try {
+        await expect(removeProjectWorktree({ id: 'path:/repo', path: '/repo' }, target)).rejects.toThrow('folder in use');
+        expect(isWorktreeRemoving(target.path)).toBe(false);
+        expect(sessionState.availableWorktrees).toEqual([target]);
+      } finally {
+        removeImplementation = undefined;
+      }
+    });
+  });
 });
 
 describe('worktreeMapsEqual', () => {
@@ -664,6 +743,34 @@ describe('partitionWorktreesByRegisteredProject', () => {
     expect([...result.keys()]).toEqual(['/repo']);
     expect(result.get('/repo')?.map((entry) => entry.path)).toEqual(['/worktrees/loose']);
   });
+
+  test('omits the checkout that holds a sub-folder project and keeps the other worktrees', () => {
+    const projects = [{ path: '/repo/a' }, { path: '/repo/b' }];
+    const topology = new Map<string, WorktreeMetadata[]>([
+      ['/repo/a', [worktree('/repo'), worktree('/repo/.worktrees/nested'), worktree('/repo-feature')]],
+      ['/repo/b', [worktree('/repo'), worktree('/repo/.worktrees/nested'), worktree('/repo-feature')]],
+    ]);
+
+    const result = partitionWorktreesByRegisteredProject(projects, topology);
+
+    expect([...result.keys()]).toEqual(['/repo/a']);
+    expect(result.get('/repo/a')?.map((entry) => entry.path)).toEqual(['/repo/.worktrees/nested', '/repo-feature']);
+  });
+
+  test('a worktree first listed from the second sub-folder project still goes to the first one', () => {
+    const projects = [{ path: '/repo/a' }, { path: '/repo/b' }];
+    const discovered = new Map<string, WorktreeMetadata[]>([
+      ['/repo/a', [worktree('/repo')]],
+      ['/repo/b', [worktree('/repo')]],
+    ]);
+    expect(partitionWorktreesByRegisteredProject(projects, discovered).size).toBe(0);
+
+    const refreshed = replaceRepositoryWorktrees(discovered, '/repo/b', [worktree('/repo'), worktree('/repo-feature')]);
+    const result = partitionWorktreesByRegisteredProject(projects, refreshed);
+
+    expect([...result.keys()]).toEqual(['/repo/a']);
+    expect(result.get('/repo/a')?.map((entry) => entry.path)).toEqual(['/repo-feature']);
+  });
 });
 
 describe('replaceRepositoryWorktrees', () => {
@@ -747,42 +854,95 @@ describe('worktreeManager fork remote payload wiring', () => {
     attachmentState.attachments = new Map();
   });
 
-  test('validate and create forward ensureRemoteName/Url for a fork head', async () => {
+  test('validate and create forward only the exact change-request source request', async () => {
     const project = { id: 'project-1', path: '/repo' };
     const args = {
       mode: 'existing' as const,
       branchName: 'feature/login',
       worktreeName: 'pr-42',
       existingBranch: 'remotes/pr-alice/feature/login',
-      setUpstream: true as const,
-      upstreamRemote: 'pr-alice',
-      upstreamBranch: 'feature/login',
-      ensureRemoteName: 'pr-alice',
-      ensureRemoteUrl: 'https://github.com/alice/openchamber.git',
+      changeRequestSource: {
+        context: { provider: 'github' as const, instance: 'github.com', directory: '/repo', repositoryId: 'repo_one', accountId: 'account_one', bindingRevision: 2, primaryRemote: 'origin' },
+        project: { id: 'acme/app', owner: 'acme', name: 'app' },
+        number: 42,
+        expectedHeadSha: '1111111111111111111111111111111111111111',
+        requestedRemoteName: 'pr-alice',
+      },
+      expectedRevision: '1111111111111111111111111111111111111111',
     };
 
     const validation = await validateWorktreeCreate(project, args);
     expect(validation.ok).toBe(true);
     expect(validatePayloads).toHaveLength(1);
-    const validated = validatePayloads[0] as Record<string, unknown>;
-    expect(validated.mode).toBe('existing');
-    expect(validated.existingBranch).toBe('remotes/pr-alice/feature/login');
-    expect(validated.ensureRemoteName).toBe('pr-alice');
-    expect(validated.ensureRemoteUrl).toBe('https://github.com/alice/openchamber.git');
-    expect('pullRequest' in validated).toBe(false);
+    expect(validatePayloads[0]).toEqual(args);
 
     await createWorktree(project, {
       ...args,
       returnAfterDirectoryCreated: true,
     });
     expect(createPayloads).toHaveLength(1);
-    const created = createPayloads[0] as Record<string, unknown>;
-    expect(created.existingBranch).toBe('remotes/pr-alice/feature/login');
-    expect(created.ensureRemoteName).toBe('pr-alice');
-    expect(created.ensureRemoteUrl).toBe('https://github.com/alice/openchamber.git');
-    expect(created.setUpstream).toBe(true);
-    expect('pullRequest' in created).toBe(false);
+    expect(createPayloads[0]).toEqual({ ...args, returnAfterDirectoryCreated: true });
   });
+});
+
+describe('worktreeManager remote deletion ordering', () => {
+  const endpoint = { displayUrl: 'https://example.com/team/repo.git', fingerprint: 'a'.repeat(64) };
+  const bindingRead: SourceControlBindingRead = {
+    status: 'bound',
+    repository: {
+      repositoryId: 'repository-one', configRevision: 'config-one', bare: false,
+      remotes: [{ name: 'origin', fetch: endpoint, push: endpoint }],
+    },
+    revision: 3,
+    binding: {
+      repositoryId: 'repository-one', revision: 3, state: 'bound', configRevision: 'config-one',
+      providers: [], auxiliary: [],
+      remotes: [{ name: 'origin', fetch: endpoint, push: endpoint, mode: 'managed', credentialId: 'credential-one', readiness: 'ready' }],
+    },
+  };
+  const plan: GitNetworkOperationPlan = {
+    operationId: 'operation-delete',
+    runtimeIdentity: { id: 'runtime-one', platform: 'web' },
+    transport: { mode: 'managed', verification: { status: 'verified', method: 'credential' } },
+    target: {
+      operation: 'delete-remote-branch', repositoryId: 'repository-one', bindingRevision: 3,
+      configRevision: 'config-one', remote: { name: 'origin', endpoint },
+      destinationRef: 'refs/heads/feature/delete-me',
+    },
+    completedSteps: [],
+    state: 'planned',
+  };
+
+  beforeEach(() => {
+    removeCalls.length = 0;
+  });
+
+  for (const state of ['failed', 'outcome-unknown'] as const) {
+    test(`does not remove the local worktree after ${state} remote deletion`, async () => {
+      const terminalOperation = (): GitNetworkOperation => state === 'failed'
+        ? { ...plan, state, error: { code: 'TRANSPORT_FAILED', message: 'Remote deletion did not complete' } }
+        : { ...plan, state, error: { code: 'OUTCOME_UNKNOWN', message: 'Remote deletion did not complete' } };
+      await expect(removeProjectWorktree(
+        { id: 'project-one', path: '/repo' },
+        { path: '/repo-feature', branch: 'feature/delete-me', projectDirectory: '/repo', label: 'delete-me' },
+        {
+          deleteRemoteBranch: true,
+          deleteLocalBranch: true,
+          remoteName: 'origin',
+          network: {
+            sourceControl: { repositoryBinding: async () => bindingRead },
+            git: {
+              planNetworkOperation: async () => plan,
+              executeNetworkOperation: async () => terminalOperation(),
+              getNetworkOperation: async () => terminalOperation(),
+            },
+          },
+        },
+      )).rejects.toThrow('Remote deletion did not complete');
+
+      expect(removeCalls).toEqual([]);
+    });
+  }
 });
 
 describe('worktreeManager missing worktrees', () => {
@@ -804,6 +964,21 @@ describe('worktreeManager missing worktrees', () => {
     expect(result.map((entry) => [entry.path, entry.worktreeStatus])).toEqual([
       ['/repo-missing/.worktrees/alive', 'ready'],
       ['/repo-missing/.worktrees/gone', 'missing'],
+    ]);
+  });
+
+  test('keeps the contributor fork provenance the server lists', async () => {
+    const provenance = { kind: 'contributor-fork' as const, revision: 1, trust: 'untrusted' as const, push: 'destination-selection-required' as const };
+    listImplementation = async () => [
+      { path: '/repo-fork/.worktrees/own', branch: 'own', head: 'abc', name: 'own' },
+      { path: '/repo-fork/.worktrees/pr', branch: 'pr', head: 'def', name: 'pr', provenance },
+    ];
+
+    const result = await listProjectWorktrees({ id: 'project-fork', path: '/repo-fork' }, { force: true });
+
+    expect(result.map((entry) => [entry.path, entry.provenance ?? null])).toEqual([
+      ['/repo-fork/.worktrees/own', null],
+      ['/repo-fork/.worktrees/pr', provenance],
     ]);
   });
 

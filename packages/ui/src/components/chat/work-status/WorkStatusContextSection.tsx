@@ -1,25 +1,40 @@
 import React from 'react';
+import { toast } from 'sonner';
 import { useI18n } from '@/lib/i18n';
 import { Icon } from '@/components/icon/Icon';
-import { useSkillsStore } from '@/stores/useSkillsStore';
+import { selectAvailableSkillsForDirectory, useSkillsStore } from '@/stores/useSkillsStore';
 import { useMcpStore } from '@/stores/useMcpStore';
 import { useSession } from '@/sync/sync-context';
-import { getLinkedIssues, canOpenLinearIssueInContextPanel, isGuestPull } from '@/lib/linkedIssues';
+import { getDistinctLinkedIssues, getLinkedSidebarChanges, getLinkedSidebarIssues, getRepositoryThreadRef, isLinkedChange, type LinkedIssue, type RepositoryThreadRef } from '@/lib/linkedIssues';
+import { useRepositoryUrlMatcher } from '@/lib/source-control/repositoryUrlMatcher';
+import { formatChangeRequestReference } from '@/lib/source-control/providers/terminology';
+import type { ChangeRequestTerm } from '@/lib/source-control/providers/descriptor';
+import { useFreshestSourceControlVisualSummaryForBranch, type PrVisualSummary } from '@/stores/useGitHubPrStatusStore';
+import { useEffectiveGitDirectory, useGitStore } from '@/stores/useGitStore';
+import { useTrackedIssueStates, useTrackedPullVisualSummaries, useTrackedWorkItemStates } from '@/stores/useTrackedItemsStore';
+import { useTrackedItems } from '@/lib/trackedItems/interest';
+import { repositoryThread, workItem } from '@/lib/trackedItems/fromLinks';
+import { trackerPresentation } from '@/lib/trackers/presentation';
+import { useTrackerDescriptors } from '@/lib/trackers/registry';
+import { getPrStatusLabel } from '@/components/session/sidebar/prStatusLabel';
+import { getIssueStateLook, getTrackerItemStateLook } from '@/components/session/sidebar/sessions/sessionPrSummaries';
 import { fetchSessionKnowledgeSummary, setSessionProjectContextPin, type SessionKnowledgeSummary } from '@/lib/sessionKnowledgeApi';
+import * as sessionActions from '@/sync/session-actions';
 import { useProjectContextStore } from '@/stores/useProjectContextStore';
 import { useAgentMemoryStore } from '@/stores/useAgentMemoryStore';
 import { useSessionUIStore } from '@/sync/session-ui-store';
 import { useProjectsStore } from '@/stores/useProjectsStore';
 import { resolveProjectForSessionDirectory } from '@/lib/projectResolution';
 import { resolveProjectContextId } from '@/lib/projectContextApi';
-import { useRuntimeAPIs } from '@/hooks/useRuntimeAPIs';
-import { useMobileAppActions } from '@/apps/mobileAppContext';
-import { useLinearAuthStore } from '@/stores/useLinearAuthStore';
 import { useConfigStore } from '@/stores/useConfigStore';
-import { useUIStore } from '@/stores/useUIStore';
+import { useOpenTrackerItem } from '@/components/sourceBoard/openTrackerItem';
 import { WorkStatusCollapsibleSection, WorkStatusRow, WorkStatusValue } from './WorkStatusPrimitives';
 import { useReportWorkStatusPresence } from './presenceContext';
 import { resolveDraftPinnedKnowledge } from './draftKnowledge';
+import { changeRequestCopy } from '@/lib/source-control/changeRequestCopy';
+import { refTintStyle } from '@/lib/source-control/prVisualState';
+import { cn } from '@/lib/utils';
+
 
 type Props = {
   sessionId: string | null;
@@ -27,8 +42,8 @@ type Props = {
 };
 
 /**
- * What is loaded into the agent's context: the GitHub threads this session was
- * pointed at, plus how much ambient material is available.
+ * What is loaded into the agent's context: the issues and change requests this
+ * session was pointed at, plus how much ambient material is available.
  *
  * Agents are deliberately absent — an agent is who does the work, not material
  * the work is done with. Tools are absent for want of an honest source:
@@ -37,11 +52,6 @@ type Props = {
  */
 export const WorkStatusContextSection: React.FC<Props> = ({ sessionId, directory }) => {
   const { t } = useI18n();
-  const { linear } = useRuntimeAPIs();
-  const linearConnected = useLinearAuthStore((state) => state.status?.connected === true);
-  const mobileActions = useMobileAppActions();
-  const openContextPanelTab = useUIStore((state) => state.openContextPanelTab);
-  const setLinearIssueFocus = useUIStore((state) => state.setLinearIssueFocus);
 
   const session = useSession(sessionId ?? '', directory ?? undefined);
   const newSessionDraft = useSessionUIStore((state) => state.newSessionDraft);
@@ -49,7 +59,7 @@ export const WorkStatusContextSection: React.FC<Props> = ({ sessionId, directory
   const availableWorktreesByProject = useSessionUIStore((state) => state.availableWorktreesByProject);
   const projects = useProjectsStore((state) => state.projects);
   const isDraft = sessionId === null && newSessionDraft.open;
-  const skills = useSkillsStore((state) => state.skills);
+  const skills = useSkillsStore((state) => selectAvailableSkillsForDirectory(state));
   const mcpStatus = useMcpStore(
     React.useCallback((state) => state.getStatusForDirectory(directory), [directory]),
   );
@@ -150,27 +160,107 @@ export const WorkStatusContextSection: React.FC<Props> = ({ sessionId, directory
     });
   }, [directory, isDraft, sessionId, setDraftProjectContextPin]);
 
+  // Removing a linked thread, like unpinning: the panel that says what the
+  // session carries is the one that can take it back off, or an agent's link
+  // would be permanent unless metadata were edited by hand. The write is the
+  // same metadata patch the attach flows use, so the row leaves when the
+  // session's stored list loses the entry.
+  const unlinkLinkedThread = React.useCallback((issue: LinkedIssue) => {
+    if (!directory || !sessionId) return;
+    void sessionActions.setLinkedIssue(sessionId, directory, issue, false).catch(() => {
+      toast.error(t('chat.workStatus.linkedIssues.unlinkFailed'));
+    });
+  }, [directory, sessionId, t]);
+
   const memoryCount = visibleKnowledge.memory.global + visibleKnowledge.memory.project;
   const pinnedCount = visibleKnowledge.notes.length + visibleKnowledge.plans.length;
 
-  const linked = React.useMemo(() => getLinkedIssues(session), [session]);
-  const openLinkedIssue = React.useCallback((entry: (typeof linked)[number]) => {
-    if (
-      entry.kind === 'linear'
-      && directory
-      && canOpenLinearIssueInContextPanel({
-        linearAvailable: Boolean(linear),
-        linearConnected,
-        inDedicatedMobileShell: mobileActions != null,
-        directory,
-      })
-    ) {
-      setLinearIssueFocus(entry.identifier);
-      openContextPanelTab(directory, { mode: 'linear' });
-      return;
+  const urlMatcher = useRepositoryUrlMatcher();
+  const linked = React.useMemo(() => getDistinctLinkedIssues(session, urlMatcher), [session, urlMatcher]);
+  // Live state of the session's linked change requests and issues, from the
+  // server's tracked items. This panel follows its own session too: the
+  // session need not be on screen in the sidebar.
+  const repositoryChanges = React.useMemo(
+    () => getLinkedSidebarChanges(session, urlMatcher).flatMap((change) => (
+      change.repository ? [{ ref: change.repository, item: repositoryThread('pull', change.repository), url: change.url, title: change.title }] : []
+    )),
+    [session, urlMatcher],
+  );
+  const linkedSidebarIssues = React.useMemo(() => getLinkedSidebarIssues(session, urlMatcher), [session, urlMatcher]);
+  const repositoryIssueRefs = React.useMemo(
+    () => linkedSidebarIssues.flatMap((issue) => (issue.source === 'repository' ? [issue.ref] : [])),
+    [linkedSidebarIssues],
+  );
+  const repositoryIssueItems = React.useMemo(() => repositoryIssueRefs.map((ref) => repositoryThread('issue', ref)), [repositoryIssueRefs]);
+  const linkedTrackerEntries = React.useMemo(
+    () => linkedSidebarIssues.flatMap((issue) => (issue.source === 'tracker' ? [{ key: issue.key, identifier: issue.identifier, item: workItem(issue.provider, issue.identifier) }] : [])),
+    [linkedSidebarIssues],
+  );
+  const linkedWorkItems = React.useMemo(() => linkedTrackerEntries.map((entry) => entry.item), [linkedTrackerEntries]);
+  const trackedItems = React.useMemo(() => [
+    ...repositoryChanges.map((link) => link.item),
+    ...repositoryIssueItems,
+    ...linkedWorkItems,
+  ], [linkedWorkItems, repositoryChanges, repositoryIssueItems]);
+  useTrackedItems(trackedItems);
+  const changeSummaries = useTrackedPullVisualSummaries(repositoryChanges);
+  const repositoryIssueStates = useTrackedIssueStates(repositoryIssueItems);
+  const linkedWorkItemStates = useTrackedWorkItemStates(linkedWorkItems);
+  // The pull request of the branch checked out here, read-only as in the
+  // repository readout. When it is also linked, its row shows this state, as
+  // the sidebar row does: a full status read carries more than a live summary,
+  // and the linked item's own state may not have arrived yet.
+  const gitDirectory = useEffectiveGitDirectory(directory);
+  const branch = useGitStore(React.useCallback(
+    (state) => (gitDirectory ? state.directories.get(gitDirectory)?.status?.current?.trim() || null : null),
+    [gitDirectory],
+  ));
+  const branchPrSummary = useFreshestSourceControlVisualSummaryForBranch(gitDirectory, branch);
+  // Repository thread key, or a tracker entry's id (`linear:ENG-12`) lowercased -> the coloured status line.
+  const liveLookById = React.useMemo(() => {
+    const looks = new Map<string, { color: string; text: string }>();
+    const changeLook = (summary: PrVisualSummary, ref: RepositoryThreadRef) => {
+      const descriptor = urlMatcher.descriptorOf(ref.provider);
+      const reference = formatChangeRequestReference(descriptor, ref.number);
+      const label = getPrStatusLabel(summary, descriptor.terminology.changeRequest, t);
+      return { color: `var(--pr-${summary.visualState})`, text: label ? `${reference} · ${label}` : reference };
+    };
+    // A summary belongs to the link at its own index: the same owner/repo#number
+    // can be linked from two instances in one session, and only the position
+    // tells those two apart.
+    repositoryChanges.forEach(({ ref }, index) => {
+      const summary = changeSummaries[index];
+      if (summary) looks.set(ref.key, changeLook(summary, ref));
+    });
+    repositoryIssueRefs.forEach((ref, index) => {
+      const state = repositoryIssueStates[index];
+      if (!state) return;
+      const look = getIssueStateLook(state.state);
+      const identifier = `${urlMatcher.descriptorOf(ref.provider).terminology.issuePrefix}${ref.number}`;
+      looks.set(ref.key, { color: look.color, text: `${identifier} · ${t(look.statusKey)}` });
+    });
+    // A tracker shows its own state name; the colour comes from its category.
+    linkedTrackerEntries.forEach(({ key, identifier }, index) => {
+      const state = linkedWorkItemStates[index];
+      if (!state) return;
+      looks.set(key.toLowerCase(), {
+        color: getTrackerItemStateLook(state.state.category).color,
+        text: `${identifier} · ${state.state.name}`,
+      });
+    });
+    if (branchPrSummary?.repo) {
+      const owner = branchPrSummary.repo.owner.toLowerCase();
+      const repo = branchPrSummary.repo.repo.toLowerCase();
+      const match = repositoryChanges.find(({ ref }) => (
+        ref.provider === branchPrSummary.provider && ref.number === branchPrSummary.number
+        && ref.owner.toLowerCase() === owner && ref.repo.toLowerCase() === repo
+      ));
+      if (match) looks.set(match.ref.key, changeLook(branchPrSummary, match.ref));
     }
-    window.open(entry.url, '_blank', 'noopener,noreferrer');
-  }, [directory, linear, linearConnected, mobileActions, openContextPanelTab, setLinearIssueFocus]);
+    return looks;
+  }, [branchPrSummary, changeSummaries, linkedTrackerEntries, linkedWorkItemStates, repositoryChanges, repositoryIssueRefs, repositoryIssueStates, t, urlMatcher]);
+  const openTrackerItem = useOpenTrackerItem();
+  const trackerDescriptors = useTrackerDescriptors();
   // Connected servers only. A disabled server contributes nothing to the
   // context, so counting it here contradicts the MCP section right above,
   // which shows the same servers switched off.
@@ -191,14 +281,15 @@ export const WorkStatusContextSection: React.FC<Props> = ({ sessionId, directory
   // The heading names what is distinctive about this session when there is
   // something — an attached thread — and falls back to the ambient counts
   // when there is not. `1 · 33 · 2` said nothing without opening the section.
-  const issueCount = linked.filter((entry) => (
-    entry.kind === 'issue'
-    || entry.kind === 'linear'
-    || (entry.kind === 'guest' && !isGuestPull(entry))
-  )).length;
-  const prCount = linked.filter((entry) => (
-    entry.kind === 'pull' || (entry.kind === 'guest' && isGuestPull(entry))
-  )).length;
+  const linkedChanges = linked.filter(isLinkedChange);
+  const prCount = linkedChanges.length;
+  // A provider's own word only when every attached change shares it.
+  const changeTerms = new Set(linkedChanges.map((entry) => {
+    const ref = getRepositoryThreadRef(entry, urlMatcher);
+    return ref ? urlMatcher.descriptorOf(ref.provider).terminology.changeRequest : 'pullRequest';
+  }));
+  const changeTerm: ChangeRequestTerm = changeTerms.size === 1 ? [...changeTerms][0] : 'pullRequest';
+  const issueCount = linked.length - prCount;
   const summaryParts: string[] = [];
   if (issueCount > 0) {
     summaryParts.push(issueCount === 1
@@ -207,8 +298,8 @@ export const WorkStatusContextSection: React.FC<Props> = ({ sessionId, directory
   }
   if (prCount > 0) {
     summaryParts.push(prCount === 1
-      ? t('chat.workStatus.breakdown.prCountSingle', { count: prCount })
-      : t('chat.workStatus.breakdown.prCountPlural', { count: prCount }));
+      ? t(changeRequestCopy('chat.workStatus.breakdown.prCountSingle', changeTerm), { count: prCount })
+      : t(changeRequestCopy('chat.workStatus.breakdown.prCountPlural', changeTerm), { count: prCount }));
   }
   // Pinned knowledge outranks ambient counts because the user chose it for this session.
   if (summaryParts.length === 0 && pinnedCount > 0) {
@@ -229,6 +320,58 @@ export const WorkStatusContextSection: React.FC<Props> = ({ sessionId, directory
     }
   }
 
+  // Identifier and state lead, the title follows and is what truncates: the
+  // number and state are what tell links apart, as in the sidebar. A GitHub
+  // thread with a known state shows it in the sidebar's colours; anything
+  // else keeps the plain muted identifier.
+  // Keyed by the repository thread, so an extension's link to a change request
+  // shows the same live state as a direct one.
+  const liveLookOf = (entry: (typeof linked)[number]) => {
+    if (entry.kind === 'tracker') return liveLookById.get(entry.id.toLowerCase());
+    const ref = getRepositoryThreadRef(entry, urlMatcher);
+    return ref ? liveLookById.get(ref.key) : undefined;
+  };
+  const renderedIdentifier = (entry: (typeof linked)[number]) => {
+    const ref = getRepositoryThreadRef(entry, urlMatcher);
+    if (ref) {
+      const descriptor = urlMatcher.descriptorOf(ref.provider);
+      return ref.thread === 'pull' ? formatChangeRequestReference(descriptor, ref.number) : `${descriptor.terminology.issuePrefix}${ref.number}`;
+    }
+    return entry.kind === 'tracker' || entry.kind === 'guest' || entry.kind === 'external' ? entry.identifier : `#${entry.number}`;
+  };
+  const openLinkedAriaLabel = (entry: Extract<(typeof linked)[number], { kind: 'issue' | 'pull' }>) => {
+    const ref = getRepositoryThreadRef(entry, urlMatcher);
+    // A link no served provider recognises names no provider.
+    return ref
+      ? t('chat.workStatus.linkedIssues.openOnProvider', { reference: renderedIdentifier(entry), provider: urlMatcher.descriptorOf(ref.provider).label })
+      : t('chat.workStatus.linkedIssues.openGuest', { id: renderedIdentifier(entry) });
+  };
+  const trackerNameOf = (provider: string) => trackerDescriptors.find((descriptor) => descriptor.id === provider)?.name ?? provider;
+  // The kind, never the author: an agent's link has no avatar, and a mix of
+  // faces and icons hid which row was a PR. An issue reads as an issue
+  // wherever it lives (GitHub, GitLab, an agent's or an extension's link) and
+  // wears its state's colour, muted, as on a sidebar row.
+  const renderLinkedIcon = (entry: (typeof linked)[number]) => {
+    const color = liveLookOf(entry)?.color;
+    return (
+      <Icon
+        name={isLinkedChange(entry) ? 'git-pull-request' : entry.kind === 'tracker' ? trackerPresentation(entry.provider).icon : 'record-circle'}
+        className={cn('size-3.5 shrink-0', color ? 'oc-ref-tint' : 'text-muted-foreground')}
+        style={color ? refTintStyle(color) : undefined}
+      />
+    );
+  };
+  const renderLinkedLabel = (entry: (typeof linked)[number]) => {
+    const look = liveLookOf(entry);
+    const identifier = renderedIdentifier(entry);
+    return (
+      <>
+        <span className={cn('tabular-nums', look && 'oc-ref-tint')} style={look ? refTintStyle(look.color) : undefined}>{look ? look.text : identifier}</span>
+        {entry.title ? <> · {entry.title}</> : null}
+      </>
+    );
+  };
+
   return (
     <WorkStatusCollapsibleSection
       id="context-sources"
@@ -241,35 +384,36 @@ export const WorkStatusContextSection: React.FC<Props> = ({ sessionId, directory
       {linked.map((entry) => (
         <WorkStatusRow
           key={entry.id}
-          leading={'authorAvatarUrl' in entry && entry.authorAvatarUrl ? (
-            <img src={entry.authorAvatarUrl} alt="" className="size-4 shrink-0 rounded-full" loading="lazy" />
-          ) : (
-            <Icon
-              name={entry.kind === 'pull' || (entry.kind === 'guest' && isGuestPull(entry))
-                ? 'git-pull-request'
-                : entry.kind === 'linear'
-                  ? 'linear'
-                  : entry.kind === 'guest'
-                    ? 'attachment-2'
-                    : 'error-warning'}
-              className="size-4 shrink-0 text-muted-foreground"
-            />
-          )}
-          label={entry.title}
+          leading={renderLinkedIcon(entry)}
+          label={renderLinkedLabel(entry)}
+          // The title truncates in a narrow panel; the full one shows on hover.
+          tooltip={entry.title ? renderLinkedLabel(entry) : undefined}
           muted
-          // GitHub threads still live on github.com. A Linear issue opens in
-          // the right-hand panel when that rail exists; otherwise the Linear URL.
-          onClick={() => openLinkedIssue(entry)}
-          ariaLabel={entry.kind === 'linear'
-            ? t('chat.workStatus.linkedIssues.openLinear', { identifier: entry.identifier })
-            : entry.kind === 'guest'
-              ? t('chat.workStatus.linkedIssues.openGuest', { id: entry.identifier })
-              : t('chat.workStatus.linkedIssues.open', { number: entry.number })}
+          // In the Tracker, read through this session's project; Cmd or Ctrl,
+          // and anything the app cannot show, opens the link.
+          onClick={(event) => openTrackerItem(entry.url, directory, event)}
+          // The panel that shows what a session carries is the one that can
+          // take an item back off; a pinned row's control is the precedent.
+          // This sits in the trailing value slot, where row actions live.
           value={(
-            <WorkStatusValue tone="muted">
-              {entry.kind === 'linear' || entry.kind === 'guest' ? entry.identifier : `#${entry.number}`}
-            </WorkStatusValue>
+            <button
+              type="button"
+              disabled={!sessionId || !directory}
+              aria-label={t('chat.workStatus.linkedIssues.unlink')}
+              onClick={(event) => {
+                event.stopPropagation();
+                unlinkLinkedThread(entry);
+              }}
+              className="shrink-0 rounded p-0.5 text-muted-foreground/60 transition-colors hover:text-foreground disabled:opacity-40 disabled:hover:text-muted-foreground/60"
+            >
+              <Icon name="close" className="size-3.5" />
+            </button>
           )}
+          ariaLabel={entry.kind === 'tracker'
+            ? t('chat.workStatus.linkedIssues.openTrackerItem', { identifier: entry.identifier, provider: trackerNameOf(entry.provider) })
+            : entry.kind === 'guest' || entry.kind === 'external'
+              ? t('chat.workStatus.linkedIssues.openGuest', { id: entry.identifier })
+              : openLinkedAriaLabel(entry)}
         />
       ))}
 
@@ -290,7 +434,7 @@ export const WorkStatusContextSection: React.FC<Props> = ({ sessionId, directory
                 event.stopPropagation();
                 unpinNote(note.id);
               }}
-              className="shrink-0 rounded p-0.5 transition-opacity hover:opacity-70 disabled:opacity-40"
+              className="-m-0.5 shrink-0 rounded p-0.5 opacity-70 transition-opacity hover:opacity-100 disabled:opacity-40"
             >
               <Icon name="pushpin-2-fill" className="size-3.5" style={{ color: 'var(--primary)' }} />
             </button>
@@ -312,7 +456,7 @@ export const WorkStatusContextSection: React.FC<Props> = ({ sessionId, directory
                 event.stopPropagation();
                 unpinPlan(plan.id);
               }}
-              className="shrink-0 rounded p-0.5 transition-opacity hover:opacity-70 disabled:opacity-40"
+              className="-m-0.5 shrink-0 rounded p-0.5 opacity-70 transition-opacity hover:opacity-100 disabled:opacity-40"
             >
               <Icon name="pushpin-2-fill" className="size-3.5" style={{ color: 'var(--primary)' }} />
             </button>

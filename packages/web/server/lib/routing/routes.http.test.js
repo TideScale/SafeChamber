@@ -29,6 +29,8 @@ const createApp = ({ routeSend, autoSessions = new Set() } = {}) => {
     setToken: vi.fn(async () => ({ available: true, tokenPresent: true })),
     clearToken: vi.fn(async () => ({ available: true, tokenPresent: false })),
     setClassifierSource: vi.fn(async () => ({ available: true })),
+    setCustomEndpoint: vi.fn(async () => ({ available: true })),
+    clearCustomEndpoint: vi.fn(async () => ({ available: true })),
   };
   const app = express();
   registerRoutingRoutes(app, runtime);
@@ -94,6 +96,47 @@ describe('routing send rewrite', () => {
     expect(runtime.routeSend).toHaveBeenCalledWith({ sessionId: 's1', directory: '/repo', body: { text: 'hi' } });
   });
 
+  it('decodes a URI-encoded directory header the way OpenCode reads it', async () => {
+    const { app, runtime } = createApp({ autoSessions: new Set(['s1']) });
+    await request(app)
+      .post('/api/session/s1/prompt')
+      .set('x-opencode-directory', '%2Frepo')
+      .send({ text: 'hi' })
+      .expect(204);
+    expect(runtime.routeSend).toHaveBeenCalledWith({ sessionId: 's1', directory: '/repo', body: { text: 'hi' } });
+  });
+
+  it('decodes a directory header marked as URI-encoded', async () => {
+    const { app, runtime } = createApp();
+    await request(app)
+      .post('/api/session/s1/model')
+      .set('x-opencode-directory', '%2Frepo')
+      .set('x-opencode-directory-encoding', 'uri')
+      .send({ model: { providerID: 'openchamber', id: 'auto' } })
+      .expect(204);
+    expect(runtime.noteModelSelection).toHaveBeenCalledWith('s1', { providerID: 'openchamber', id: 'auto' }, '/repo');
+  });
+
+  it('forwards a directory header without percent-escapes untouched', async () => {
+    const { app, runtime } = createApp({ autoSessions: new Set(['s1']) });
+    await request(app)
+      .post('/api/session/s1/prompt')
+      .set('x-opencode-directory', '/repo')
+      .send({ text: 'hi' })
+      .expect(204);
+    expect(runtime.routeSend).toHaveBeenCalledWith({ sessionId: 's1', directory: '/repo', body: { text: 'hi' } });
+  });
+
+  it('keeps a directory header with malformed escapes as it arrived', async () => {
+    const { app, runtime } = createApp({ autoSessions: new Set(['s1']) });
+    await request(app)
+      .post('/api/session/s1/prompt')
+      .set('x-opencode-directory', '%2Frepo%ZZ')
+      .send({ text: 'hi' })
+      .expect(204);
+    expect(runtime.routeSend).toHaveBeenCalledWith({ sessionId: 's1', directory: '%2Frepo%ZZ', body: { text: 'hi' } });
+  });
+
   it('leaves a send in a session that is not on Auto unread', async () => {
     const { app, runtime, forwarded } = createApp();
     await request(app).post('/api/session/s1/prompt').send({ text: 'hi' }).expect(204);
@@ -133,6 +176,10 @@ describe('routing routes', () => {
     expect(runtime.clearToken).toHaveBeenCalled();
     await request(app).put('/api/routing/classifier').send({ source: 'zen-key' }).expect(200);
     expect(runtime.setClassifierSource).toHaveBeenCalledWith('zen-key');
+    await request(app).put('/api/routing/classifier/custom').send({ url: 'https://jev.example.com/v1', model: 'jev-latest', key: 'k', extra: true }).expect(200);
+    expect(runtime.setCustomEndpoint).toHaveBeenCalledWith({ url: 'https://jev.example.com/v1', model: 'jev-latest', key: 'k' });
+    await request(app).delete('/api/routing/classifier/custom').expect(200);
+    expect(runtime.clearCustomEndpoint).toHaveBeenCalled();
   });
 
 });

@@ -11,15 +11,17 @@ const checkResponseSchema = z.object({
 export type UpdateGuestErrorCode =
   | 'not-git'
   | 'clone-failed'
+  | 'clone-auth-failed'
   | 'invalid-manifest'
   | 'missing-build'
   | 'host-too-old'
+  | 'enterprise-mode'
   | 'swap-failed'
   | 'not-found'
   | 'failed';
 
 const updateErrorSchema = z.object({
-  error: z.enum(['not-git', 'clone-failed', 'invalid-manifest', 'missing-build', 'host-too-old', 'swap-failed', 'not-found']),
+  error: z.enum(['not-git', 'clone-failed', 'clone-auth-failed', 'invalid-manifest', 'missing-build', 'host-too-old', 'swap-failed', 'not-found', 'enterprise-mode']),
   required: z.string().trim().min(1).max(64).optional(),
 });
 

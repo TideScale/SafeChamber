@@ -2,10 +2,9 @@ import React from 'react';
 import { useSessionUIStore } from '@/sync/session-ui-store';
 import { useUIStore, type ContextPanelMode } from '@/stores/useUIStore';
 import { parseRoute, updateBrowserURL, hasRouteParams } from '@/lib/router';
-import { openSessionFromRoute } from '@/lib/router/openSessionFromRoute';
+import { openSessionLink } from '@/lib/router/openSessionFromRoute';
 import type { RouteState, AppRouteState } from '@/lib/router';
 import { resolveSettingsSlug } from '@/lib/settings/metadata';
-import { isEmbeddedSessionChat } from '@/components/layout/contextPanelEmbeddedChat';
 import { useDirectoryStore } from '@/stores/useDirectoryStore';
 
 /**
@@ -31,18 +30,9 @@ function isVSCodeContext(): boolean {
  * - Web: Full bidirectional sync
  * - Desktop: Full bidirectional sync
  * - VS Code: State-only (no URL updates, reads initial params)
- * - Embedded session-chat iframe (`?ocPanel=session-chat`): No URL updates.
- *   The iframe's session identity is fixed at mount (the parent builds the
- *   src with `sessionId`); in-place subtask navigation must NOT rewrite the
- *   URL, otherwise `ocPanel` (and `directory`/`readOnly`) get stripped and
- *   `isEmbeddedSessionChat()` starts returning false, breaking subsequent
- *   "Open subtask" clicks.
  */
 export function useRouter(): void {
   const isVSCode = React.useMemo(() => isVSCodeContext(), []);
-  // Captured once at mount: the iframe's embedded-ness never changes during
-  // its lifetime (a parent src swap is a full reload).
-  const isEmbeddedChat = React.useMemo(() => isEmbeddedSessionChat(), []);
 
   // Track initialization to avoid duplicate applies
   const initializedRef = React.useRef(false);
@@ -65,9 +55,10 @@ export function useRouter(): void {
       isApplyingRouteRef.current = true;
 
       try {
-        // 1. Apply session first (may trigger async operations)
+        // 1. Apply session first (may trigger async operations); a message
+        // link also asks the session's timeline to show that message.
         if (route.sessionId) {
-          await openSessionFromRoute(route.sessionId);
+          await openSessionLink(route.sessionId, route.messageId);
         }
 
         // 2. Handle settings first because it is a full-screen overlay.
@@ -125,14 +116,14 @@ export function useRouter(): void {
    */
   const syncURLFromState = React.useCallback(
     (options: { replace?: boolean } = {}) => {
-      if (isVSCode || isEmbeddedChat || isApplyingRouteRef.current) {
+      if (isVSCode || isApplyingRouteRef.current) {
         return;
       }
 
       const state = getCurrentAppState();
       updateBrowserURL(state, options);
     },
-    [isVSCode, isEmbeddedChat, getCurrentAppState]
+    [isVSCode, getCurrentAppState]
   );
 
   // Initialize: parse URL and apply route on mount
@@ -144,7 +135,11 @@ export function useRouter(): void {
 
     // Only process if URL has route params
     if (!hasRouteParams()) {
-      // No route params - just set up sync (URL will update when user navigates)
+      // No route params. The launch may already have reopened the last
+      // session (App selects it before this effect runs, so the session
+      // subscription below never sees that change): name it in the URL
+      // without adding a history entry.
+      syncURLFromState({ replace: true });
       return;
     }
 
@@ -158,7 +153,7 @@ export function useRouter(): void {
       // Use the parsed route values instead of an immediate store snapshot so
       // deep links do not briefly normalize `?session=...` back to `/` while
       // the session's directory/message bootstrap is still catching up.
-      if (!isVSCode && !isEmbeddedChat) {
+      if (!isVSCode) {
         updateBrowserURL({
           ...getCurrentAppState(),
           sessionId: route.sessionId ?? useSessionUIStore.getState().currentSessionId,
@@ -168,11 +163,11 @@ export function useRouter(): void {
     };
 
     void initializeRoute();
-  }, [applyRoute, getCurrentAppState, isVSCode, isEmbeddedChat]);
+  }, [applyRoute, getCurrentAppState, isVSCode, syncURLFromState]);
 
   // Subscribe to session changes
   React.useEffect(() => {
-    if (isVSCode || isEmbeddedChat) {
+    if (isVSCode) {
       return;
     }
 
@@ -191,11 +186,11 @@ export function useRouter(): void {
     });
 
     return unsubscribe;
-  }, [isVSCode, isEmbeddedChat, syncURLFromState]);
+  }, [isVSCode, syncURLFromState]);
 
   // Subscribe to UI store changes (view, settings)
   React.useEffect(() => {
-    if (isVSCode || isEmbeddedChat) {
+    if (isVSCode) {
       return;
     }
 
@@ -220,11 +215,11 @@ export function useRouter(): void {
     });
 
     return unsubscribe;
-  }, [isVSCode, isEmbeddedChat, syncURLFromState]);
+  }, [isVSCode, syncURLFromState]);
 
   // Listen for browser back/forward navigation
   React.useEffect(() => {
-    if (typeof window === 'undefined' || isVSCode || isEmbeddedChat) {
+    if (typeof window === 'undefined' || isVSCode) {
       return;
     }
 
@@ -250,5 +245,5 @@ export function useRouter(): void {
     return () => {
       window.removeEventListener('popstate', handlePopState);
     };
-  }, [applyRoute, isVSCode, isEmbeddedChat, setSettingsDialogOpen]);
+  }, [applyRoute, isVSCode, setSettingsDialogOpen]);
 }

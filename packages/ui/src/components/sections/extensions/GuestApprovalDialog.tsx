@@ -20,10 +20,12 @@ const CAPABILITY_ROWS = {
   sessions: { icon: 'git-branch', titleKey: 'settings.extensions.capability.sessions', detailKey: 'settings.extensions.capability.sessions.detail' },
   files: { icon: 'file-text', titleKey: 'settings.extensions.capability.files', detailKey: 'settings.extensions.capability.files.detail' },
   model: { icon: 'sparkling', titleKey: 'settings.extensions.capability.model', detailKey: 'settings.extensions.capability.model.detail' },
+  shells: { icon: 'terminal-box', titleKey: 'settings.extensions.capability.shells', detailKey: 'settings.extensions.capability.shells.detail' },
   conversation: { icon: 'chat-history', titleKey: 'settings.extensions.capability.conversation', detailKey: 'settings.extensions.capability.conversation.detail' },
   filesystem: { icon: 'hard-drive-2', titleKey: 'settings.extensions.capability.filesystem', detailKey: 'settings.extensions.capability.filesystem.detail' },
   service: { icon: 'terminal', titleKey: 'settings.extensions.capability.service', detailKey: 'settings.extensions.capability.service.detail' },
   network: { icon: 'plug', titleKey: 'settings.extensions.capability.network', detailKey: 'settings.extensions.capability.network.detail' },
+  origins: { icon: 'global', titleKey: 'settings.extensions.capability.origins', detailKey: 'settings.extensions.capability.origins.detail' },
 } satisfies Record<GuestCapability, { icon: IconName; titleKey: I18nKey; detailKey: I18nKey }>;
 
 type GuestApprovalDialogProps = {
@@ -43,9 +45,11 @@ export const GuestApprovalDialog: React.FC<GuestApprovalDialogProps> = ({ guest,
   const { t } = useI18n();
   const requested = guest?.capabilities.requested ?? [];
   const filesystemPatterns = guest?.filesystem ?? [];
+  const origins = guest?.origins ?? [];
   const serviceExec = guest?.service?.permissions?.exec ?? [];
   const serviceSockets = guest?.service?.permissions?.sockets ?? [];
   const providesBrowser = serviceProvides(guest?.service, 'browser');
+  const providesSourceControl = serviceProvides(guest?.service, 'source-control');
   const apiOrigin = guest?.integration?.apiOrigin ?? null;
 
   return (
@@ -83,6 +87,13 @@ export const GuestApprovalDialog: React.FC<GuestApprovalDialogProps> = ({ guest,
                       ))}
                     </ul>
                   ) : null}
+                  {capability === 'origins' && origins.length > 0 ? (
+                    <ul className="mt-1 space-y-0.5">
+                      {origins.map((origin) => (
+                        <li key={origin} className="typography-meta break-all font-mono text-foreground">{origin}</li>
+                      ))}
+                    </ul>
+                  ) : null}
                   {capability === 'network' && apiOrigin ? (
                     <p className="typography-meta mt-1 text-foreground">
                       {t('settings.extensions.capability.service.sockets')}{' '}
@@ -104,6 +115,13 @@ export const GuestApprovalDialog: React.FC<GuestApprovalDialogProps> = ({ guest,
                   {capability === 'service' && providesBrowser ? (
                     <p className="typography-meta mt-0.5 text-foreground">
                       {t('settings.extensions.capability.service.providesBrowser')}
+                    </p>
+                  ) : null}
+                  {capability === 'service' && providesSourceControl ? (
+                    <p className="typography-meta mt-0.5 text-foreground">
+                      {t('settings.extensions.capability.service.providesSourceControl', {
+                        label: guest?.sourceControl?.label ?? guest?.name ?? '',
+                      })}
                     </p>
                   ) : null}
                 </div>

@@ -63,7 +63,7 @@ const MAX_POLICY_ENTRIES = 1_000;
 
 const pause = (milliseconds) => new Promise((resolve) => { setTimeout(resolve, milliseconds); });
 
-const unreadableAnswer = (why) => new SpaceError('gatekeeper_answer_unreadable', `The gatekeeper of the space ${why}`);
+const unreadableAnswer = (why) => new SpaceError('gatekeeper_answer_unreadable', `The network filter of the space ${why}`);
 
 /**
  * One field of a journal record, as text and no longer than the host reads. A list or an object
@@ -90,11 +90,11 @@ export function createGatekeeperChannel({ exec, wait = pause, now = Date.now }) 
    */
   const writeProgram = async (spaceId, { bindAddress }) => {
     if (net.isIP(bindAddress) === 0 || bindAddress === '0.0.0.0' || bindAddress === '::') {
-      throw new SpaceError('gatekeeper_address_unknown', 'The address of the gatekeeper on the space\'s network is not known, so its listeners cannot be bound to it.');
+      throw new SpaceError('gatekeeper_address_unknown', 'The address of the network filter on the space\'s network is not known, so its listeners cannot be bound to it.');
     }
     const result = await execInGatekeeper(spaceId, [IMAGE_SH, '-c', WRITE_PROGRAM_SCRIPT, 'sh', bindAddress], { stdin: GATEKEEPER_PROGRAM });
     if (result.code !== 0) {
-      throw new SpaceError('gatekeeper_setup_failed', `Could not store the gatekeeper's program: ${tail(result.stderr) || `exit code ${result.code}`}`);
+      throw new SpaceError('gatekeeper_setup_failed', `Could not store the network filter's program: ${tail(result.stderr) || `exit code ${result.code}`}`);
     }
   };
 
@@ -116,7 +116,7 @@ export function createGatekeeperChannel({ exec, wait = pause, now = Date.now }) 
       }
       // No Docker step was interrupted here, so this must not look like one to a rollback.
       if (EXEC_INTERRUPTED_CODES.includes(error.code)) {
-        throw new SpaceError('gatekeeper_unreachable', `The request to the gatekeeper did not finish in time: ${error.message}`, { curlExitCode: null, execFailed: false });
+        throw new SpaceError('gatekeeper_unreachable', `The request to the network filter did not finish in time: ${error.message}`, { curlExitCode: null, execFailed: false });
       }
       throw error;
     }
@@ -134,7 +134,7 @@ export function createGatekeeperChannel({ exec, wait = pause, now = Date.now }) 
   const command = async (spaceId, path, body, what) => {
     const answer = await request(spaceId, { method: 'POST', path, body: JSON.stringify(body) });
     if (answer.status !== 200) {
-      throw new SpaceError('gatekeeper_refused', `The gatekeeper refused to ${what}: ${tail(answer.body) || `status ${answer.status}`}`, { status: answer.status });
+      throw new SpaceError('gatekeeper_refused', `The network filter refused to ${what}: ${tail(answer.body) || `status ${answer.status}`}`, { status: answer.status });
     }
   };
 
@@ -177,14 +177,15 @@ export function createGatekeeperChannel({ exec, wait = pause, now = Date.now }) 
   /**
    * One grant: a "uses without seeing" credential, whose secret is in the body and so out of every
    * argument list, or an opened domain with no secret and no header, which the window forwards to
-   * as the space sent it.
+   * as the space sent it. `headers` are the provider's own, set on every request beside the
+   * credential; they travel in the body like the secret, and only when there are any.
    */
-  const addGrant = (spaceId, { id, upstream, header = null, secret = null }) => command(
-    spaceId,
-    '/grants',
-    secret === null ? { id, upstream } : { id, upstream, header, secret },
-    `add the grant '${id}'`,
-  );
+  const addGrant = (spaceId, { id, upstream, header = null, secret = null, headers = {} }) => {
+    const body = { id, upstream };
+    if (secret !== null) Object.assign(body, { header, secret });
+    if (Object.keys(headers).length > 0) body.headers = headers;
+    return command(spaceId, '/grants', body, `add the grant '${id}'`);
+  };
 
   /**
    * What the gatekeeper holds now: its mode, its allowlist and the ids of its grants, never a

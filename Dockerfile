@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1
-FROM oven/bun:1.4.2 AS base
+FROM oven/bun:1.4.4 AS base
 WORKDIR /app
 
 FROM base AS deps
@@ -23,7 +23,7 @@ COPY . .
 RUN bun run --cwd packages/sdk build
 RUN bun run build:web
 
-FROM oven/bun:1.4.2 AS runtime
+FROM oven/bun:1.4.4 AS runtime
 WORKDIR /home/openchamber
 
 # Package postinstalls must not try to start services during the build: there
@@ -32,6 +32,7 @@ RUN printf '#!/bin/sh\nexit 101\n' > /usr/sbin/policy-rc.d && chmod +x /usr/sbin
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
   bash \
+  bzip2 \
   ca-certificates \
   curl \
   # >>> docker-in-docker (sysbox): the inner daemon needs iptables to build
@@ -103,7 +104,7 @@ ENV PATH=${NPM_CONFIG_PREFIX}/bin:${PATH}
 
 RUN npm config set prefix /home/openchamber/.npm-global && mkdir -p /home/openchamber/.npm-global && \
   mkdir -p /home/openchamber/.local /home/openchamber/.config /home/openchamber/.ssh && \
-  npm install -g @opencode/cli@2.0.18
+  npm install -g @opencode/cli@2.1.4
 
 # cloudflared 2026.3.0 - update digest explicitly when upgrading
 COPY --from=cloudflare/cloudflared@sha256:6d91c121b803126f7a5344005d17a9324788fc09d305b6e2560ec6040a7ae283 /usr/local/bin/cloudflared /usr/local/bin/cloudflared

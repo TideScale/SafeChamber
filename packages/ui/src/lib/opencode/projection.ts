@@ -13,6 +13,7 @@ import type {
   Project as ProjectWire,
   PromptFileAttachment,
   VcsInfo,
+  SessionInboxSyntheticPayload,
   SessionInboxUserPayload,
   SessionInfo,
   SessionMessageAssistant,
@@ -35,9 +36,11 @@ import {
   type Session,
   type ToolPart,
   type ToolState,
+  type SyntheticMessage,
   type UserMessage,
   type Vcs,
 } from "./model"
+import { formatModelSelection, parseModelSelection } from "../modelIdentifier"
 
 /** One item of an assistant message's ordered content. */
 export type AssistantContentItem = SessionMessageAssistant["content"][number]
@@ -196,18 +199,23 @@ export function projectAssistantContent(
   const parts: Part[] = []
   let textOrdinal = 0
   let reasoningOrdinal = 0
-  for (const item of content) {
+  for (const [index, item] of content.entries()) {
     switch (item.type) {
       case "text": {
         const ordinal = textOrdinal
         textOrdinal += 1
+        // A text item that something else follows is finished even while the
+        // message is still open (the model moved on to a tool such as a
+        // question). Sealing it keeps its last line visible after a reload,
+        // the same as the live text-ended event does.
+        const followed = index < content.length - 1
         parts.push({
           id: partIds.text(owner.messageID, ordinal),
           sessionID: owner.sessionID,
           messageID: owner.messageID,
           type: "text",
           text: item.text,
-          time: compact({ start: owner.created, end: owner.completed }),
+          time: compact({ start: owner.created, end: owner.completed ?? (followed ? owner.created : undefined) }),
         })
         break
       }
@@ -259,6 +267,50 @@ function projectAssistantMessage(info: SessionMessageAssistant, sessionID: strin
 function fileAttachmentUrl(file: PromptFileAttachment): string {
   if (file.source.type === "uri") return file.source.uri
   return `data:${file.mime};base64,${file.data}`
+}
+
+/** The inbox items that stand for a message; control items carry no payload we read. */
+export type InboxMessageItem =
+  | { type: "user"; payload: SessionInboxUserPayload }
+  | { type: "synthetic"; payload: SessionInboxSyntheticPayload }
+  | { type: "compaction" | "move" }
+
+/**
+ * The message an inbox item stands for, as `session.inbox.enqueued` paints it
+ * live and a cold load repaints it from the pending inbox. Null for control
+ * items (compaction, move), which paint nothing.
+ */
+export function projectInboxMessage(
+  item: InboxMessageItem,
+  owner: { sessionID: string; messageID: string; created: number },
+): { info: UserMessage | SyntheticMessage; parts: Part[] | null } | null {
+  if (item.type === "user") {
+    return {
+      info: compact({
+        id: owner.messageID,
+        sessionID: owner.sessionID,
+        role: "user",
+        time: { created: owner.created },
+        metadata: item.payload.metadata,
+      }),
+      parts: projectUserParts(item.payload, owner),
+    }
+  }
+  if (item.type === "synthetic") {
+    return {
+      info: compact({
+        id: owner.messageID,
+        sessionID: owner.sessionID,
+        role: "synthetic",
+        time: { created: owner.created },
+        text: item.payload.text,
+        description: item.payload.description,
+        metadata: item.payload.metadata,
+      }),
+      parts: null,
+    }
+  }
+  return null
 }
 
 /**
@@ -449,7 +501,15 @@ export function projectMessage(info: SessionMessageInfo, sessionID: string): Pro
       }
     case "idle":
       return {
-        message: compact({ id: info.id, sessionID, role: "idle", time: { ...info.time }, outcome: info.outcome, metadata }),
+        message: compact({
+          id: info.id,
+          sessionID,
+          role: "idle",
+          time: { ...info.time },
+          outcome: info.outcome,
+          error: info.error,
+          metadata,
+        }),
         parts: [],
       }
   }
@@ -491,8 +551,98 @@ export function mergeConfigDocuments(entries: readonly ConfigEntry[]): Config {
   return merged as Config
 }
 
+/**
+ * A document's policy statements. OpenCode 2.0.29 serves them as top-level
+ * `policies`; older servers keep them under `experimental.policies`. Same
+ * order as upstream's merge, the experimental ones first.
+ */
+function documentPolicies(entry: ConfigDocument) {
+  return [...(entry.info.experimental?.policies ?? []), ...(entry.info.policies ?? [])]
+}
+
+/**
+ * Whether any config document denies a provider through a `provider.use`
+ * policy. Read per document: the folded config keeps only the last
+ * document's policies, and policies from every layer apply. Statements
+ * from a connected OpenCode Console workspace are not part of `/api/config`.
+ */
+export function deniesAnyProvider(entries: readonly ConfigEntry[]): boolean {
+  return entries.some((entry) => isDocument(entry)
+    && documentPolicies(entry).some((policy) => policy.action === "provider.use" && policy.effect === "deny"))
+}
+
+/**
+ * One `integration.use` statement: `resource` is `mcp:<server>` or `skill:<id>`,
+ * with `*` and `?` wildcards; `path` is the config file it is written in, null
+ * for config that has no file.
+ */
+export type IntegrationPolicy = { resource: string; effect: "allow" | "deny"; path: string | null }
+
+/**
+ * The `integration.use` statements of every config document, in the order
+ * OpenCode decides by (`ManagedPolicy.statements` upstream): documents
+ * reversed, so the last matching statement wins. Statements from a connected
+ * OpenCode Console workspace are not part of `/api/config`.
+ */
+export function readIntegrationPolicies(entries: readonly ConfigEntry[]): IntegrationPolicy[] {
+  return entries
+    .filter(isDocument)
+    .reverse()
+    .flatMap((entry) => documentPolicies(entry)
+      .flatMap((policy) => (policy.action === "integration.use"
+        ? [{ resource: policy.resource, effect: policy.effect, path: entry.path ?? null }]
+        : [])))
+}
+
+/** OpenCode's `Wildcard.match`: `*` is any run, `?` one character, a trailing ` *` also matches nothing. */
+function matchesWildcard(input: string, pattern: string): boolean {
+  let escaped = pattern
+    .replaceAll("\\", "/")
+    .replace(/[.+^${}()|[\]\\]/g, "\\$&")
+    .replace(/\*/g, ".*")
+    .replace(/\?/g, ".")
+  if (escaped.endsWith(" .*")) escaped = `${escaped.slice(0, -3)}( .*)?`
+  return new RegExp(`^${escaped}$`, "s").test(input.replaceAll("\\", "/"))
+}
+
+/** The statement that decides an MCP server (`mcp:<name>`) or skill (`skill:<id>`), or null when none matches. */
+export function findIntegrationPolicy(policies: readonly IntegrationPolicy[], resource: string): IntegrationPolicy | null {
+  for (let index = policies.length - 1; index >= 0; index -= 1) {
+    if (matchesWildcard(resource, policies[index].resource)) return policies[index]
+  }
+  return null
+}
+
+/** Whether OpenCode drops this MCP server (`mcp:<name>`) or skill (`skill:<id>`) by policy. */
+export function isIntegrationDenied(policies: readonly IntegrationPolicy[], resource: string): boolean {
+  return findIntegrationPolicy(policies, resource)?.effect === "deny"
+}
+
 function isPlainRecord(value: Config[keyof Config]): value is Record<string, JsonValue> {
   return Object.prototype.toString.call(value) === "[object Object]"
+}
+
+/** A JSON representation probe, mirroring `isPlainRecord`; `typeof` is banned by the anti-slop rule. */
+const isStringValue = (value: Config["model"]): value is string =>
+  Object.prototype.toString.call(value) === "[object String]"
+
+/**
+ * Config `model` arrives as `provider/model[#variant]` or the explicit
+ * `{ providerID, model, variant }` form OpenCode 2 decodes it into. Fold both
+ * to the identifier spelling the stores parse.
+ */
+export function configModelIdentifier(value: Config["model"]): string | undefined {
+  if (isStringValue(value)) {
+    return formatModelSelection(parseModelSelection(value)) ?? undefined
+  }
+  if (!value) {
+    return undefined
+  }
+  return formatModelSelection({
+    providerID: value.providerID,
+    modelID: value.model,
+    variant: value.variant,
+  }) ?? undefined
 }
 
 /** See `Agent` in `./model`: the wire `name` is display-only; `id` is the key the server expects back. */

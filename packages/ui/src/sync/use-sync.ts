@@ -12,7 +12,7 @@ import {
   useSyncRuntime,
   resyncBlockingRequestsForDirectory,
   buildSessionMessageRecordsSnapshot,
-  recoverInterruptedTurnAfterMessageLoad,
+  markRecordedInterruptedTurn,
 } from "./sync-context"
 import { stripSessionDiffSnapshots } from "./sanitize"
 import { getSessionMaterializationStatus } from "./materialization"
@@ -109,7 +109,10 @@ export function useSync() {
       const cachedReady = materialization.hasMessages && materialization.renderable
       const hasSession = Binary.search(current.session, sessionID, (s) => s.id).found
       if (cachedReady && hasSession && !force) {
-        await recoverInterruptedTurnAfterMessageLoad(targetDirectory, targetStore, sessionID, isStale)
+        if (!isStale()) markRecordedInterruptedTurn(targetStore, sessionID)
+        // Renders from cache; a transcript a stream gap left unconfirmed
+        // refreshes its tail in the background.
+        messageLoader.revalidateIfStale({ directory: targetDirectory, sessionID })
         return
       }
       const shouldLoadMessages = Boolean(!cachedReady || force)
@@ -140,7 +143,7 @@ export function useSync() {
                   { force, reason: "reactive" },
                 )
                 if (!isStale()) {
-                  await recoverInterruptedTurnAfterMessageLoad(targetDirectory, targetStore, sessionID, isStale)
+                  markRecordedInterruptedTurn(targetStore, sessionID)
                 }
               })()
             : Promise.resolve(),

@@ -28,7 +28,7 @@ export interface TerminalChunk {
  * frequency. Keeping it here leaves tab metadata referentially stable, so
  * output cannot rerender the tab strip or rewrite the persisted snapshot.
  */
-export type TerminalBuffer = {
+type TerminalBuffer = {
   chunks: TerminalChunk[];
   byteLength: number;
   lastSequence: number;
@@ -66,7 +66,7 @@ export type TerminalTab = {
   previewUrlLocked: boolean;
 };
 
-export type DirectoryTerminalState = {
+type DirectoryTerminalState = {
   tabs: TerminalTab[];
   activeTabId: string | null;
 };
@@ -100,6 +100,8 @@ interface TerminalStore {
   reconcileServerSessions: (directory: string, serverSessions: TerminalServerSession[], options?: ReconcileServerSessionsOptions) => void;
   setActiveTab: (directory: string, tabId: string) => void;
   setTabLabel: (directory: string, tabId: string, label: string) => void;
+  /** Moves `tabId` to the position `overTabId` holds, shifting the tabs between. */
+  moveTab: (directory: string, tabId: string, overTabId: string) => void;
   setTabIconKey: (directory: string, tabId: string, iconKey: string | null) => void;
   closeTab: (directory: string, tabId: string) => void;
 
@@ -516,6 +518,22 @@ export const useTerminalStore = create<TerminalStore>()(
                 if (matchIndex < 0) {
                   matchIndex = actionMatchIndex;
                 }
+                // A listing taken after a new run was allocated, but before the
+                // server holds its session, still shows the action's last,
+                // finished run. That run says nothing about the one starting;
+                // adopting it would cancel the start without a word.
+                const target = matchIndex >= 0 ? tabs[matchIndex]! : null;
+                if (
+                  target
+                  && session.status !== 'running'
+                  && target.lifecycle === 'starting'
+                  && isProjectActionPurpose(target.purpose)
+                  && target.purpose.executionId !== null
+                  && target.purpose.executionId !== sessionPurpose.executionId
+                ) {
+                  matchedTabIds.add(target.id);
+                  continue;
+                }
               }
 
               const nextPurpose: TerminalTabPurpose = sessionPurpose?.type === 'project-action'
@@ -708,6 +726,24 @@ export const useTerminalStore = create<TerminalStore>()(
               ...existing,
               tabs: nextTabs,
             });
+            return { sessions: newSessions };
+          });
+        },
+
+        moveTab: (directory: string, tabId: string, overTabId: string) => {
+          const key = normalizeDirectory(directory);
+          set((state) => {
+            const existing = state.sessions.get(key);
+            if (!existing || tabId === overTabId) return state;
+            const from = findTabIndex(existing, tabId);
+            const to = findTabIndex(existing, overTabId);
+            if (from < 0 || to < 0) return state;
+
+            const nextTabs = [...existing.tabs];
+            const [moved] = nextTabs.splice(from, 1);
+            nextTabs.splice(to, 0, moved);
+            const newSessions = new Map(state.sessions);
+            newSessions.set(key, { ...existing, tabs: nextTabs });
             return { sessions: newSessions };
           });
         },

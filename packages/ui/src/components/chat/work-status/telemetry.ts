@@ -22,6 +22,7 @@ type CompletedStepStats = {
 export type CompletedTurnStats = {
   lastAssistantMessageId: string;
   stepsCount: number;
+  elapsedDurationMs: number | null;
   totalLlmDurationMs: number | null;
   totalToolDurationMs: number | null;
   avgTtftMs: number | null;
@@ -79,12 +80,17 @@ export const formatTelemetryDuration = (ms: number): string => {
   if (!Number.isFinite(ms) || ms <= 0) {
     return '0.0s';
   }
+  // 1–49ms rounds to 0.0s at one decimal. That is a real wait, not zero.
+  if (ms < 50) {
+    return '<0.1s';
+  }
   if (ms < 60_000) {
     return `${(ms / 1000).toFixed(1)}s`;
   }
-  const minutes = Math.floor(ms / 60_000);
-  const seconds = Math.floor((ms % 60_000) / 1000);
-  return `${minutes}m${seconds}s`;
+  const totalSeconds = Math.round(ms / 1000);
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  return `${minutes}m ${seconds}s`;
 };
 
 export const formatTelemetryTokens = (tokens: number): string => {
@@ -141,6 +147,11 @@ function calculateResponseTokenRate(record: SessionMessageRecord): number | null
   const { created, completed } = info.time;
   if (output === null || completed === undefined || nonnegative(created) === null || nonnegative(completed) === null) return null;
 
+  // Stored text carries no timing; a reload stamps it with the step's own
+  // `created` and `completed`. A start at `created` is that stamp, not a
+  // measured first token. Dividing by it counted the initial wait and
+  // reasoning, so the same turn read ~94 tok/s live and ~55 after a reload
+  // (#5465). Unknown hides the row, as for TTFT.
   const intervals: Array<[number, number]> = [];
   for (const part of parts) {
     if (part.type !== 'text') continue;
@@ -148,7 +159,7 @@ function calculateResponseTokenRate(record: SessionMessageRecord): number | null
     const start = part.time?.start;
     const end = part.time?.end;
     if (start === undefined || end === undefined || !Number.isFinite(start) || !Number.isFinite(end)
-      || start < created || end > completed || end <= start) return null;
+      || start <= created || end > completed || end <= start) return null;
     intervals.push([start, end]);
   }
   return tokenRate(output, sumIntervalsDuration(mergeTimeIntervals(intervals)));
@@ -192,12 +203,16 @@ function calculateCompletedStepStats(record: SessionMessageRecord): CompletedSte
     ? nonnegative(totalDurationMs - toolDurationMs)
     : null;
 
-  // Measure TTFT from first text or reasoning part start timestamp
+  // Wait until the first text or reasoning part that starts after the step
+  // was created. A start equal to `created` is the creation stamp copied onto
+  // the part, not a measured first token. Counting it made tool-heavy turns
+  // show Average TTFT 0.0s. Leaving it unset hides the row, same as a missing
+  // timestamp.
   let ttftMs: number | null = null;
   for (const part of parts) {
     if (part.type === 'text' || part.type === 'reasoning') {
       const partStart = part.time?.start;
-      if (validWindow && partStart !== undefined && Number.isFinite(partStart) && partStart >= created && partStart <= completed) {
+      if (validWindow && partStart !== undefined && Number.isFinite(partStart) && partStart > created && partStart <= completed) {
         const delta = partStart - created;
         ttftMs = ttftMs === null ? delta : Math.min(ttftMs, delta);
       }
@@ -245,7 +260,8 @@ export function getLatestCompletedTurnStats(
     }
   }
   if (lastCompletedAssistantIdx < 0) return null;
-  if (records[lastCompletedAssistantIdx].info.role !== 'assistant') return null;
+  const lastAssistantInfo = records[lastCompletedAssistantIdx].info;
+  if (lastAssistantInfo.role !== 'assistant') return null;
   let turnStartIdx = -1;
   for (let i = records.length - 1; i >= 0; i -= 1) {
     const record = records[i];
@@ -256,6 +272,13 @@ export function getLatestCompletedTurnStats(
   }
 
   if (turnStartIdx === -1) return null;
+
+  const turnStartMs = nonnegative(records[turnStartIdx - 1].info.time.created);
+  const turnEndMs = nonnegative(lastAssistantInfo.time.completed);
+  const elapsedDurationMs =
+    turnStartMs !== null && turnEndMs !== null && turnEndMs >= turnStartMs
+      ? turnEndMs - turnStartMs
+      : null;
 
   const stepStatsList: CompletedStepStats[] = [];
   for (let i = turnStartIdx; i <= lastCompletedAssistantIdx; i += 1) {
@@ -306,6 +329,7 @@ export function getLatestCompletedTurnStats(
   return {
     lastAssistantMessageId: records[lastCompletedAssistantIdx].info.id,
     stepsCount: stepStatsList.length,
+    elapsedDurationMs,
     totalLlmDurationMs,
     totalToolDurationMs,
     avgTtftMs,

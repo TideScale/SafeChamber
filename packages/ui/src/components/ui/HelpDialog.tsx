@@ -155,6 +155,11 @@ export const HelpDialog: React.FC = () => {
           icon: "close-circle",
           keys: '',
         },
+        {
+          id: 'background_session_work',
+          icon: 'arrow-up-double',
+          keys: '',
+        },
       ],
     },
     {
@@ -199,6 +204,18 @@ export const HelpDialog: React.FC = () => {
           id: 'toggle_services_menu',
           descriptionKey: 'helpDialog.item.toggleServicesMenu',
           icon: "stack",
+          keys: '',
+        },
+        {
+          id: 'toggle_source_board',
+          descriptionKey: 'helpDialog.item.toggleSourceBoard',
+          icon: "git-pull-request",
+          keys: '',
+        },
+        {
+          id: 'open_project_actions',
+          descriptionKey: 'helpDialog.item.openProjectActions',
+          icon: "play",
           keys: '',
         },
         {
@@ -259,7 +276,7 @@ export const HelpDialog: React.FC = () => {
                           {t('helpDialog.keyCombiner.or')}
                         </span>
                       )}
-                      <kbd className="inline-flex items-center gap-1 px-1.5 py-0.5 typography-meta font-mono bg-muted rounded border border-border/20">
+                      <kbd className="inline-flex items-center gap-1 px-1.5 py-0.5 typography-meta bg-muted rounded border border-border/20">
                         {keyCombo}
                       </kbd>
                     </React.Fragment>
@@ -287,7 +304,7 @@ export const HelpDialog: React.FC = () => {
 
         <ScrollableOverlay
           outerClassName="flex-1 min-h-0 mt-3"
-          className="pr-1"
+          className="pe-1"
           disableHorizontal
         >
           <div className="grid grid-cols-1 gap-x-12 gap-y-4 lg:grid-cols-2">

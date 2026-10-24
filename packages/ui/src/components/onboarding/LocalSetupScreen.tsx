@@ -8,6 +8,7 @@ import { copyTextToClipboard } from '@/lib/clipboard';
 import { restartDesktopApp } from '@/lib/desktop';
 import { useI18n } from '@/lib/i18n';
 import { runtimeFetch } from '@/lib/runtime-fetch';
+import { useEnterprisePolicyStore } from '@/stores/useEnterprisePolicyStore';
 
 const INSTALL_COMMAND = 'curl -fsSL https://opencode.ai/v2/install | bash';
 const WINDOWS_INSTALL_COMMAND = 'npm install -g @opencode/cli';
@@ -29,7 +30,7 @@ type LocalSetupScreenProps = {
 function InstallCommand({ windows, onCopy, copyTitle }: { windows: boolean; onCopy: () => void; copyTitle: string }) {
   return (
     <div className="flex items-center justify-center gap-3">
-      <code className="flex-1 min-w-0 text-left overflow-x-auto whitespace-nowrap">
+      <code className="flex-1 min-w-0 text-start overflow-x-auto whitespace-nowrap">
         {windows ? (
           <span style={{ color: 'var(--syntax-keyword)' }}>{WINDOWS_INSTALL_COMMAND}</span>
         ) : (
@@ -70,6 +71,8 @@ export function LocalSetupScreen({
   const [isChecking, setIsChecking] = React.useState(false);
   const [checkError, setCheckError] = React.useState<string | null>(null);
   const [opencodeBinary, setOpencodeBinary] = React.useState('');
+  // The server ignores the user's path while the administrator pins one.
+  const pinnedBinary = useEnterprisePolicyStore((state) => state.opencodeBinary);
   const [platform, setPlatform] = React.useState<OnboardingPlatform>('unknown');
 
   React.useEffect(() => {
@@ -241,9 +244,9 @@ export function LocalSetupScreen({
         </div>
 
         {platform === 'windows' && (
-          <div className="mx-auto max-w-2xl rounded-lg border border-border bg-background/50 p-4 text-left">
+          <div className="mx-auto max-w-2xl rounded-lg border border-border bg-background/50 p-4 text-start">
             <div className="text-sm text-foreground">{t('onboarding.localSetup.windows.title')}</div>
-            <ol className="mt-2 list-decimal space-y-1 pl-5 text-sm text-muted-foreground">
+            <ol className="mt-2 list-decimal space-y-1 ps-5 text-sm text-muted-foreground">
               <li>{t('onboarding.localSetup.windows.stepRunInstallInWsl')}</li>
               <li>{t('onboarding.localSetup.windows.stepSetBinaryPath')}</li>
             </ol>
@@ -300,29 +303,35 @@ export function LocalSetupScreen({
             <div className="text-sm text-muted-foreground">{t('onboarding.localSetup.field.alreadyInstalled')}</div>
             <div className="flex gap-2">
               <Input
-                value={opencodeBinary}
+                value={pinnedBinary ?? opencodeBinary}
                 onChange={(e) => setOpencodeBinary(e.target.value)}
                 placeholder={binaryPlaceholder}
-                disabled={isRetrying}
+                disabled={isRetrying || pinnedBinary !== null}
                 className="flex-1 font-mono text-xs"
               />
-              <Button
-                type="button"
-                variant="secondary"
-                onClick={handleBrowse}
-                disabled={isRetrying || !isDesktopApp}
-              >
-                {t('onboarding.localSetup.actions.browse')}
-              </Button>
-              <Button
-                type="button"
-                onClick={handleApplyPath}
-                disabled={isRetrying}
-              >
-                {t('onboarding.localSetup.actions.apply')}
-              </Button>
+              {pinnedBinary === null && (
+                <>
+                  <Button
+                    type="button"
+                    variant="secondary"
+                    onClick={handleBrowse}
+                    disabled={isRetrying || !isDesktopApp}
+                  >
+                    {t('onboarding.localSetup.actions.browse')}
+                  </Button>
+                  <Button
+                    type="button"
+                    onClick={handleApplyPath}
+                    disabled={isRetrying}
+                  >
+                    {t('onboarding.localSetup.actions.apply')}
+                  </Button>
+                </>
+              )}
             </div>
-            <div className="text-xs text-muted-foreground/70">{t('onboarding.localSetup.helper.saveAndReload')}</div>
+            <div className="text-xs text-muted-foreground/70">
+              {t(pinnedBinary === null ? 'onboarding.localSetup.helper.saveAndReload' : 'onboarding.localSetup.helper.pinnedByAdministrator')}
+            </div>
           </div>
         </div>
 
@@ -342,7 +351,7 @@ export function LocalSetupScreen({
       </div>
 
       {showHint && (
-        <div className="absolute bottom-8 left-0 right-0 text-center space-y-1">
+        <div className="absolute bottom-8 inset-s-0 inset-e-0 text-center space-y-1">
           {platform === 'windows' ? (
             <>
               <p className="text-sm text-muted-foreground/70">

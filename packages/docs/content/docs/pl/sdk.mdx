@@ -110,13 +110,13 @@ Rysowanie panelu i odczyt bieżącej sesji nie wymagają żadnej zgody. Wszystko
 | `files` | odczyt i zapis plików w otwartym projekcie (`readFile`, `writeFile`, `listDir`, `stat` ze ścieżką względną) |
 | `model` | jednorazowe generowanie tekstu za pomocą Small Model użytkownika (`generate`), poza jakąkolwiek sesją |
 
-Cztery kolejne są dodawane automatycznie: `network`, gdy deklarujesz `integration`, `service`, gdy deklarujesz `service`, `filesystem`, gdy deklarujesz wzorce `filesystem`, oraz `conversation`, gdy akcja sesji prosi o wiadomości (zobacz [Akcje, polecenia i odznaka](#akcje-polecenia-i-odznaka)).
+Pięć kolejnych jest dodawanych automatycznie: `network`, gdy deklarujesz `integration`, `service`, gdy deklarujesz `service`, `filesystem`, gdy deklarujesz wzorce `filesystem`, `origins`, gdy deklarujesz `origins`, oraz `conversation`, gdy akcja sesji prosi o wiadomości (zobacz [Akcje, polecenia i odznaka](#akcje-polecenia-i-odznaka)).
 
 Użytkownik widzi pełną listę raz, przy instalacji rozszerzenia, i albo ją zatwierdza, albo usuwa rozszerzenie. Jeśli nowa wersja prosi o więcej, okno pojawia się ponownie. Wywołanie, które wymaga niezatwierdzonego uprawnienia, kończy się błędem `NOT_GRANTED`.
 
 ## Generowanie tekstu
 
-Dzięki uprawnieniu `model` `host.generate` prosi Small Model użytkownika o jednorazową odpowiedź: podsumowanie, tytuł, szkic. Nic nie trafia do sesji, historia nie jest zapisywana, a rozszerzenie nigdy nie wybiera dostawcy. OpenChamber używa tego samego modelu, którego używa do własnej pracy w tle, wybranego w Ustawienia → Sesje → Small Model, albo dobieranego automatycznie spośród dostawców, do których użytkownik jest zalogowany.
+Dzięki uprawnieniu `model` `host.generate` prosi Small Model użytkownika o jednorazową odpowiedź: podsumowanie, tytuł, szkic. Nic nie trafia do sesji, historia nie jest zapisywana, a rozszerzenie nigdy nie wybiera dostawcy. OpenChamber używa tego samego modelu, którego używa do własnej pracy w tle, wybranego w Ustawienia → Sesje → Small Model, albo małego modelu dostawcy, z którym użytkownik akurat pracuje, albo domyślnego modelu z jego konfiguracji OpenCode.
 
 ```ts
 const { text } = await host.generate({
@@ -130,7 +130,19 @@ Gdy żaden model nie jest dostępny, wywołanie kończy się błędem `NO_MODEL`
 
 ## Konta i sieć
 
-Twoja strona działa w sandboxie i nie może sama łączyć się z internetem. Zadeklaruj `integration`, a OpenChamber wykona wywołania za Ciebie przez `host.request`, dołączając token użytkownika. Token nigdy nie trafia do Twojej strony.
+Twoja strona działa w sandboxie i nie może sama łączyć się z siecią: skrypty, style, obrazy, czcionki i multimedia ładują się tylko z Twojego pakietu, a `fetch` sięga tylko do plików Twojego pakietu. Dołącz czcionki i obrazy do pakietu, zamiast ładować je z CDN.
+
+Aby rozmawiać z zewnętrzną usługą, zadeklaruj `integration`, a OpenChamber wykona wywołania za Ciebie przez `host.request`, dołączając token użytkownika. Token nigdy nie trafia do Twojej strony.
+
+Dla wszystkiego innego, czego Twoja strona potrzebuje bezpośrednio, np. czcionek lub obrazów z CDN albo publicznego API, wymień do 8 originów https:
+
+```json
+"origins": ["https://fonts.example.com"]
+```
+
+Użytkownik widzi je w oknie zatwierdzania jako adresy, do których Twoje rozszerzenie może wysyłać dane i z których może je odbierać, i zatwierdza je ponownie, gdy aktualizacja doda nowy. Zatwierdzone originy są otwarte dla `fetch`, obrazów, czcionek, stylów i multimediów, ale nigdy dla skryptów: kod musi być dostarczony w Twoim pakiecie. Origin strony to `null`, więc aby odczytać odpowiedź `fetch`, serwer musi zezwolić na CORS dla tego originu.
+
+W [trybie enterprise](/security/) rozszerzenie z `origins`, `integration` albo `service` instaluje się tylko z repozytorium Git, które administrator umieścił na liście. Jeśli Twoje rozszerzenie może działać bez nich, takie zespoły nadal mogą je zainstalować. Aby tworzyć rozszerzenie na takiej maszynie, poproś administratora o `allowLocalExtensions`, dzięki czemu zainstalujesz je z jego folderu.
 
 - `token`: użytkownik wkleja token API na karcie w Ustawienia → Integracje. `apiOrigin` to jedyny origin, który `request` może wywołać. `account` jest opcjonalne: ścieżka GET i nazwa pola, żeby karta mogła pokazać, kto jest podłączony. `scheme` określa, jak token jest wysyłany; zobacz tabelę poniżej. Sprawdź w dokumentacji API dostawcy, jakiego nagłówka oczekuje.
 - `oauth`: użytkownik wkleja client id, a OpenChamber przeprowadza proces autoryzacji. Wymaga `authorizeUrl`, `tokenUrl` i `apiOrigin`.

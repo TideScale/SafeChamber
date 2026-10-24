@@ -1,14 +1,16 @@
+import { useChatSessionSelection } from '@/components/chat/chatColumnSession';
 import { useDirectoryStore } from '@/stores/useDirectoryStore';
 import { useProjectsStore } from '@/stores/useProjectsStore';
 import { useSessionUIStore } from '@/sync/session-ui-store';
 import { useSessionWorktreeStore } from '@/sync/session-worktree-store';
 import { getAttachedSessionDirectory } from '@/sync/session-worktree-contract';
-import { useSessions } from '@/sync/sync-context';
-import type { Session } from '@/lib/opencode/model';
+import { useSessionDirectory } from '@/sync/sync-context';
 
 export const useChatSearchDirectory = (): string | undefined => {
-  const currentSessionId = useSessionUIStore((state) => state.currentSessionId);
-  const sessions = useSessions();
+  // Inside a chat the session is its column's, so a chat pinned in the side
+  // panel searches its own session's project.
+  const { sessionId: currentSessionId, directory: currentSessionDirectory } = useChatSessionSelection();
+  const currentSessionOwnDirectory = useSessionDirectory(currentSessionId, currentSessionDirectory ?? undefined);
   const worktreeAttachment = useSessionWorktreeStore((state) =>
     currentSessionId ? state.getAttachment(currentSessionId) : undefined
   );
@@ -30,10 +32,8 @@ export const useChatSearchDirectory = (): string | undefined => {
       return worktreeMetadata.path;
     }
 
-    type SessionWithDirectory = Session & { directory?: string };
-    const currentSession = sessions.find((session) => session.id === currentSessionId) as SessionWithDirectory | undefined;
-    if (currentSession?.directory) {
-      return currentSession.directory;
+    if (currentSessionOwnDirectory) {
+      return currentSessionOwnDirectory;
     }
   }
 

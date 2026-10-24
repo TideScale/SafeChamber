@@ -1,9 +1,10 @@
-import type { Session } from '@/lib/opencode/model';
 import React from 'react';
 import type { SessionNode } from '../types';
 import { useGlobalSessionStatusStore } from '@/sync/global-session-status';
 import { useGlobalBlockingRequestsStore } from '@/sync/global-blocking-requests';
-import { useNotificationStore } from '@/sync/notification-store';
+import { useBackgroundShellsStore } from '@/sync/background-shells';
+import { useGlobalSessionsStore } from '@/stores/useGlobalSessionsStore';
+import { isSessionUnread } from '@/sync/session-unread';
 
 // Ordered by how much the user is needed: a blocked turn outranks a running
 // one, which outranks something merely unread.
@@ -22,19 +23,17 @@ const getSessionNodeActivityState = (
   node: SessionNode,
   activeSessionIds: Set<string>,
   unreadSessionIds: Set<string>,
-  includeUnreadSubtasks: boolean,
 ): CollapsedActivityState => {
   if (activeSessionIds.has(node.session.id)) return 'active';
 
   let state: CollapsedActivityState = null;
-  // SAFETY: SessionNode sessions are SDK Session records; parentID is the optional hierarchy field.
-  const isSubtask = Boolean((node.session as Session & { parentID?: string | null }).parentID);
-  if (unreadSessionIds.has(node.session.id) && (includeUnreadSubtasks || !isSubtask)) state = 'unread';
+  // A subtask is never unread on its own; its parent carries the mark.
+  if (unreadSessionIds.has(node.session.id) && !node.session.parentID) state = 'unread';
 
   for (const child of node.children) {
     state = mergeCollapsedActivityStates(
       state,
-      getSessionNodeActivityState(child, activeSessionIds, unreadSessionIds, includeUnreadSubtasks),
+      getSessionNodeActivityState(child, activeSessionIds, unreadSessionIds),
     );
     if (state === 'active') return state;
   }
@@ -46,13 +45,12 @@ export const getSessionNodesActivityState = (
   nodes: SessionNode[],
   activeSessionIds: Set<string>,
   unreadSessionIds: Set<string>,
-  includeUnreadSubtasks: boolean,
 ): CollapsedActivityState => {
   let state: CollapsedActivityState = null;
   for (const node of nodes) {
     state = mergeCollapsedActivityStates(
       state,
-      getSessionNodeActivityState(node, activeSessionIds, unreadSessionIds, includeUnreadSubtasks),
+      getSessionNodeActivityState(node, activeSessionIds, unreadSessionIds),
     );
     if (state === 'active') return state;
   }
@@ -61,15 +59,18 @@ export const getSessionNodesActivityState = (
 
 type SessionActivityProps = {
   nodes: readonly SessionNode[];
-  includeUnreadSubtasks: boolean;
+  // Sessions not present as nodes whose pending requests still count, such as
+  // the hidden subagents of timeline rows.
+  blockingSessionIds?: readonly string[];
 };
 
-const collectActivityIds = (nodes: readonly SessionNode[], includeUnreadSubtasks: boolean) => {
+/** Every session in the hidden subtrees, and the top-level ones among them: only those can be unread. */
+const collectActivityIds = (nodes: readonly SessionNode[]) => {
   const active = new Set<string>();
   const unread = new Set<string>();
   const visit = (node: SessionNode, isSubtask: boolean): void => {
     active.add(node.session.id);
-    if (!isSubtask || includeUnreadSubtasks) unread.add(node.session.id);
+    if (!isSubtask) unread.add(node.session.id);
     node.children.forEach((child) => visit(child, true));
   };
   nodes.forEach((node) => visit(node, false));
@@ -78,10 +79,14 @@ const collectActivityIds = (nodes: readonly SessionNode[], includeUnreadSubtasks
 
 export const useCollapsedSessionActivityState = ({
   nodes,
-  includeUnreadSubtasks,
+  blockingSessionIds,
   enabled = true,
 }: SessionActivityProps & { enabled?: boolean }): CollapsedActivityState => {
-  const ids = React.useMemo(() => collectActivityIds(enabled ? nodes : [], includeUnreadSubtasks), [enabled, includeUnreadSubtasks, nodes]);
+  const ids = React.useMemo(() => collectActivityIds(enabled ? nodes : []), [enabled, nodes]);
+  const blockingIds = React.useMemo(
+    () => (blockingSessionIds && blockingSessionIds.length > 0 ? new Set([...ids.active, ...blockingSessionIds]) : ids.active),
+    [blockingSessionIds, ids.active],
+  );
   const active = useGlobalSessionStatusStore(React.useCallback((state): CollapsedActivityState => {
     if (!enabled) return null;
     for (const sessionId of ids.active) {
@@ -90,10 +95,18 @@ export const useCollapsedSessionActivityState = ({
     }
     return null;
   }, [enabled, ids.active]));
-  const unread = useNotificationStore(React.useCallback((state): CollapsedActivityState => {
+  // A session idling while its background command runs is still at work.
+  const waitingOnShell = useBackgroundShellsStore(React.useCallback((state): CollapsedActivityState => {
+    if (!enabled) return null;
+    for (const sessionId of ids.active) {
+      if (state.sessionIds.has(sessionId)) return 'active';
+    }
+    return null;
+  }, [enabled, ids.active]));
+  const unread = useGlobalSessionsStore(React.useCallback((state): CollapsedActivityState => {
     if (!enabled) return null;
     for (const sessionId of ids.unread) {
-      if ((state.index.session.unseenCount[sessionId] ?? 0) > 0) return 'unread';
+      if (isSessionUnread(state.entityById.get(sessionId))) return 'unread';
     }
     return null;
   }, [enabled, ids.unread]));
@@ -104,13 +117,14 @@ export const useCollapsedSessionActivityState = ({
   const blocked = useGlobalBlockingRequestsStore(React.useCallback((state): CollapsedActivityState => {
     if (!enabled) return null;
     let result: CollapsedActivityState = null;
-    for (const sessionId of ids.active) {
+    for (const sessionId of blockingIds) {
       const pending = state.bySession.get(sessionId);
       if (!pending) continue;
       if (pending.permissions.length > 0) return 'permission';
-      if (pending.forms.length > 0) result = 'form';
+      // A page that waits for the user's answer blocks the agent like a form.
+      if (pending.forms.length > 0 || pending.pages.length > 0) result = 'form';
     }
     return result;
-  }, [enabled, ids.active]));
-  return blocked ?? active ?? unread;
+  }, [enabled, blockingIds]));
+  return blocked ?? active ?? waitingOnShell ?? unread;
 };

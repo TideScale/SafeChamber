@@ -4,13 +4,14 @@ import http from 'node:http';
 import os from 'os';
 import path from 'path';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'bun:test';
+import { GUEST_GENERATE_PROMPT_MAX, GUEST_GENERATE_SYSTEM_MAX, GUEST_GENERATE_TIMEOUT_MS } from '@openchamber/sdk';
 
 // The settings override is read straight from disk, so without this the suite
 // would resolve whatever small model the developer running it has configured.
 const TEMP_DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'small-model-settings-'));
 process.env.OPENCHAMBER_DATA_DIR = TEMP_DATA_DIR;
 
-const { generateSmallModelText, describeSmallModel, listAuthenticatedProviders, setUnavailableRetryDelaysForTest } = await import('./index.js');
+const { generateSmallModelText, describeSmallModel, listAuthenticatedProviders, setUnavailableRetryDelaysForTest, generationBudgetMs } = await import('./index.js');
 const { configureOpenCodeRuntimeProviders, resetOpenCodeRuntimeProviders } = await import('./client.js');
 
 // A real OpenCode stub over HTTP. The module talks to OpenCode through
@@ -20,9 +21,16 @@ const state = {
   models: [],
   providers: [],
   defaultModel: null,
+  // The model OpenCode's `title` agent carries from config, or null for none.
+  titleModel: null,
+  // OpenCode answers 404 for `title` while a cold location loads its agents.
+  titleMissing: false,
   generate: () => ({ text: 'generated' }),
   requests: [],
   generateErrors: [],
+  // Holds each /api/experimental/generate response open, so a client-side
+  // deadline can fire mid-request.
+  generateDelayMs: 0,
 };
 
 const MODEL = (overrides = {}) => ({
@@ -64,12 +72,29 @@ beforeAll(async () => {
     if (url.pathname === '/api/model') return send({ location: LOCATION, data: state.models });
     if (url.pathname === '/api/model/default') return send({ location: LOCATION, data: state.defaultModel });
     if (url.pathname === '/api/provider') return send({ location: LOCATION, data: state.providers });
+    if (url.pathname === '/api/agent/title') {
+      if (state.titleMissing) {
+        res.writeHead(404, { 'content-type': 'application/json' });
+        return res.end(JSON.stringify({ _tag: 'AgentNotFoundError', agentID: 'title', message: 'Agent not found: title' }));
+      }
+      const agent = {
+        id: 'title',
+        name: 'Title',
+        request: { settings: {}, headers: {}, body: {} },
+        mode: 'primary',
+        hidden: true,
+        permissions: [],
+      };
+      if (state.titleModel) agent.model = state.titleModel;
+      return send({ location: LOCATION, data: agent });
+    }
     if (url.pathname === '/api/experimental/generate') {
       const error = state.generateErrors.shift();
       if (error) {
         res.writeHead(400, { 'content-type': 'application/json' });
         return res.end(JSON.stringify(error));
       }
+      if (state.generateDelayMs) await new Promise((resolve) => setTimeout(resolve, state.generateDelayMs));
       return send({ location: LOCATION, data: state.generate(body) });
     }
     res.writeHead(404).end('{}');
@@ -87,9 +112,12 @@ beforeEach(() => {
   state.models = [MODEL()];
   state.providers = [{ id: 'anthropic', name: 'Anthropic', activation: 'auto', package: 'x' }];
   state.defaultModel = MODEL();
+  state.titleModel = null;
+  state.titleMissing = false;
   state.generate = () => ({ text: 'generated' });
   state.requests = [];
   state.generateErrors = [];
+  state.generateDelayMs = 0;
   configureOpenCodeRuntimeProviders({
     buildOpenCodeUrl: (requestPath) => `${baseUrl}${requestPath.startsWith('/') ? requestPath : `/${requestPath}`}`,
     getOpenCodeAuthHeaders: () => ({ Authorization: 'Basic test' }),
@@ -163,12 +191,23 @@ describe('generateSmallModelText', () => {
     expect(state.requests.filter((entry) => entry.path === '/api/experimental/generate')).toHaveLength(1);
   });
 
+  it('reports a blown deadline as a 504 generation-timeout naming the model and budget', async () => {
+    state.generateDelayMs = 2_500;
+    // The explicit timeoutMs also proves override: the derived budget for this
+    // small prompt would be ~60 s, so only the caller's 1 s deadline can fire.
+    await expect(generateSmallModelText({ prompt: 'hi', directory: '/proj', timeoutMs: 1_000 }))
+      .rejects.toMatchObject({
+        statusCode: 504,
+        code: 'generation-timeout',
+        message: expect.stringContaining('anthropic/claude-haiku-4-5 did not finish within the 1s budget for this prompt size'),
+      });
+  });
+
   it('sends the prompt to /api/generate on the resolved model', async () => {
     const result = await generateSmallModelText({ prompt: 'summarize this', directory: '/proj' });
 
-    // The fixture's only model is a haiku: the family scan finds it before
-    // OpenCode's default is even asked.
-    expect(result).toMatchObject({ text: 'generated', providerID: 'anthropic', modelID: 'claude-haiku-4-5', source: 'small' });
+    // No provider to stay on and no Settings pick: OpenCode's default.
+    expect(result).toMatchObject({ text: 'generated', providerID: 'anthropic', modelID: 'claude-haiku-4-5', source: 'default' });
     expect(lastGenerate().body).toEqual({
       prompt: 'summarize this',
       model: { id: 'claude-haiku-4-5', providerID: 'anthropic' },
@@ -179,6 +218,21 @@ describe('generateSmallModelText', () => {
     await generateSmallModelText({ prompt: 'hi', directory: '/proj/sub dir' });
 
     expect(lastGenerate().headers['x-opencode-directory']).toBe(encodeURIComponent('/proj/sub dir'));
+  });
+
+  // The model lists are read through a location; without a directory OpenCode
+  // would start its own working directory, MCP servers included.
+  it('scopes a request without a directory to the server default', async () => {
+    configureOpenCodeRuntimeProviders({
+      buildOpenCodeUrl: (requestPath) => `${baseUrl}${requestPath.startsWith('/') ? requestPath : `/${requestPath}`}`,
+      getOpenCodeAuthHeaders: () => ({ Authorization: 'Basic test' }),
+      getDefaultDirectory: () => '/last/project',
+    });
+
+    await generateSmallModelText({ prompt: 'hi' });
+
+    const unscoped = state.requests.filter((entry) => entry.headers['x-opencode-directory'] !== encodeURIComponent('/last/project'));
+    expect(unscoped).toEqual([]);
   });
 
   it('leads the prompt with the system instructions', async () => {
@@ -201,13 +255,12 @@ describe('generateSmallModelText', () => {
     expect(lastGenerate().body.model).toEqual({ id: 'haiku', providerID: 'claude-code' });
   });
 
-  it('stays on the session provider when the caller forbids switching', async () => {
+  it('falls back to the session model when its provider has no small one', async () => {
     const result = await generateSmallModelText({
       prompt: 'hi',
       directory: '/proj',
       preferredProviderID: 'openai',
       preferredModelID: 'gpt-5.6-luna',
-      restrictToPreferredProvider: true,
     });
 
     expect(result).toMatchObject({ providerID: 'openai', modelID: 'gpt-5.6-luna', source: 'session-model' });
@@ -227,7 +280,6 @@ describe('generateSmallModelText', () => {
       directory: '/proj',
       preferredProviderID: 'anthropic',
       preferredModelID: 'claude-sonnet-5',
-      restrictToPreferredProvider: true,
     });
 
     // Newest active haiku of the session provider; the other provider's
@@ -236,38 +288,26 @@ describe('generateSmallModelText', () => {
     expect(lastGenerate().body.model).toEqual({ id: 'claude-haiku-5', providerID: 'anthropic' });
   });
 
-  it('without a session, takes the newest small model of any provider before the default', async () => {
-    state.models = [
-      MODEL({ id: 'claude-sonnet-5', modelID: 'claude-sonnet-5', family: 'claude-sonnet' }),
-      MODEL({ id: 'claude-haiku-5', modelID: 'claude-haiku-5', family: 'claude-haiku', time: { released: 9 } }),
-      MODEL({ id: 'gemini-3.5-flash', modelID: 'gemini-3.5-flash', providerID: 'google', family: 'gemini-flash', time: { released: 1 } }),
-      MODEL({ id: 'gemini-3.6-flash', modelID: 'gemini-3.6-flash', providerID: 'google', family: 'gemini-flash', time: { released: 2 } }),
-    ];
-    state.defaultModel = state.models[0];
-
-    const result = await generateSmallModelText({ prompt: 'hi', directory: '/proj' });
-
-    // gemini-flash outranks claude-haiku in the family list, so the newest
-    // gemini-flash wins even though haiku was released later.
-    expect(result).toMatchObject({ providerID: 'google', modelID: 'gemini-3.6-flash', source: 'small' });
-  });
-
-  it('with a session but no restriction, still prefers the session provider, then any provider', async () => {
+  it('never takes a small model from another connected provider', async () => {
     state.models = [
       MODEL({ id: 'claude-sonnet-5', modelID: 'claude-sonnet-5', family: 'claude-sonnet' }),
       MODEL({ id: 'gemini-3.6-flash', modelID: 'gemini-3.6-flash', providerID: 'google', family: 'gemini-flash' }),
     ];
     state.defaultModel = state.models[0];
 
-    const result = await generateSmallModelText({
+    // Anthropic has no small family here, yet the connected Google flash is
+    // not someone's pick for this content.
+    const withProvider = await generateSmallModelText({
       prompt: 'hi',
       directory: '/proj',
       preferredProviderID: 'anthropic',
       preferredModelID: 'claude-sonnet-5',
     });
+    expect(withProvider).toMatchObject({ providerID: 'anthropic', modelID: 'claude-sonnet-5', source: 'session-model' });
 
-    // Anthropic has no small family here, and the caller allows switching.
-    expect(result).toMatchObject({ providerID: 'google', modelID: 'gemini-3.6-flash', source: 'small' });
+    const withoutProvider = await generateSmallModelText({ prompt: 'hi', directory: '/proj' });
+    expect(withoutProvider).toMatchObject({ providerID: 'anthropic', modelID: 'claude-sonnet-5', source: 'default' });
+    expect(state.requests.some((entry) => entry.body?.model?.providerID === 'google')).toBe(false);
   });
 
   it('reads the family from the model id when the catalog has none (custom provider)', async () => {
@@ -282,7 +322,6 @@ describe('generateSmallModelText', () => {
       directory: '/proj',
       preferredProviderID: 'my-proxy',
       preferredModelID: 'my-big-model',
-      restrictToPreferredProvider: true,
     });
 
     expect(result).toMatchObject({ providerID: 'my-proxy', modelID: 'gemini-3.6-flash', source: 'session-provider-small' });
@@ -291,9 +330,9 @@ describe('generateSmallModelText', () => {
   it('picks Claude Code haiku as the small model like any other provider', async () => {
     state.models = [MODEL({ id: 'haiku', modelID: 'haiku', providerID: 'claude-code', family: 'claude-haiku' })];
 
-    const result = await generateSmallModelText({ prompt: 'hi', directory: '/proj' });
+    const result = await generateSmallModelText({ prompt: 'hi', directory: '/proj', preferredProviderID: 'claude-code' });
 
-    expect(result).toMatchObject({ providerID: 'claude-code', modelID: 'haiku', source: 'small' });
+    expect(result).toMatchObject({ providerID: 'claude-code', modelID: 'haiku', source: 'session-provider-small' });
   });
 
   it('ignores a disabled small model and falls back to the session model', async () => {
@@ -307,10 +346,222 @@ describe('generateSmallModelText', () => {
       directory: '/proj',
       preferredProviderID: 'anthropic',
       preferredModelID: 'claude-sonnet-5',
-      restrictToPreferredProvider: true,
     });
 
     expect(result).toMatchObject({ providerID: 'anthropic', modelID: 'claude-sonnet-5', source: 'session-model' });
+  });
+
+  it('sends a session title to the small model configured for OpenCode', async () => {
+    state.titleModel = { id: 'gpt-5-mini', providerID: 'openai' };
+
+    const result = await generateSmallModelText({
+      prompt: 'hi',
+      directory: '/proj',
+      preferredProviderID: 'anthropic',
+      preferredModelID: 'claude-haiku-4-5',
+    });
+
+    // Configured on purpose, so it may leave the session provider the way
+    // OpenCode's own titles do.
+    expect(result).toMatchObject({ providerID: 'openai', modelID: 'gpt-5-mini', source: 'config' });
+    expect(lastGenerate().body.model).toEqual({ id: 'gpt-5-mini', providerID: 'openai' });
+  });
+
+  it('sends the thinking variant a caller names with its own model', async () => {
+    state.models = [MODEL({ variants: [{ id: 'low' }, { id: 'high' }] })];
+
+    const result = await generateSmallModelText({
+      prompt: 'hi', directory: '/proj', model: 'anthropic/claude-haiku-4-5', variant: 'high',
+    });
+    expect(result).toMatchObject({ providerID: 'anthropic', modelID: 'claude-haiku-4-5', source: 'request' });
+    expect(lastGenerate().body.model).toEqual({ id: 'claude-haiku-4-5', providerID: 'anthropic', variant: 'high' });
+  });
+
+  it('sends the thinking variant saved beside the small model override', async () => {
+    state.models = [MODEL({ variants: [{ id: 'low' }, { id: 'high' }] })];
+    fs.writeFileSync(
+      path.join(TEMP_DATA_DIR, 'settings.json'),
+      JSON.stringify({
+        smallModelUseDefault: false,
+        smallModelOverride: 'anthropic/claude-haiku-4-5',
+        smallModelVariant: 'high',
+      }),
+    );
+
+    try {
+      const result = await generateSmallModelText({ prompt: 'hi', directory: '/proj' });
+      expect(result).toMatchObject({ providerID: 'anthropic', modelID: 'claude-haiku-4-5', source: 'settings' });
+      expect(lastGenerate().body.model).toEqual({
+        id: 'claude-haiku-4-5',
+        providerID: 'anthropic',
+        variant: 'high',
+      });
+    } finally {
+      fs.rmSync(path.join(TEMP_DATA_DIR, 'settings.json'), { force: true });
+    }
+  });
+
+  it('reads the saved variant from the profile preferences file', async () => {
+    state.models = [MODEL({ variants: [{ id: 'high' }] })];
+    const preferencesPath = path.join(TEMP_DATA_DIR, 'preferences.json');
+    fs.writeFileSync(
+      preferencesPath,
+      JSON.stringify({
+        version: 1,
+        fields: {
+          smallModelUseDefault: { value: false, updatedAt: 1 },
+          smallModelOverride: { value: 'anthropic/claude-haiku-4-5', updatedAt: 1 },
+          smallModelVariant: { value: 'high', updatedAt: 1 },
+        },
+      }),
+    );
+
+    try {
+      await generateSmallModelText({ prompt: 'hi', directory: '/proj' });
+      expect(lastGenerate().body.model).toEqual({
+        id: 'claude-haiku-4-5',
+        providerID: 'anthropic',
+        variant: 'high',
+      });
+    } finally {
+      fs.rmSync(preferencesPath, { force: true });
+    }
+  });
+
+  it('drops a saved variant the catalog does not list for the model', async () => {
+    state.models = [MODEL({ variants: [{ id: 'low' }] })];
+    fs.writeFileSync(
+      path.join(TEMP_DATA_DIR, 'settings.json'),
+      JSON.stringify({
+        smallModelUseDefault: false,
+        smallModelOverride: 'anthropic/claude-haiku-4-5',
+        smallModelVariant: 'high',
+      }),
+    );
+
+    try {
+      await generateSmallModelText({ prompt: 'hi', directory: '/proj' });
+      expect(lastGenerate().body.model).toEqual({ id: 'claude-haiku-4-5', providerID: 'anthropic' });
+    } finally {
+      fs.rmSync(path.join(TEMP_DATA_DIR, 'settings.json'), { force: true });
+    }
+  });
+
+  it('drops a saved variant when the known model lists no variants', async () => {
+    state.models = [MODEL()];
+    fs.writeFileSync(
+      path.join(TEMP_DATA_DIR, 'settings.json'),
+      JSON.stringify({
+        smallModelUseDefault: false,
+        smallModelOverride: 'anthropic/claude-haiku-4-5',
+        smallModelVariant: 'high',
+      }),
+    );
+
+    try {
+      await generateSmallModelText({ prompt: 'hi', directory: '/proj' });
+      expect(lastGenerate().body.model).toEqual({ id: 'claude-haiku-4-5', providerID: 'anthropic' });
+    } finally {
+      fs.rmSync(path.join(TEMP_DATA_DIR, 'settings.json'), { force: true });
+    }
+  });
+
+  it('keeps a saved variant when the catalog does not know the model', async () => {
+    state.models = [];
+    fs.writeFileSync(
+      path.join(TEMP_DATA_DIR, 'settings.json'),
+      JSON.stringify({
+        smallModelUseDefault: false,
+        smallModelOverride: 'anthropic/claude-haiku-4-5',
+        smallModelVariant: 'high',
+      }),
+    );
+
+    try {
+      await generateSmallModelText({ prompt: 'hi', directory: '/proj' });
+      expect(lastGenerate().body.model).toEqual({
+        id: 'claude-haiku-4-5',
+        providerID: 'anthropic',
+        variant: 'high',
+      });
+    } finally {
+      fs.rmSync(path.join(TEMP_DATA_DIR, 'settings.json'), { force: true });
+    }
+  });
+
+  it('ignores the saved variant while the default small model is used', async () => {
+    state.models = [MODEL({ variants: [{ id: 'high' }] })];
+    state.defaultModel = state.models[0];
+    fs.writeFileSync(
+      path.join(TEMP_DATA_DIR, 'settings.json'),
+      JSON.stringify({
+        smallModelUseDefault: true,
+        smallModelOverride: 'openai/gpt-5.6-luna',
+        smallModelVariant: 'high',
+      }),
+    );
+
+    try {
+      const result = await generateSmallModelText({ prompt: 'hi', directory: '/proj' });
+      expect(result).toMatchObject({ providerID: 'anthropic', modelID: 'claude-haiku-4-5', source: 'default' });
+      expect(lastGenerate().body.model).toEqual({ id: 'claude-haiku-4-5', providerID: 'anthropic' });
+    } finally {
+      fs.rmSync(path.join(TEMP_DATA_DIR, 'settings.json'), { force: true });
+    }
+  });
+
+  it('sends the thinking variant on OpenCode\'s title agent model', async () => {
+    state.titleModel = { id: 'gpt-5-mini', providerID: 'openai', variant: 'low' };
+    state.models = [MODEL({
+      id: 'gpt-5-mini',
+      modelID: 'gpt-5-mini',
+      providerID: 'openai',
+      variants: [{ id: 'low' }],
+    })];
+
+    const result = await generateSmallModelText({
+      prompt: 'hi',
+      directory: '/proj',
+      preferredProviderID: 'anthropic',
+      preferredModelID: 'claude-haiku-4-5',
+    });
+
+    expect(result).toMatchObject({ providerID: 'openai', modelID: 'gpt-5-mini', source: 'config' });
+    expect(lastGenerate().body.model).toEqual({
+      id: 'gpt-5-mini',
+      providerID: 'openai',
+      variant: 'low',
+    });
+  });
+
+  // A commit message or a spoken summary names the composer's provider and
+  // model; OpenCode's default (its first available model when none is set)
+  // can be another provider's.
+  it('takes the composer model, not OpenCode\'s default from another provider', async () => {
+    state.models = [
+      MODEL({ id: 'claude-opus-5', modelID: 'claude-opus-5', family: 'claude-opus' }),
+      MODEL({ id: 'gpt-5.6', modelID: 'gpt-5.6', providerID: 'openai', family: 'gpt' }),
+    ];
+    state.defaultModel = state.models[1];
+
+    const result = await generateSmallModelText({
+      prompt: 'hi',
+      directory: '/proj',
+      preferredProviderID: 'anthropic',
+      preferredModelID: 'claude-opus-5',
+    });
+
+    expect(result).toMatchObject({ providerID: 'anthropic', modelID: 'claude-opus-5', source: 'session-model' });
+    expect(state.requests.some((entry) => entry.body?.model?.providerID === 'openai')).toBe(false);
+  });
+
+  it('keeps OpenCode\'s default when it is on the named provider', async () => {
+    state.models = [MODEL({ id: 'claude-opus-5', modelID: 'claude-opus-5', family: 'claude-opus' })];
+    state.defaultModel = state.models[0];
+
+    const result = await generateSmallModelText({ prompt: 'hi', directory: '/proj', preferredProviderID: 'anthropic' });
+
+    expect(result).toMatchObject({ providerID: 'anthropic', modelID: 'claude-opus-5', source: 'default' });
   });
 
   it('refuses rather than switch provider when the session has no model of its own', async () => {
@@ -318,7 +569,6 @@ describe('generateSmallModelText', () => {
       prompt: 'hi',
       directory: '/proj',
       preferredProviderID: 'openai',
-      restrictToPreferredProvider: true,
     })).rejects.toMatchObject({ statusCode: 404 });
   });
 
@@ -374,6 +624,36 @@ describe('oversized input', () => {
   });
 });
 
+describe('generationBudgetMs', () => {
+  it('keeps small prompts at the historical 60 s base', () => {
+    expect(generationBudgetMs(0)).toBe(60_000);
+    // A few hundred chars — a title, a commit message without diffs — sits
+    // within a breath of the old flat default.
+    expect(generationBudgetMs(400)).toBe(64_000);
+  });
+
+  it('covers the ~43 KB commit-message diff from issue #5017 (~11k tokens)', () => {
+    // ~490 s: well above the 1.5-2 min prefill the issue measured on 4 GB-VRAM
+    // local models, and far above the flat 60 s that always killed the request.
+    const budget = generationBudgetMs(43_000);
+    expect(budget).toBe(60_000 + 10_750 * 40);
+    expect(budget).toBeGreaterThan(120_000);
+  });
+
+  it('caps at the 900 s walkthrough ceiling', () => {
+    expect(generationBudgetMs(10_000_000)).toBe(900_000);
+  });
+
+  it('finishes before an extension stops waiting for the largest guest request', () => {
+    // The SDK's guest wait must outlast this deadline, or the guest gives up
+    // while the model still works and the answer is thrown away. Changing the
+    // formula here fails this test instead of silently breaking that order.
+    const budget = generationBudgetMs(GUEST_GENERATE_PROMPT_MAX + GUEST_GENERATE_SYSTEM_MAX);
+    expect(budget).toBe(780_000);
+    expect(budget).toBeLessThan(GUEST_GENERATE_TIMEOUT_MS);
+  });
+});
+
 describe('structured output', () => {
   const schema = { type: 'object', properties: { title: { type: 'string' } } };
 
@@ -425,7 +705,7 @@ describe('describeSmallModel', () => {
     expect(described).toMatchObject({
       providerID: 'anthropic',
       modelID: 'claude-haiku-4-5',
-      source: 'small',
+      source: 'default',
       inputCharBudget: 16_000,
       contextTokens: 8_000,
       contextKnown: true,
@@ -446,6 +726,73 @@ describe('describeSmallModel', () => {
     try {
       const described = await describeSmallModel({ directory: '/proj' });
       expect(described).toMatchObject({ providerID: 'openai', modelID: 'gpt-5.6-luna', source: 'settings' });
+    } finally {
+      fs.rmSync(path.join(TEMP_DATA_DIR, 'settings.json'), { force: true });
+    }
+  });
+
+  it('reports the override thinking variant', async () => {
+    state.models = [MODEL({ variants: [{ id: 'low' }, { id: 'high' }] })];
+    fs.writeFileSync(
+      path.join(TEMP_DATA_DIR, 'settings.json'),
+      JSON.stringify({
+        smallModelUseDefault: false,
+        smallModelOverride: 'anthropic/claude-haiku-4-5',
+        smallModelVariant: 'high',
+      }),
+    );
+
+    try {
+      const described = await describeSmallModel({ directory: '/proj' });
+      expect(described).toMatchObject({
+        providerID: 'anthropic',
+        modelID: 'claude-haiku-4-5',
+        variant: 'high',
+        source: 'settings',
+      });
+    } finally {
+      fs.rmSync(path.join(TEMP_DATA_DIR, 'settings.json'), { force: true });
+    }
+  });
+
+  it('reports the small model configured for OpenCode before its own pick', async () => {
+    state.titleModel = { id: 'gpt-5-mini', providerID: 'openai' };
+
+    const described = await describeSmallModel({ directory: '/proj', preferredProviderID: 'anthropic' });
+
+    expect(described).toMatchObject({ providerID: 'openai', modelID: 'gpt-5-mini', source: 'config' });
+    const agentRead = state.requests.find((entry) => entry.path === '/api/agent/title');
+    expect(agentRead.headers['x-opencode-directory']).toBe(encodeURIComponent('/proj'));
+  });
+
+  it('skips a configured small model whose provider has lost its login', async () => {
+    state.titleModel = { id: 'gpt-5-mini', providerID: 'openai' };
+    state.models = [
+      MODEL({ id: 'gpt-5-mini', modelID: 'gpt-5-mini', providerID: 'openai', enabled: false }),
+      MODEL({ family: 'claude-haiku' }),
+    ];
+
+    const described = await describeSmallModel({ directory: '/proj', preferredProviderID: 'anthropic' });
+
+    expect(described).toMatchObject({ providerID: 'anthropic', modelID: 'claude-haiku-4-5', source: 'session-provider-small' });
+  });
+
+  it('falls through to its own pick when OpenCode has no title agent yet', async () => {
+    state.titleMissing = true;
+
+    expect(await describeSmallModel({ directory: '/proj' })).toMatchObject({ source: 'default' });
+  });
+
+  it('lets the settings override outrank the OpenCode config', async () => {
+    state.titleModel = { id: 'gpt-5-mini', providerID: 'openai' };
+    fs.writeFileSync(
+      path.join(TEMP_DATA_DIR, 'settings.json'),
+      JSON.stringify({ smallModelUseDefault: false, smallModelOverride: 'anthropic/claude-haiku-4-5' }),
+    );
+
+    try {
+      const described = await describeSmallModel({ directory: '/proj' });
+      expect(described).toMatchObject({ providerID: 'anthropic', modelID: 'claude-haiku-4-5', source: 'settings' });
     } finally {
       fs.rmSync(path.join(TEMP_DATA_DIR, 'settings.json'), { force: true });
     }
@@ -476,6 +823,25 @@ describe('describeSmallModel', () => {
 
     expect(await describeSmallModel({ directory: '/proj' })).toBeNull();
   });
+
+  it.each([
+    ['http://127.0.0.1:8080/v1', true],
+    ['http://localhost:1234/v1', true],
+    ['http://[::1]:11434/v1', true],
+    ['http://192.168.1.20:8080/v1', true],
+    ['http://100.101.102.103:8080/v1', true],
+    ['http://gpu-box:8080/v1', true],
+    ['http://llm.home.arpa/v1', true],
+    ['https://api.example.com/v1', false],
+    ['http://8.8.8.8/v1', false],
+    [undefined, false],
+  ])('reports whether %s is a local endpoint', async (baseURL, local) => {
+    state.models = [MODEL({ id: 'qwen3', modelID: 'qwen3', providerID: 'llama', settings: baseURL ? { baseURL } : {} })];
+
+    const described = await describeSmallModel({ directory: '/proj', preferredProviderID: 'llama', preferredModelID: 'qwen3' });
+
+    expect(described).toMatchObject({ source: 'session-model', localEndpoint: local });
+  });
 });
 
 describe('listAuthenticatedProviders', () => {
@@ -503,10 +869,60 @@ describe('listAuthenticatedProviders', () => {
     expect(await listAuthenticatedProviders()).toContain('claude-code');
   });
 
+  // OpenCode 2 answers with an empty catalog while it starts; caching that
+  // kept the pickers empty after the models arrived.
+  it('offers a provider as soon as a cold catalog fills in', async () => {
+    state.models = [];
+    expect(await listAuthenticatedProviders()).toEqual([]);
+
+    state.models = [MODEL()];
+    expect(await listAuthenticatedProviders()).toEqual(['anthropic']);
+  });
+
   it('answers an empty list when OpenCode is not reachable', async () => {
     configureOpenCodeRuntimeProviders(null);
 
     expect(await listAuthenticatedProviders()).toEqual([]);
+  });
+
+  // The model list is directory-scoped, so an unscoped read answers for
+  // OpenCode's own working directory, which need not be where the user works.
+  it('scopes the model and provider reads to the requested directory', async () => {
+    configureOpenCodeRuntimeProviders({
+      buildOpenCodeUrl: (requestPath) => `${baseUrl}${requestPath.startsWith('/') ? requestPath : `/${requestPath}`}`,
+      getOpenCodeAuthHeaders: () => ({ Authorization: 'Basic test' }),
+      getDefaultDirectory: () => '/last/project',
+    });
+
+    await listAuthenticatedProviders('/proj/sub dir');
+
+    const reads = state.requests.filter((entry) => entry.path === '/api/model' || entry.path === '/api/provider');
+    expect(reads.length).toBeGreaterThan(0);
+    expect(reads.every((entry) => entry.headers['x-opencode-directory'] === encodeURIComponent('/proj/sub dir'))).toBe(true);
+  });
+});
+
+describe('small model routes', () => {
+  it('forwards the request directory to the provider list', async () => {
+    let getHandler;
+    const providerCalls = [];
+    registerSmallModelRoutes({
+      get(_path, handler) { getHandler = handler; },
+      post() {},
+    }, {
+      getSmallModelService: async () => ({
+        describeSmallModel: async () => null,
+        listAuthenticatedProviders: async (directory) => {
+          providerCalls.push(directory);
+          return ['anthropic'];
+        },
+      }),
+    });
+    const response = { json() {}, status() { return response; } };
+
+    await getHandler({ query: { directory: '/proj/sub dir' } }, response);
+
+    expect(providerCalls).toEqual(['/proj/sub dir']);
   });
 });
 
@@ -538,5 +954,44 @@ describe('small model failure response', () => {
       code: 'small-model-unavailable',
     });
     setUnavailableRetryDelaysForTest();
+  });
+
+  const registerWithFailure = (failure) => {
+    let generate;
+    registerSmallModelRoutes({
+      get() {},
+      post(_path, handler) { generate = handler; },
+    }, {
+      getSmallModelService: async () => ({ generateSmallModelText: () => Promise.reject(failure) }),
+    });
+    return generate;
+  };
+
+  const respond = () => {
+    let status;
+    let payload;
+    const response = {
+      status(value) { status = value; return response; },
+      json(value) { payload = value; },
+    };
+    return { response, read: () => ({ status, payload }) };
+  };
+
+  it('surfaces a generation-timeout as its own message with status 504', async () => {
+    const message = 'ollama/qwen2.5:latest did not finish within the 490s budget for this prompt size';
+    const generate = registerWithFailure(Object.assign(new Error(message), { statusCode: 504, code: 'generation-timeout' }));
+    const { response, read } = respond();
+    await generate({ body: { prompt: 'commit' } }, response);
+    expect(read()).toEqual({ status: 504, payload: { error: message, code: 'generation-timeout' } });
+  });
+
+  it('keeps the generic text for other 5xx failures', async () => {
+    const generate = registerWithFailure(Object.assign(new Error('boom'), { statusCode: 500 }));
+    const { response, read } = respond();
+    await generate({ body: { prompt: 'commit' } }, response);
+    expect(read()).toEqual({
+      status: 500,
+      payload: { error: 'The selected Small Model could not complete this action. Choose another model in Settings → Sessions → Small Model and try again.' },
+    });
   });
 });

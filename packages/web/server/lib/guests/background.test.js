@@ -67,11 +67,12 @@ test('background install serves sandboxed assets and storage obeys approval and 
   const catalog = await request(app).get('/api/guests').expect(200);
   expect(catalog.body.guests[0].backgroundEntry).toBe('index.html');
   const html = await request(app).get('/api/guests/background-test/index.html?oc_url_token=test-scope').expect(200);
-  expect(html.headers['content-security-policy']).toBe('sandbox allow-scripts');
+  expect(html.headers['content-security-policy']).toMatch(/^sandbox allow-scripts; default-src 'none';/);
   expect(html.text).toContain('main.js?oc_url_token=test-scope');
   expect((await request(app).get('/api/guests/background-test/main.js').expect(200)).text).toBe('void 0;');
   await request(app).post('/api/guests/background-test/storage').send({ op: 'set', key: 'count', value: 1 }).expect(400);
   await request(app).put('/api/guests/background-test/capabilities').send({ granted: ['files'] }).expect(200);
+  await request(app).post('/api/guests/background-test/storage').send({ op: 'set', scope: 'device', key: 'count', value: 1 }).expect(400);
   await request(app).post('/api/guests/background-test/storage').send({ op: 'set', key: 'count', value: 1 }).expect(200);
   expect((await request(app).post('/api/guests/background-test/storage').send({ op: 'get', key: 'count' }).expect(200)).body).toMatchObject({ found: true, value: 1 });
   await request(app).put('/api/guests/background-test/enabled').send({ enabled: false }).expect(200);

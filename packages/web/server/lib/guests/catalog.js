@@ -1,12 +1,14 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 
-import { hasGuestPage, requestedGuestCapabilities, resolveAttachEntry, resolveAttachMode, resolvePageEntry, resolveStatusSectionEntry, toPublicService, toPublicIntegration, hostMeetsOpenChamberEngine, openChamberEngineMinimum } from '@openchamber/sdk';
+import { hasGuestPage, requestedGuestCapabilities, resolveAttachEntry, resolveAttachMode, resolvePageEntry, resolveStatusSectionEntry, resolveStatusSectionSource, toPublicService, toPublicSourceControl, toPublicIntegration, hostMeetsOpenChamberEngine, openChamberEngineMinimum } from '@openchamber/sdk';
 import { parseManifestJson } from '@openchamber/sdk/schemas';
 
 import { listRelativeGuestScriptHrefs, resolveGuestHtmlRelativePath } from './html-tokens.js';
 import { effectiveGrants, guestGrantScope } from './grant-scope.js';
-import { onExtensionStoreWrite, readExtensionStore } from './persist.js';
+import { enterpriseBlockedCapabilities } from './enterprise.js';
+import { readEnterprisePolicy } from '../enterprise-mode.js';
+import { ensureGuestStorageIds, onExtensionStoreWrite, readExtensionStore } from './persist.js';
 import { buildPublicSocketBindings } from './sockets.js';
 import { isReservedBuiltInId, readBuiltInRegistry } from './builtins.js';
 
@@ -248,7 +250,8 @@ export const inspectGuestPackage = async (packageRoot, { openchamberVersion, ski
     if (page !== true && page?.title) guest.pageTitle = page.title;
   }
   // The Work Status section is checked like any other entry, and may be the
-  // package's only frame.
+  // package's only frame. A source section has no frame: the host reads it
+  // from the service.
   const statusEntry = resolveStatusSectionEntry(parsed.manifest.contributes);
   if (statusEntry) {
     if (!await resolveGuestAssetPath(packageRoot, statusEntry)) {
@@ -258,9 +261,15 @@ export const inspectGuestPackage = async (packageRoot, { openchamberVersion, ski
       return { ok: false, code: 'missing-build' };
     }
     guest.statusEntry = statusEntry;
+  }
+  const statusSource = resolveStatusSectionSource(parsed.manifest.contributes);
+  if (statusSource) guest.statusSource = statusSource;
+  if (statusEntry || statusSource) {
     const section = parsed.manifest.contributes.statusSection;
     if (section !== true && section?.title) guest.statusTitle = section.title;
     if (section !== true && section?.height !== undefined) guest.statusHeight = section.height;
+    if (section !== true && section?.defaultExpanded !== undefined) guest.statusDefaultExpanded = section.defaultExpanded;
+    if (section !== true && section?.requiresProject !== undefined) guest.statusRequiresProject = section.requiresProject;
   }
   // File editors are frames of their own too; each entry is checked the same way.
   const fileEditors = parsed.manifest.contributes.fileEditors ?? [];
@@ -284,6 +293,9 @@ export const inspectGuestPackage = async (packageRoot, { openchamberVersion, ski
   if (parsed.manifest.contributes.filesystem?.length) {
     guest.filesystem = [...parsed.manifest.contributes.filesystem];
   }
+  if (parsed.manifest.contributes.origins?.length) {
+    guest.origins = [...parsed.manifest.contributes.origins];
+  }
   if (parsed.manifest.contributes.actions?.length) {
     guest.actions = parsed.manifest.contributes.actions.map((action) => ({ ...action }));
   }
@@ -299,6 +311,10 @@ export const inspectGuestPackage = async (packageRoot, { openchamberVersion, ski
       return { ok: false, code: 'missing-build' };
     }
     guest.service = parsed.manifest.contributes.service;
+  }
+  // The Git host a `source-control` service provides; the parse requires it exactly then.
+  if (parsed.manifest.contributes.sourceControl) {
+    guest.sourceControl = parsed.manifest.contributes.sourceControl;
   }
   return { ok: true, guest };
 };
@@ -329,6 +345,9 @@ export const toPublicGuest = (guest) => {
     path: guest.path ?? null,
     enabled: guest.enabled !== false,
   };
+  if (guest.enterpriseBlocked?.length) {
+    row.enterpriseBlocked = [...guest.enterpriseBlocked];
+  }
   if (guest.entry) {
     row.entry = guest.entry;
   }
@@ -358,8 +377,11 @@ export const toPublicGuest = (guest) => {
   if (guest.pageEntry) row.pageEntry = guest.pageEntry;
   if (guest.pageTitle) row.pageTitle = guest.pageTitle;
   if (guest.statusEntry) row.statusEntry = guest.statusEntry;
+  if (guest.statusSource) row.statusSource = { path: guest.statusSource.path, interval: guest.statusSource.interval };
   if (guest.statusTitle) row.statusTitle = guest.statusTitle;
   if (Number.isInteger(guest.statusHeight)) row.statusHeight = guest.statusHeight;
+  if (guest.statusDefaultExpanded !== undefined) row.statusDefaultExpanded = guest.statusDefaultExpanded;
+  if (guest.statusRequiresProject !== undefined) row.statusRequiresProject = guest.statusRequiresProject;
   if (attach) {
     row.attach = attach;
   }
@@ -371,6 +393,10 @@ export const toPublicGuest = (guest) => {
   }
   if (Array.isArray(guest.filesystem) && guest.filesystem.length > 0) {
     row.filesystem = [...guest.filesystem];
+  }
+  // Shown on the approval card: the frame may exchange data with these.
+  if (Array.isArray(guest.origins) && guest.origins.length > 0) {
+    row.origins = [...guest.origins];
   }
   // Actions, commands, and tools are the parsed manifest entries as they
   // are: the UI decides which ones to apply from the grant and the enabled flag.
@@ -391,6 +417,9 @@ export const toPublicGuest = (guest) => {
     requested: requestedGuestCapabilities(guest),
     granted,
   };
+  if (guest.storageId && requestedGuestCapabilities(guest).every((capability) => granted.includes(capability))) {
+    row.storageId = guest.storageId;
+  }
   const service = toPublicService(
     guest.service,
     granted.includes('service'),
@@ -398,6 +427,10 @@ export const toPublicGuest = (guest) => {
   );
   if (service) {
     row.service = service;
+  }
+  // What the approval dialog names: the Git host's label and the instances it reaches.
+  if (guest.sourceControl) {
+    row.sourceControl = toPublicSourceControl(guest.sourceControl);
   }
   return row;
 };
@@ -434,17 +467,38 @@ export const invalidateGuestCatalog = (persistPath) => {
 };
 onExtensionStoreWrite(invalidateGuestCatalog);
 
+/**
+ * Enterprise mode, applied on every read after the cache so a policy change
+ * counts at once: a package whose gated capabilities the policy refuses keeps
+ * none of them, and `enterpriseBlocked` names them for Settings. Every route
+ * and proxy takes grants from this row, so none of them can use the refused
+ * capabilities.
+ */
+const withEnterprisePolicy = (guests) => {
+  const policy = readEnterprisePolicy();
+  if (!policy.enterpriseMode) return guests;
+  return guests.map((guest) => {
+    const blocked = enterpriseBlockedCapabilities(guest, { source: guest.source, gitUrl: guest.gitOrigin?.url }, policy);
+    if (blocked.length === 0) return guest;
+    return {
+      ...guest,
+      capabilityGrants: guest.capabilityGrants.filter((capability) => !blocked.includes(capability)),
+      enterpriseBlocked: blocked,
+    };
+  });
+};
+
 export const listInstalledGuests = async ({ persistPath } = {}) => {
   const cached = persistPath ? catalogCache.get(persistPath) : undefined;
   if (cached && cached.expiresAt > Date.now()) {
-    return cached.guests;
+    return withEnterprisePolicy(cached.guests);
   }
   const version = persistPath ? catalogVersionOf(persistPath) : 0;
   const guests = await listInstalledGuestsUncached({ persistPath });
   if (persistPath && catalogVersionOf(persistPath) === version) {
     catalogCache.set(persistPath, { guests, expiresAt: Date.now() + CATALOG_CACHE_TTL_MS });
   }
-  return guests;
+  return withEnterprisePolicy(guests);
 };
 
 const listInstalledGuestsUncached = async ({ persistPath } = {}) => {
@@ -475,6 +529,7 @@ const listInstalledGuestsUncached = async ({ persistPath } = {}) => {
         capabilityGrants: requestedGuestCapabilities(guest),
         enabled: !stored.disabledGuests?.[guest.id],
         socketBindings,
+        storageDescriptor: { id: guest.id, storedPath: null, builtIn: true },
       });
     }
   }
@@ -513,9 +568,22 @@ const listInstalledGuestsUncached = async ({ persistPath } = {}) => {
       ),
       enabled: !stored.disabledGuests?.[guest.id],
       socketBindings,
+      storageDescriptor: { id: guest.id, storedPath, builtIn: false },
     });
   }
 
+  const descriptors = guests.map((guest) => guest.storageDescriptor);
+  if (descriptors.some(({ id }) => !stored.storageIds?.[id])) {
+    try {
+      const identities = await ensureGuestStorageIds(persistPath, descriptors);
+      for (const guest of guests) guest.storageId = identities[guest.id];
+    } catch {
+      console.warn('Guest storage identities are temporarily unavailable.');
+    }
+  } else {
+    for (const guest of guests) guest.storageId = stored.storageIds?.[guest.id];
+  }
+  for (const guest of guests) delete guest.storageDescriptor;
   return guests;
 };
 

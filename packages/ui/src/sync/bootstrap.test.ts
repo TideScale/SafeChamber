@@ -20,12 +20,15 @@ const mcp = spyOn(opencodeClient, "listMcpServers")
 const vcs = spyOn(opencodeClient, "getVcs")
 const forms = spyOn(opencodeClient, "listPendingForms")
 const permissions = spyOn(opencodeClient, "listPendingPermissions")
+// Optional enrichment: unstubbed, its failed read would be retried as transient.
+const shells = spyOn(opencodeClient, "listRunningShells")
 // `commands` and `mcp` are spied so the regression test can assert bootstrap
 // never touches them; they are not part of directory initialization.
 const spies = [location, config, statuses, vcs, forms, permissions]
 
 beforeEach(() => {
-  for (const spy of [...spies, commands, mcp]) spy.mockReset()
+  for (const spy of [...spies, commands, mcp, shells]) spy.mockReset()
+  shells.mockImplementation(async (directory) => ({ directory, shells: [] }))
   location.mockImplementation(async (directory) => ({
     directory: directory ?? "/repo",
     project: { id: "project-a", directory: directory ?? "/repo", canonical: directory ?? "/repo" },
@@ -188,7 +191,7 @@ describe("bootstrapDirectory", () => {
       expect(await bootstrap.sessions).toBe("complete")
       expect(await bootstrap.environment).toBe("complete")
       for (const spy of [location, config, vcs]) expect(spy.mock.calls).toEqual([[directory]])
-      for (const spy of [forms, permissions]) expect(spy.mock.calls).toEqual([[{ directories: [directory], includeGlobal: false }]])
+      for (const spy of [forms, permissions]) expect(spy.mock.calls).toEqual([[{ directories: [directory] }]])
       // The directory travels with the read; the client keeps the host's snapshot global and
       // asks a directory inside an isolated space for its own.
       expect(statuses.mock.calls).toEqual([[directory]])

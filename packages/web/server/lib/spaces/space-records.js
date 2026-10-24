@@ -12,6 +12,7 @@ import path from 'node:path';
 import { z } from 'zod';
 
 import { requireSpaceId } from './labels.js';
+import { MAX_KEPT_OUTPUT_CHARACTERS, MAX_SETUP_COMMAND_LENGTH, MAX_SETUP_COMMANDS } from './space-setup.js';
 
 const RECORDS_DIRECTORY = path.join('spaces', 'records');
 
@@ -31,6 +32,8 @@ export const networkSchema = z.object({
 const historySchema = z.enum(['pending', 'sent', 'already_complete', 'host_shallow', 'failed']);
 
 const GRANT_ID_PATTERN = /^[A-Za-z0-9._-]{1,64}$/;
+/** A provider id as the host's catalog names it, which is also the grant id of a model or login grant. */
+export const providerIdSchema = z.string().regex(GRANT_ID_PATTERN);
 // zod runs the refinement even when `.url()` failed, so the parse of the URL must not throw here.
 const isHttpUrl = (value) => {
   try {
@@ -63,11 +66,53 @@ export const grantSchema = z.discriminatedUnion('kind', [
     id: z.string().regex(GRANT_ID_PATTERN),
     upstream: upstreamSchema,
   }).strict(),
+  // A provider's browser login of the host's, since stage 7: the host reads its own login again
+  // at every start, so the record names only the provider and the login method it was made by.
+  z.object({
+    kind: z.literal('login'),
+    id: z.string().regex(GRANT_ID_PATTERN),
+    provider: z.string().regex(GRANT_ID_PATTERN),
+    method: z.string().regex(/^[a-z0-9-]{1,64}$/),
+  }).strict(),
+  // A provider the user defined in the host's OpenCode configuration, "custom" in Settings: its
+  // address, its key and its models are read from the host again at every start, so the record
+  // names only the provider.
+  z.object({
+    kind: z.literal('custom'),
+    id: z.string().regex(GRANT_ID_PATTERN),
+    provider: z.string().regex(GRANT_ID_PATTERN),
+  }).strict(),
 ]);
 const MAX_GRANTS = 100;
 
+// The setup commands' last run (5d-4): begun, finished, or failed with the end of its output,
+// which came from inside the space and is text to show. `space-setup.js` keeps it within these.
+// A failed run keeps when it began, so the client can find what the gatekeeper refused meanwhile;
+// a record from before that has no `startedAt`.
+const setupCountSchema = z.number().int().min(1).max(MAX_SETUP_COMMANDS);
+const setupSchema = z.discriminatedUnion('state', [
+  z.object({ state: z.literal('running'), total: setupCountSchema, startedAt: z.string() }).strict(),
+  z.object({ state: z.literal('done'), total: setupCountSchema, finishedAt: z.string() }).strict(),
+  z.object({
+    state: z.literal('failed'),
+    total: setupCountSchema,
+    index: z.number().int().min(0).max(MAX_SETUP_COMMANDS - 1),
+    command: z.string().max(MAX_SETUP_COMMAND_LENGTH),
+    exitCode: z.number().int().nullable(),
+    timedOut: z.boolean(),
+    output: z.string().max(MAX_KEPT_OUTPUT_CHARACTERS),
+    startedAt: z.string().optional(),
+    finishedAt: z.string(),
+  }).strict(),
+]);
+
 const recordSchema = z.object({
   version: z.literal(1),
+  /** The place the space was made on. A record from before there were two names the local Docker place. */
+  placeId: z.string().min(1).default('docker'),
+  /** The display name and the creation time, as the labels hold them, for a list while the place cannot be asked. */
+  name: z.string().nullable().default(null),
+  created: z.string().nullable().default(null),
   network: networkSchema,
   /** The host repository the code came from, as the user's project names it. */
   repository: z.string().min(1).nullable().default(null),
@@ -78,6 +123,8 @@ const recordSchema = z.object({
   history: historySchema.default('pending'),
   /** The grants the user gave, said again to the gatekeeper after every start. */
   grants: z.array(grantSchema).max(MAX_GRANTS).default([]),
+  /** The setup commands' last run, or null before any. */
+  setup: setupSchema.nullable().default(null),
 });
 
 /**
@@ -103,6 +150,18 @@ export function createSpaceRecords({ dataDir, logger = console }) {
     return { ...raw, grants };
   };
 
+  /**
+   * A setup the host cannot read, from a later version among the reasons, is forgotten with a
+   * warning: it only says how the last run of the setup commands went, and must not make the
+   * network and the grants unreadable with it.
+   */
+  const withReadableSetup = (spaceId, raw) => {
+    if (!(raw instanceof Object) || raw.setup === undefined || raw.setup === null) return raw;
+    if (setupSchema.safeParse(raw.setup).success) return raw;
+    logger.warn?.(`[spaces] the record of space ${spaceId} holds a setup this host cannot read; it is left out`);
+    return { ...raw, setup: null };
+  };
+
   const read = (spaceId) => {
     const file = fileOf(spaceId);
     let text;
@@ -114,7 +173,7 @@ export function createSpaceRecords({ dataDir, logger = console }) {
       return { status: 'unreadable', record: null };
     }
     try {
-      const parsed = recordSchema.safeParse(withReadableGrants(spaceId, JSON.parse(text)));
+      const parsed = recordSchema.safeParse(withReadableSetup(spaceId, withReadableGrants(spaceId, JSON.parse(text))));
       if (parsed.success) return { status: 'ok', record: parsed.data };
     } catch {
       // Reported below.
@@ -149,5 +208,21 @@ export function createSpaceRecords({ dataDir, logger = console }) {
     }
   };
 
-  return { read, write, update, remove };
+  /** Every record the host holds, `{ id, record }`, by space id; one that cannot be read is left out with its warning. */
+  const list = () => {
+    let names;
+    try {
+      names = fs.readdirSync(directory);
+    } catch (error) {
+      if (error?.code !== 'ENOENT') logger.warn?.(`[spaces] could not list the records: ${error?.code ?? error?.message ?? error}`);
+      return [];
+    }
+    return names
+      .filter((name) => /^[0-9a-f]{12}\.json$/.test(name))
+      .map((name) => ({ id: name.slice(0, -5), ...read(name.slice(0, -5)) }))
+      .filter((entry) => entry.status === 'ok')
+      .map(({ id, record }) => ({ id, record }));
+  };
+
+  return { read, write, update, remove, list };
 }

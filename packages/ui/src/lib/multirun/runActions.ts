@@ -5,6 +5,7 @@ import { getWorktreeSetupWaitEnabled } from '@/lib/openchamberConfig';
 import { getRuntimeKey } from '@/lib/runtime-switch';
 import { resolveWorktreeSetupCommands } from '@/lib/sharedTrustConfirmation';
 import { waitForWorktreeBootstrap } from '@/lib/worktrees/worktreeBootstrap';
+import { resolveCreatedWorktreeStartDirectory } from '@/lib/worktrees/worktreeStartDirectory';
 import { createWorktreeWithDefaults } from '@/lib/worktrees/worktreeCreate';
 import { dispatchRunPrompt, registerMultiRunSession, toGitSafeSlug, toModelSlug } from '@/stores/useMultiRunStore';
 import { requestSessionMetadataUpdate } from '@/sync/session-archive-batch';
@@ -14,6 +15,7 @@ import { resolveRunMemberLocation, runSnapshotRef } from './keep';
 import { loadLaneFirstPrompt } from './laneData';
 import { multiRunMembershipPatch, type MultiRunMembership } from './identity';
 import { multiRunVariantLabel, readMultiRunIdentity, type MultiRunSummary } from './runs';
+import { generateUuid } from '@/lib/uuid';
 
 /**
  * Renames the run on every member. Each write is a merge patch of the title
@@ -88,7 +90,7 @@ export async function askOtherModels(input: {
   const membership: MultiRunMembership = {
     version: 1,
     sessionID: session.id,
-    group: { kind: 'id', id: crypto.randomUUID() },
+    group: { kind: 'id', id: generateUuid() },
     groupSlug: toGitSafeSlug(title) || 'multi-run',
     providerID,
     modelID,
@@ -195,7 +197,8 @@ export async function addLaneToRun(input: {
       await waitForWorktreeBootstrap(worktree.path);
       assertCurrent();
     }
-    directory = worktree.path;
+    directory = await resolveCreatedWorktreeStartDirectory(location.project, worktree);
+    assertCurrent();
   }
 
   const session = await createMultiRunSession({
@@ -214,7 +217,7 @@ export async function addLaneToRun(input: {
     selection: { model: { providerID: model.providerID, id: model.modelID, variant: model.variant }, agent: templateSession.agent },
   }, assertCurrent);
   registerMultiRunSession(session, directory);
-  if (worktree) useSessionUIStore.getState().setWorktreeMetadata(session.id, { ...worktree, kind: 'standard' });
+  if (worktree) useSessionUIStore.getState().setWorktreeMetadata(session.id, { ...worktree, kind: 'standard' }, directory);
 
   await dispatchRunPrompt({
     runtimeKey,

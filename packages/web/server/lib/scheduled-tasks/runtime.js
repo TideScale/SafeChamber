@@ -4,6 +4,8 @@ import { CronExpressionParser } from 'cron-parser';
 import { expandSnippets } from '../opencode/snippets.js';
 import { buildGoalIntroText, createSessionGoal } from '../session-goal/create.js';
 import { discoverLoops } from './loops.js';
+import { assertOpenCodeApiResponse } from '../opencode/prompt-response.js';
+import { createExistingSessionTasks } from './existing-session.js';
 
 const DEFAULT_GLOBAL_CONCURRENCY = 4;
 const DEFAULT_PROJECT_CONCURRENCY = 2;
@@ -258,6 +260,15 @@ export const createScheduledTasksRuntime = (deps) => {
     // The goal record lives in OpenChamber's metadata store (OpenCode 2.x takes
     // session metadata only at create time); without it goal mode cannot run.
     persistSessionGoal = null,
+    // Chats scope (see chats-scope.js): scheduled like a project, but each run
+    // opens a new chat directory and loop files are not discovered for it.
+    chatsScope = null,
+    // The session defaults a task with `useDefaults` runs on:
+    // `(projectID) => { providerID, modelID, variant, agent }`, any of them null.
+    readSessionDefaults = null,
+    messageQueueRuntime,
+    resolvePrimaryWorktreeRoot,
+    isSessionArchived,
     logger = console,
     maxGlobalConcurrency = DEFAULT_GLOBAL_CONCURRENCY,
     maxProjectConcurrency = DEFAULT_PROJECT_CONCURRENCY,
@@ -273,8 +284,43 @@ export const createScheduledTasksRuntime = (deps) => {
       ...getOpenCodeAuthHeaders(),
       ...(directory ? { 'x-opencode-directory': encodeURIComponent(directory) } : {}),
     },
-    fetch,
+    fetch: async (...args) => {
+      const response = await fetch(...args);
+      assertOpenCodeApiResponse(response);
+      return response;
+    },
   });
+
+  const existingSessionTasks = messageQueueRuntime ? createExistingSessionTasks({
+    projectConfigRuntime, messageQueueRuntime, createClient: createScopedClient,
+    listProjects, chatsScope, resolvePrimaryWorktreeRoot, isSessionArchived, emitTaskRunEvent,
+  }) : null;
+
+  // A pinned task runs on what it stores; one that follows the session
+  // defaults reads them now, so changing a default reaches it on its next run.
+  const resolveRunSelection = async (projectID, task) => {
+    const execution = task.execution;
+    if (!execution.useDefaults) {
+      return {
+        providerID: execution.providerID ?? null,
+        modelID: execution.modelID ?? null,
+        variant: execution.variant ?? null,
+        agent: execution.agent ?? null,
+      };
+    }
+    try {
+      const defaults = typeof readSessionDefaults === 'function' ? await readSessionDefaults(projectID) : null;
+      return {
+        providerID: defaults?.providerID ?? null,
+        modelID: defaults?.modelID ?? null,
+        variant: defaults?.variant ?? null,
+        agent: defaults?.agent ?? null,
+      };
+    } catch (error) {
+      logger.warn?.('[scheduled-tasks] session defaults unavailable, using OpenCode defaults:', error?.message ?? error);
+      return { providerID: null, modelID: null, variant: null, agent: null };
+    }
+  };
 
   let started = false;
   const tasksByProject = new Map();
@@ -379,13 +425,23 @@ export const createScheduledTasksRuntime = (deps) => {
     }
   };
 
+  const isChatsScope = (projectID) => Boolean(chatsScope) && projectID === chatsScope.id;
+
+  const listScopes = async () => {
+    const projects = await listProjects();
+    if (!chatsScope || projects.some((project) => project?.id === chatsScope.id)) {
+      return projects;
+    }
+    return [...projects, { id: chatsScope.id, path: chatsScope.root }];
+  };
+
   const ensureProjectPath = async (projectID) => {
     if (projectPathByID.has(projectID)) {
       return projectPathByID.get(projectID) || null;
     }
 
     try {
-      const projects = await listProjects();
+      const projects = await listScopes();
       const project = projects.find((item) => item?.id === projectID && item?.path);
       if (project?.path) {
         projectPathByID.set(projectID, project.path);
@@ -402,7 +458,9 @@ export const createScheduledTasksRuntime = (deps) => {
     const projectPath = projectPathByID.get(projectID) || null;
 
     let tasks;
-    if (projectPath) {
+    // The chats root is not a repository: user-scope loops already run once
+    // per project, and discovering them here would add one more run each.
+    if (projectPath && !isChatsScope(projectID)) {
       // Reconcile `.agents/loops` definitions with the persisted task list:
       // loop files are authoritative while present, removed files unschedule
       // their task, and runtime state is preserved (see loops.js).
@@ -422,7 +480,7 @@ export const createScheduledTasksRuntime = (deps) => {
   };
 
   const syncAllProjects = async () => {
-    const projects = await listProjects();
+    const projects = await listScopes();
     const activeProjectIDs = new Set();
     projectPathByID.clear();
     for (const project of projects) {
@@ -476,33 +534,20 @@ export const createScheduledTasksRuntime = (deps) => {
     return projectRunning < maxProjectConcurrency;
   };
 
-  // Never allowed to fail the run: a task that executes without its
-  // background is a lesser loss than a task that does not execute.
-  const resolveKnowledge = (sessionID, projectPath) => (sessionKnowledgeRuntime
-    ? sessionKnowledgeRuntime.resolvePendingForSession(sessionID, projectPath)
-      .catch(() => ({ text: '', signature: '' }))
-    : Promise.resolve({ text: '', signature: '' }));
-
-  // Recorded only after the send is accepted, so a failed dispatch carries
-  // the context again on the next run.
-  const recordKnowledge = async (sessionID, projectPath, knowledge) => {
-    if (knowledge.text && sessionKnowledgeRuntime) {
-      await sessionKnowledgeRuntime.recordDelivered(sessionID, projectPath, knowledge.signature)
-        .catch(() => undefined);
-    }
-  };
+  // Never fails the run (`sync` does not throw): a task that executes without
+  // its background is a lesser loss than a task that does not execute.
+  const syncKnowledge = (sessionID, projectPath) => (sessionKnowledgeRuntime
+    ? sessionKnowledgeRuntime.sync(sessionID, projectPath)
+    : Promise.resolve(false));
 
   const runPrompt = async ({ client, sessionID, projectPath, task }) => {
-    const knowledge = await resolveKnowledge(sessionID, projectPath);
+    await syncKnowledge(sessionID, projectPath);
 
-    // A v2 prompt carries a single authored text. Standing project context and
-    // the goal briefing therefore travel as synthetic messages sent first, so
-    // the model still reads the prompt against them exactly as before. A
-    // synthetic message schedules execution unless `resume: false`: without
-    // it the model would start on the briefing alone, before the task arrived.
-    if (knowledge.text) {
-      await client.session.synthetic({ sessionID, text: knowledge.text, resume: false });
-    }
+    // A v2 prompt carries a single authored text. The goal briefing therefore
+    // travels as a synthetic message sent first, so the model still reads the
+    // prompt against it exactly as before. A synthetic message schedules
+    // execution unless `resume: false`: without it the model would start on
+    // the briefing alone, before the task arrived.
     if (task.execution.goalEnabled) {
       await client.session.synthetic({ sessionID, text: buildGoalIntroText(task.execution.goalTokenBudget), resume: false });
     }
@@ -511,8 +556,6 @@ export const createScheduledTasksRuntime = (deps) => {
       sessionID,
       text: expandSnippets(task.execution.prompt, projectPath),
     });
-
-    await recordKnowledge(sessionID, projectPath, knowledge);
   };
 
   const resolveScheduledCommand = async ({ client, projectPath, task }) => {
@@ -537,12 +580,7 @@ export const createScheduledTasksRuntime = (deps) => {
   };
 
   const runScheduledCommand = async ({ client, sessionID, projectPath, command }) => {
-    // The command route takes no extra parts, so standing context goes in
-    // first as a synthetic message that does not start execution.
-    const knowledge = await resolveKnowledge(sessionID, projectPath);
-    if (knowledge.text) {
-      await client.session.synthetic({ sessionID, text: knowledge.text, resume: false });
-    }
+    await syncKnowledge(sessionID, projectPath);
     // Agent, model and variant are session properties in v2 and were already
     // set when the run created the session; the command body only carries text.
     await client.session.command({
@@ -551,10 +589,9 @@ export const createScheduledTasksRuntime = (deps) => {
       name: command.command,
       text: command.arguments,
     });
-    await recordKnowledge(sessionID, projectPath, knowledge);
   };
 
-  const runTaskWithWatchdog = async (projectID, task, reason) => {
+  const runTaskWithWatchdog = async (projectID, task, reason, onSessionCreated) => {
     const startedAt = Date.now();
     const title = formatScheduledSessionTitle(task, startedAt);
     const projectPath = projectPathByID.get(projectID);
@@ -566,26 +603,49 @@ export const createScheduledTasksRuntime = (deps) => {
       await waitForOpenCodeReady(10_000, 250);
     }
 
+    // A chats-scope run is a new chat, so it gets its own directory the way a
+    // chat started from the UI does; a project run works in the project.
+    const directory = isChatsScope(projectID)
+      ? await chatsScope.createChatDirectory(new Date(startedAt))
+      : projectPath;
+
     const baseUrl = openCodeOrigin();
     const authHeaders = getOpenCodeAuthHeaders();
-    const client = createScopedClient(projectPath);
+    const client = createScopedClient(directory);
+    const selection = await resolveRunSelection(projectID, task);
 
     // Agent, model and variant belong to the session in v2: a scheduled run
     // fixes them here instead of repeating them on every prompt.
-    const session = await client.session.create({
-      title,
-      location: { directory: projectPath },
-      model: {
-        providerID: task.execution.providerID,
-        id: task.execution.modelID,
-        ...(task.execution.variant ? { variant: task.execution.variant } : {}),
-      },
-      ...(task.execution.agent ? { agent: task.execution.agent } : {}),
-    });
-    const sessionID = session?.id;
-    if (!sessionID) {
-      throw new Error('failed to create session');
+    let sessionID;
+    try {
+      const session = await client.session.create({
+        title,
+        location: { directory },
+        // Marks a run of a task, so it stays out of In work: nobody sent it.
+        metadata: { openchamber: { kind: 'scheduled' } },
+        // No model or agent at all: OpenCode picks its own default.
+        ...(selection.providerID && selection.modelID ? {
+          model: {
+            providerID: selection.providerID,
+            id: selection.modelID,
+            ...(selection.variant ? { variant: selection.variant } : {}),
+          },
+        } : {}),
+        ...(selection.agent ? { agent: selection.agent } : {}),
+      });
+      sessionID = session?.id;
+      if (!sessionID) {
+        throw new Error('failed to create session');
+      }
+    } catch (error) {
+      if (directory !== projectPath) {
+        await chatsScope.discardChatDirectory(directory);
+      }
+      throw error;
     }
+
+    // Before the event, so a UI refreshing on it already sees the session.
+    await onSessionCreated?.(sessionID);
 
     try {
       emitTaskRunEvent?.({
@@ -603,13 +663,13 @@ export const createScheduledTasksRuntime = (deps) => {
       // is already auto-approved. Enrollment failure must not kill the run —
       // the task still executes, permissions just wait for the user.
       try {
-        await setSessionAutoAccept(sessionID, true, projectPath);
+        await setSessionAutoAccept(sessionID, true, directory);
       } catch (error) {
         logger.warn?.('[scheduled-tasks] failed to enable permission auto-accept for session', sessionID, error?.message ?? error);
       }
     }
 
-    const scheduledCommand = await resolveScheduledCommand({ client, projectPath, task });
+    const scheduledCommand = await resolveScheduledCommand({ client, projectPath: directory, task });
 
     if (task.execution.goalEnabled) {
       const commandObjective = scheduledCommand
@@ -620,24 +680,25 @@ export const createScheduledTasksRuntime = (deps) => {
         authHeaders,
         persistSessionGoal,
         sessionID,
-        directory: projectPath,
-        objective: commandObjective ?? expandSnippets(task.execution.prompt, projectPath),
+        directory,
+        objective: commandObjective ?? expandSnippets(task.execution.prompt, directory),
         tokenBudget: task.execution.goalTokenBudget,
-        providerID: task.execution.providerID,
-        modelID: task.execution.modelID,
+        providerID: selection.providerID ?? undefined,
+        modelID: selection.modelID ?? undefined,
         onWarning: (message, error) => console.warn(`[scheduled-tasks] ${message}:`, error?.message || error),
       });
     }
 
     if (scheduledCommand) {
-      await runScheduledCommand({ client, sessionID, projectPath, command: scheduledCommand });
+      await runScheduledCommand({ client, sessionID, projectPath: directory, command: scheduledCommand });
     } else {
-      await runPrompt({ client, sessionID, projectPath, task });
+      await runPrompt({ client, sessionID, projectPath: directory, task });
     }
 
     const finishedAt = Date.now();
     return {
       sessionID,
+      directory,
       durationMs: Math.max(0, finishedAt - startedAt),
       reason,
       startedAt,
@@ -697,6 +758,27 @@ export const createScheduledTasksRuntime = (deps) => {
       return { ok: false, skipped: true };
     }
 
+    if (task.targetSessionId) {
+      if (!existingSessionTasks) return { ok: false, error: 'Existing-session scheduling is unavailable', statusCode: 503 };
+      const nextRunAt = computeNextRunAt(task, Math.max(Date.now(), (scheduledFor ?? 0) + 1));
+      const result = await existingSessionTasks.run(projectID, task, reason, scheduledFor, nextRunAt);
+      if (reason === 'scheduled') {
+        if (task.schedule.kind === 'once' && result.task && !result.skipped) {
+          try {
+            const consumed = await projectConfigRuntime.upsertScheduledTask(projectID, { ...result.task, enabled: false });
+            updateInMemoryTask(projectID, consumed.task);
+          } catch (consumeError) {
+            logger.warn?.('[ScheduledTasks] failed to consume one-time task', {
+              projectID,
+              taskID,
+              error: safeErrorMessage(consumeError),
+            });
+          }
+        } else scheduleFutureRun(projectID, taskID, nextRunAt);
+      }
+      return result;
+    }
+
     const taskKey = buildTaskKey(projectID, taskID);
     if (runningTaskKeys.has(taskKey)) {
       return { ok: false, running: true };
@@ -726,6 +808,8 @@ export const createScheduledTasksRuntime = (deps) => {
           lastRunAt: runStartedAt,
           lastStatus: 'running',
           lastError: undefined,
+          // Set again once this run creates its session.
+          lastSessionId: undefined,
           updatedAt: runStartedAt,
           // Always set nextRunAt so a past once-slot is cleared when there is
           // no following occurrence (omitting the key would leave the past value).
@@ -846,6 +930,7 @@ export const createScheduledTasksRuntime = (deps) => {
             lastRunAt: runStartedAt,
             lastStatus: 'running',
             lastError: undefined,
+            lastSessionId: undefined,
             updatedAt: runStartedAt,
           });
           if (startResult.task) {
@@ -864,11 +949,30 @@ export const createScheduledTasksRuntime = (deps) => {
 
       let status = 'success';
       let sessionID;
+      let sessionDirectory;
       let durationMs = 0;
       let errorMessage;
+      // Known as soon as the run creates its session, so a run that fails or
+      // times out afterwards still points at the session it left behind.
+      let createdSessionID;
+      const recordCreatedSession = async (id) => {
+        createdSessionID = id;
+        try {
+          const recorded = await projectConfigRuntime.updateScheduledTaskState(projectID, taskID, { lastSessionId: id });
+          if (recorded.task) {
+            updateInMemoryTask(projectID, recorded.task);
+          }
+        } catch (error) {
+          logger.warn?.('[ScheduledTasks] failed to record the run session', {
+            projectID,
+            taskID,
+            error: safeErrorMessage(error),
+          });
+        }
+      };
 
       try {
-        const runPromise = runTaskWithWatchdog(projectID, task, reason);
+        const runPromise = runTaskWithWatchdog(projectID, task, reason, recordCreatedSession);
         let timeoutID;
         const timeoutPromise = new Promise((_, reject) => {
           timeoutID = setTimeout(() => {
@@ -882,6 +986,7 @@ export const createScheduledTasksRuntime = (deps) => {
           }
         });
         sessionID = result.sessionID;
+        sessionDirectory = result.directory;
         durationMs = result.durationMs;
         status = 'success';
         logger.info?.(
@@ -929,7 +1034,7 @@ export const createScheduledTasksRuntime = (deps) => {
         lastStatus: status,
         lastDurationMs: durationMs,
         lastError: status === 'error' ? errorMessage : undefined,
-        lastSessionId: status === 'success' ? sessionID : undefined,
+        lastSessionId: sessionID ?? createdSessionID,
         nextRunAt: Number.isFinite(nextRunAt) ? nextRunAt : undefined,
         updatedAt: finishedAt,
       };
@@ -966,7 +1071,7 @@ export const createScheduledTasksRuntime = (deps) => {
             lastStatus: status,
             lastDurationMs: durationMs,
             lastError: status === 'error' ? errorMessage : undefined,
-            lastSessionId: status === 'success' ? sessionID : undefined,
+            lastSessionId: sessionID ?? createdSessionID,
             nextRunAt: Number.isFinite(nextRunAt) ? nextRunAt : undefined,
             updatedAt: finishedAt,
           },
@@ -1000,6 +1105,7 @@ export const createScheduledTasksRuntime = (deps) => {
           ok: status === 'success',
           status,
           sessionID,
+          directory: sessionDirectory,
           task: stateResult.task || recoveredTask,
           error: status === 'error' ? errorMessage : undefined,
           persistError: message,
@@ -1022,6 +1128,7 @@ export const createScheduledTasksRuntime = (deps) => {
         ok: status === 'success',
         status,
         sessionID,
+        directory: sessionDirectory,
         task: stateResult.task || null,
         error: errorMessage,
       };
@@ -1135,5 +1242,10 @@ export const createScheduledTasksRuntime = (deps) => {
     syncProject,
     runNow,
     getStatus,
+    validateTarget: (projectID, sessionID) => existingSessionTasks.validateTarget(projectID, sessionID),
+    listEligibleTargets: (projectID, candidates) => existingSessionTasks.listEligibleTargets(projectID, candidates),
+    beforeScheduledTaskSend: (sessionID, directory, item) => existingSessionTasks.beforeSend(sessionID, directory, item),
+    onScheduledTaskResult: (provenance, status, error) => existingSessionTasks.result(provenance, status, error),
+    cancelWaitingPrompt: (projectID, taskID) => existingSessionTasks?.cancel(projectID, taskID),
   };
 };

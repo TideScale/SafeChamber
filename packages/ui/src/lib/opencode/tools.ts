@@ -20,7 +20,7 @@
 
 import { z } from "zod"
 
-import type { Metadata, ToolInput } from "./model"
+import type { JsonValue, Metadata, ToolInput, ToolState } from "./model"
 
 /** Built-in tool names as the server reports them. */
 export const OPENCODE_TOOLS = {
@@ -75,10 +75,14 @@ export const isExecuteTool = is(OPENCODE_TOOLS.execute)
 export const isSubagentTool = is(OPENCODE_TOOLS.subagent)
 export const isQuestionTool = is(OPENCODE_TOOLS.question)
 export const isSkillTool = is(OPENCODE_TOOLS.skill)
-export const isReadTool = is(OPENCODE_TOOLS.read)
 export const isEditTool = is(OPENCODE_TOOLS.edit)
 export const isWriteTool = is(OPENCODE_TOOLS.write)
 export const isPatchTool = is(OPENCODE_TOOLS.patch)
+
+// Tools whose transcript row opens the read file or skill in the app and never
+// shows the call's result.
+const NAVIGATION_TOOLS = new Set<string>([OPENCODE_TOOLS.read, OPENCODE_TOOLS.skill])
+export const isNavigationTool = (toolName: ToolName): boolean => NAVIGATION_TOOLS.has(normalizeToolName(toolName))
 
 const FILE_CHANGE_TOOLS = new Set<string>([OPENCODE_TOOLS.edit, OPENCODE_TOOLS.write, OPENCODE_TOOLS.patch])
 const EXPLORATION_TOOLS = new Set<string>([
@@ -101,12 +105,6 @@ export const carriesFileDiffs = (toolName: ToolName): boolean => {
 export const isExplorationTool = (toolName: ToolName): boolean => EXPLORATION_TOOLS.has(normalizeToolName(toolName))
 export const isWebTool = (toolName: ToolName): boolean => WEB_TOOLS.has(normalizeToolName(toolName))
 export const isWebSearchTool = (toolName: ToolName): boolean => normalizeToolName(toolName) === OPENCODE_TOOLS.websearch
-
-/**
- * Tools that block the turn on a form the user must answer. Only `question`
- * does this today; the form itself renders as its own card.
- */
-export const blocksOnForm = isQuestionTool
 
 // ---------------------------------------------------------------------------
 // Input and metadata accessors
@@ -139,6 +137,23 @@ const inputSchema = z
     url: optionalText,
     code: optionalText,
     questions: z.array(z.unknown()).optional().catch(undefined),
+    // OpenChamber's own tools: one `action` plus its `parameters`.
+    action: optionalText,
+    parameters: z
+      .object({
+        title: optionalText,
+        name: optionalText,
+        prompt: optionalText,
+        path: optionalText,
+        url: optionalText,
+        query: optionalText,
+        text: optionalText,
+        selector: optionalText,
+        taskId: optionalText,
+        link: z.object({ identifier: optionalText, title: optionalText }).optional().catch(undefined),
+      })
+      .optional()
+      .catch(undefined),
   })
   .catch({})
 
@@ -169,6 +184,8 @@ const metadataSchema = z
     files: z.array(fileDiffSchema.nullable().catch(null)).optional().catch(undefined),
     sessionID: optionalText,
     sessionId: optionalText,
+    shellID: optionalText,
+    status: optionalText,
     name: optionalText,
     toolCalls: z.array(executeToolCallSchema.nullable().catch(null)).optional().catch(undefined),
     truncated: z.boolean().optional().catch(undefined),
@@ -179,6 +196,34 @@ const metadataSchema = z
 type ParsedInput = z.infer<typeof inputSchema>
 
 const readInput = (input: ToolInput | undefined): ParsedInput => inputSchema.parse(input ?? {})
+
+const renderPageFields = z.object({
+  html: z.string().optional().catch(undefined),
+  title: optionalText,
+  awaitAnswer: z.boolean().optional().catch(undefined),
+})
+
+// The plugin accepts the inputs inside `parameters` or beside `action`, and an
+// explicit `parameters` object wins, so the page is read the same way.
+const renderPageInputSchema = renderPageFields
+  .extend({ parameters: renderPageFields.optional().catch(undefined) })
+  .catch({})
+
+// What the user answered on a page that waited (render.page with
+// awaitAnswer), as the plugin records it in the call's metadata.
+const pageAnswerSchema = z.union([
+  z.object({ answered: z.literal(true), summary: z.string(), data: z.json().catch(null) }),
+  z.object({ answered: z.literal(false) }),
+])
+
+const openChamberResultSchema = z
+  .object({
+    openchamber: z.object({
+      ok: z.boolean().optional().catch(undefined),
+      answer: pageAnswerSchema.optional().catch(undefined),
+    }).optional().catch(undefined),
+  })
+  .catch({})
 
 /** One entry of a tool's `metadata.files` (`FileDiff.Info` on the wire). */
 export type ToolFileDiff = z.infer<typeof fileDiffSchema> & { file: string }
@@ -213,6 +258,16 @@ export type ExecuteToolCall = {
 
 const MAX_EXECUTE_CALL_INPUT_LENGTH = 160
 
+/** Blocking work in a running `execute`, including progress forwarded by its child tool. */
+export function executeHasBackgroundableWork(metadata: Metadata | undefined): boolean {
+  const parsed = metadataSchema.parse(metadata ?? {})
+  // Child progress replaces Code Mode's call list while shell/subagent waits.
+  if (parsed.shellID || (parsed.status === "running" && (parsed.sessionID || parsed.sessionId))) return true
+  return (parsed.toolCalls ?? []).some((call) => (
+    call?.status === "running" && (isShellTool(call.tool) || isSubagentTool(call.tool))
+  ))
+}
+
 /**
  * The tools an `execute` script called, in order. Entries without a tool name
  * are dropped rather than failing the list, so one malformed call cannot erase
@@ -239,6 +294,25 @@ export function executeToolCalls(metadata: Metadata | undefined): ExecuteToolCal
   return parsed
 }
 
+const executeRawCallSchema = z
+  .object({
+    toolCalls: z
+      .array(z.object({ tool: optionalText, input: z.json().optional().catch(undefined) }).nullable().catch(null))
+      .optional()
+      .catch(undefined),
+  })
+  .catch({})
+
+/** The newest call an `execute` script made, with its arguments as the script passed them. */
+export function lastExecuteToolCall(metadata: Metadata | undefined): { tool: string; input?: JsonValue } | undefined {
+  const calls = executeRawCallSchema.parse(metadata ?? {}).toolCalls ?? []
+  for (let index = calls.length - 1; index >= 0; index -= 1) {
+    const call = calls[index]
+    if (call?.tool) return { tool: call.tool, input: call.input }
+  }
+  return undefined
+}
+
 /** `JSON.stringify` that answers `undefined` for anything it cannot serialize. */
 function stringifyOrUndefined(value: ExecuteToolCallInput): string | undefined {
   if (value === undefined || value === null) return undefined
@@ -263,6 +337,74 @@ export function executeOutputTruncation(metadata: Metadata | undefined): { outpu
 /** The script an `execute` call ran (`input.code`). */
 export function executeScript(input: ToolInput | undefined): string | undefined {
   return readInput(input).code
+}
+
+/** The agent a `subagent` call runs (`input.agent`). */
+const isRenderTool = (toolName: ToolName): boolean => toolName === OPENCHAMBER_RENDER_TOOL
+
+/** Where a page stands on the user's answer. */
+export type RenderedPageAsk =
+  | { kind: "show" }
+  | { kind: "waiting" }
+  | { kind: "answered"; summary: string; data: JsonValue }
+  | { kind: "answered-in-chat" }
+  | { kind: "unanswered" }
+
+// A page sent without a title is named after its own <title>, else its first
+// h1 to h3: the server accepts such a call and names it with the same rule
+// (renderPageTitleFromHtml in
+// packages/web/server/lib/openchamber-control/render-page.js); change both
+// together. The server's last resort, "Page", is the chat's own localized word.
+const TITLE_ENTITIES = { amp: "&", lt: "<", gt: ">", quot: "\"", "#39": "'", apos: "'", nbsp: " " } as const
+const RENDER_PAGE_MAX_TITLE_LENGTH = 120
+const elementText = (html: string, pattern: RegExp): string => (pattern.exec(html)?.[1] ?? "")
+  .replace(/<[^>]*>/g, " ")
+  .replace(/&(amp|lt|gt|quot|#39|apos|nbsp);/g, (_, entity: keyof typeof TITLE_ENTITIES) => TITLE_ENTITIES[entity])
+  .replace(/\s+/g, " ")
+  .trim()
+const pageTitleFromHtml = (html: string): string => (
+  elementText(html, /<title\b[^>]*>([\s\S]*?)<\/title>/i)
+  || elementText(html, /<h[1-3]\b[^>]*>([\s\S]*?)<\/h[1-3]>/i)
+).slice(0, RENDER_PAGE_MAX_TITLE_LENGTH).trim()
+
+/**
+ * The page an `openchamber_render` call showed: present once OpenChamber
+ * accepted the call, so a refused or unfinished call keeps its tool row. A
+ * page that waits for the user's answer shows while its call runs, since the
+ * call runs until the user answers, and after a call that failed while waiting.
+ */
+export function renderedPage(
+  toolName: ToolName,
+  state: ToolState,
+): { html: string; title: string; ask: RenderedPageAsk } | null {
+  if (!isRenderTool(toolName)) return null
+  const parsed = renderPageInputSchema.parse(state.input ?? {})
+  const html = parsed.parameters?.html ?? parsed.html
+  if (!html?.trim()) return null
+  // Empty when neither the call nor the page names it; the chat shows its own word then.
+  const title = (parsed.parameters?.title ?? parsed.title)?.trim() || pageTitleFromHtml(html)
+  // A page that waited stays in the chat when its call ends without an
+  // answer (the user stopped the turn), so the question it asked is still there.
+  if ((parsed.parameters?.awaitAnswer ?? parsed.awaitAnswer) === true) {
+    if (state.status === "running") return { html, title, ask: { kind: "waiting" } }
+    if (state.status === "error") return { html, title, ask: { kind: "unanswered" } }
+  }
+  if (state.status !== "completed") return null
+  const result = openChamberResultSchema.parse(state.metadata ?? {}).openchamber
+  if (result?.ok !== true) return null
+  const answer = result.answer
+  if (answer?.answered === true) return { html, title, ask: { kind: "answered", summary: answer.summary, data: answer.data } }
+  if (answer?.answered === false) return { html, title, ask: { kind: "answered-in-chat" } }
+  return { html, title, ask: { kind: "show" } }
+}
+
+export function subagentAgent(input: ToolInput | undefined): string | undefined {
+  return readInput(input).agent
+}
+
+/** The short label a `subagent` call gives its task (`input.description`). */
+export function subagentDescription(input: ToolInput | undefined): string | undefined {
+  return readInput(input).description
 }
 
 /** The child session a `subagent` call runs in (`metadata.sessionID`). */
@@ -299,6 +441,96 @@ const MAX_COMMAND_LENGTH = 100
 const MAX_DESCRIBED_TOOL_CALLS = 4
 const MAX_TEXT_LENGTH = 120
 
+const OPENCHAMBER_RENDER_TOOL = "openchamber_render"
+
+/** The control, schedule, browser, memory, knowledge, notify and render tools OpenChamber gives every session. */
+const OPENCHAMBER_TOOLS = new Set(["openchamber", "openchamber_schedule", "openchamber_web", "openchamber_memory", "openchamber_knowledge", "openchamber_notify", OPENCHAMBER_RENDER_TOOL])
+
+const openChamberCallSchema = z
+  .object({
+    action: optionalText,
+    awaitAnswer: z.boolean().optional().catch(undefined),
+    parameters: z.object({ awaitAnswer: z.boolean().optional().catch(undefined) }).optional().catch(undefined),
+  })
+  .catch({})
+
+/** A call to one of OpenChamber's own tools: which tool, the `action` it ran, and whether its page waits for the user. */
+export type OpenChamberToolCall = { tool: string; action?: string; awaitsAnswer: boolean }
+
+/**
+ * The tools of OpenCode's `opencode` namespace, which manage OpenCode itself.
+ * They run inside Code Mode, which names them by registry id
+ * (`opencode_session_rename`); the dotted form is how the namespace is written.
+ */
+const OPENCODE_NAMESPACE_TOOLS = new Set([
+  "session_rename",
+  "session_move",
+  "worktree_create",
+  "worktree_list",
+  "worktree_remove",
+  "models",
+  "list_mcp_resources",
+  "read_mcp_resource",
+])
+const OPENCODE_NAMESPACE_PREFIX = "opencode_"
+
+/** The bare name (`session_rename`) of a tool in the `opencode` namespace, else `undefined`. */
+export function opencodeNamespaceTool(toolName: ToolName): string | undefined {
+  const trimmed = toolName?.trim().toLowerCase() ?? ""
+  const name = trimmed.startsWith(OPENCODE_NAMESPACE_PREFIX)
+    ? trimmed.slice(OPENCODE_NAMESPACE_PREFIX.length)
+    : normalizeToolName(trimmed)
+  return OPENCODE_NAMESPACE_TOOLS.has(name) ? name : undefined
+}
+
+/**
+ * The MCP server a tool comes from. OpenCode names an MCP tool
+ * `<server>_<tool>`, with every character of the server name outside
+ * `[A-Za-z0-9_-]` replaced by `_`. A server name may hold `_` itself, so only
+ * the known server names can split the tool name; the longest match wins.
+ */
+export function mcpToolServer(toolName: ToolName, servers: readonly string[]): string | undefined {
+  const trimmed = toolName?.trim() ?? ""
+  let match: string | undefined
+  for (const server of servers) {
+    const prefix = `${server.replace(/[^a-zA-Z0-9_-]/g, "_")}_`
+    if (trimmed.length > prefix.length && trimmed.startsWith(prefix) && server.length > (match?.length ?? 0)) match = server
+  }
+  return match
+}
+
+/** `null` for every tool that is not OpenChamber's own. */
+export function openChamberToolCall(toolName: ToolName, input: JsonValue | undefined): OpenChamberToolCall | null {
+  const tool = normalizeToolName(toolName)
+  if (!OPENCHAMBER_TOOLS.has(tool)) return null
+  const parsed = openChamberCallSchema.parse(input ?? {})
+  return { tool, action: parsed.action, awaitsAnswer: (parsed.parameters?.awaitAnswer ?? parsed.awaitAnswer) === true }
+}
+
+/**
+ * The action an OpenChamber tool call ran and the one detail that tells calls
+ * apart: what was linked, created, saved, opened or asked. Notifications have
+ * no action, so their title stands alone.
+ */
+function describeOpenChamberTool(parsed: ParsedInput): ToolDescription | null {
+  const parameters = parsed.parameters
+  const link = parameters?.link
+  const linked = link ? [link.identifier, link.title].filter(Boolean).join(" ") : undefined
+  const detail = linked
+    || parameters?.title
+    || parameters?.name
+    || parameters?.path
+    || parameters?.url
+    || parameters?.query
+    || parameters?.text
+    || parameters?.selector
+    || parameters?.prompt?.split("\n")[0]
+    || parameters?.taskId
+    || parsed.title
+  const label = [parsed.action, detail].filter(Boolean).join(" · ")
+  return label ? { kind: "text", value: label.slice(0, MAX_COMMAND_LENGTH) } : null
+}
+
 const text = (value: string | undefined): ToolDescription | null =>
   value ? { kind: "text", value: value.slice(0, MAX_TEXT_LENGTH) } : null
 
@@ -321,6 +553,47 @@ export function patchInputFiles(input: ToolInput | undefined): string[] {
     if (file && !files.includes(file)) files.push(file)
   }
   return files
+}
+
+/** Built-ins that never add, remove or move a file. `edit` refuses to create one. */
+const LISTING_NEUTRAL_TOOLS = new Set<string>([
+  OPENCODE_TOOLS.edit,
+  OPENCODE_TOOLS.read,
+  OPENCODE_TOOLS.grep,
+  OPENCODE_TOOLS.glob,
+  OPENCODE_TOOLS.skill,
+  OPENCODE_TOOLS.webfetch,
+  OPENCODE_TOOLS.websearch,
+  OPENCODE_TOOLS.question,
+  // A subagent's own calls arrive in its child session.
+  OPENCODE_TOOLS.subagent,
+  OPENCODE_TOOLS.sessionRename,
+  OPENCODE_TOOLS.sessionMove,
+  OPENCODE_TOOLS.models,
+])
+
+/**
+ * The files whose directory listing a finished call may have changed, as the
+ * call named them (relative to the session directory, or absolute). `write`
+ * may create its file; `patch` adds, deletes and moves, so both the paths in
+ * its text and the ones it reported count. An empty list means the call
+ * changed no listing. `null` means it could have touched any file: `shell`,
+ * `execute`, and every MCP or plugin tool.
+ */
+export function toolListingChanges(
+  toolName: ToolName,
+  input: ToolInput | undefined,
+  metadata: Metadata | undefined,
+): string[] | null {
+  const name = normalizeToolName(toolName)
+  if (name === OPENCODE_TOOLS.write) {
+    const path = toolInputPath(input)
+    return path ? [path] : []
+  }
+  if (name === OPENCODE_TOOLS.patch) {
+    return [...new Set([...patchInputFiles(input), ...toolFileDiffs(metadata).map((file) => file.file)])]
+  }
+  return LISTING_NEUTRAL_TOOLS.has(name) ? [] : null
 }
 
 /**
@@ -405,6 +678,7 @@ export function toolDescription(
 
     // MCP and plugin tools: anything they call a description, then a path.
     default:
+      if (OPENCHAMBER_TOOLS.has(name)) return describeOpenChamberTool(parsed)
       return text(parsed.description) ?? asPath(parsed.path ?? parsed.filePath ?? parsed.file_path)
   }
 }

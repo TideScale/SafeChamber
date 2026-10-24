@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import { createPermissionAutoAcceptRuntime } from './runtime.js';
 
-const createRuntime = ({ stored, fetchImpl, retryDelaysMs = [0], evaluatePermission, onPermissionReplied, resolveLegacyEnabledMode } = {}) => {
+const createRuntime = ({ stored, fetchImpl, retryDelaysMs = [0], evaluatePermission, onPermissionReplied, resolveLegacyEnabledMode, broadcastGlobalUiEvent, beforePersist } = {}) => {
   let settings = stored ?? { permissionAutoAccept: { sessions: {} } };
   let eventHandler;
   let statusHandler;
@@ -13,12 +13,16 @@ const createRuntime = ({ stored, fetchImpl, retryDelaysMs = [0], evaluatePermiss
     buildOpenCodeUrl: (path) => `http://opencode.test${path}`,
     getOpenCodeAuthHeaders: () => ({}),
     readSettingsFromDiskMigrated: async () => settings,
-    persistSettings: async (changes) => { settings = { ...settings, ...changes }; },
+    persistSettings: async (changes) => {
+      await beforePersist?.(changes);
+      settings = { ...settings, ...changes };
+    },
     fetchImpl: fetchImpl ?? vi.fn(async () => new Response('[]')),
     retryDelaysMs,
     evaluatePermission,
     onPermissionReplied,
     resolveLegacyEnabledMode,
+    broadcastGlobalUiEvent,
   });
   runtime.start();
   return {
@@ -98,6 +102,23 @@ describe('permission auto-accept runtime', () => {
     await expect(runtime.resolveSessionMode('root', '/project')).resolves.toBe('ask');
   });
 
+  it('saves the next mode change after one failed to persist', async () => {
+    let failNext = true;
+    const { runtime, getSettings } = createRuntime({
+      beforePersist: async () => {
+        if (!failNext) return;
+        failNext = false;
+        throw new Error('ENOSPC: no space left on device, write');
+      },
+    });
+
+    await expect(runtime.setSessionPolicy('root', 'auto')).rejects.toThrow('ENOSPC');
+    expect((await runtime.load()).modes).toEqual({});
+
+    await expect(runtime.setSessionPolicy('root', 'safety')).resolves.toMatchObject({ modes: { root: 'safety' }, revision: 1 });
+    expect(getSettings().permissionAutoAccept).toEqual({ sessions: { root: 'safety' }, revision: 1 });
+  });
+
   it('increments the authoritative policy revision', async () => {
     const { runtime, getSettings } = createRuntime();
 
@@ -147,6 +168,75 @@ describe('permission auto-accept runtime', () => {
     expect(fetchImpl.mock.calls.some(([url, init]) => new URL(url).pathname === '/api/session/child/permission/perm/reply' && init.method === 'POST')).toBe(true);
   });
 
+  it('fetches the lineage of a subagent first seen through a partial update', async () => {
+    const fetchImpl = vi.fn(async (url, init = {}) => {
+      const path = new URL(url).pathname;
+      if (path === '/api/session/child') return Response.json({ data: { id: 'child', parentID: 'root', location: { directory: '/project' } } });
+      if (init.method === 'POST') return Response.json({});
+      return new Response('[]');
+    });
+    const { runtime, emit } = createRuntime({ stored: { permissionAutoAccept: { sessions: { root: 'auto' } } }, fetchImpl });
+    // After a restart, a running subagent's first event is its usage update,
+    // which carries no parentID.
+    emit({ type: 'session.updated', properties: { info: { id: 'child', cost: 0.1 } } });
+    await expect(runtime.processPermission({ id: 'perm', sessionID: 'child' }, '/project')).resolves.toBe(true);
+    await expect(runtime.isPermissionAutoAnswered('child', '/project', 'perm')).resolves.toBe(true);
+    expect(fetchImpl.mock.calls.some(([url, init]) => new URL(url).pathname === '/api/session/child/permission/perm/reply' && init.method === 'POST')).toBe(true);
+  });
+
+  it('trusts a created session without a parent as top-level', async () => {
+    const fetchImpl = vi.fn(async () => new Response('[]'));
+    const { runtime, emit } = createRuntime({ fetchImpl });
+    emit({ type: 'session.created', properties: { info: { id: 'root' } } });
+    emit({ type: 'session.updated', properties: { info: { id: 'root', title: 'Renamed' } } });
+    await expect(runtime.resolveSessionMode('root', '/project')).resolves.toBe('ask');
+    expect(fetchImpl.mock.calls.some(([url]) => new URL(url).pathname === '/api/session/root')).toBe(false);
+  });
+
+  it('retries a failed lineage lookup before leaving the request for the user', async () => {
+    let lookups = 0;
+    const fetchImpl = vi.fn(async (url, init = {}) => {
+      const path = new URL(url).pathname;
+      if (path === '/api/session/child') {
+        lookups += 1;
+        return lookups === 1 ? new Response('', { status: 503 }) : Response.json({ id: 'child', parentID: 'root' });
+      }
+      if (init.method === 'POST') return Response.json({});
+      return new Response('[]');
+    });
+    const { runtime } = createRuntime({
+      stored: { permissionAutoAccept: { sessions: { root: 'auto' } } },
+      fetchImpl,
+      retryDelaysMs: [0, 0],
+    });
+    await expect(runtime.processPermission({ id: 'perm', sessionID: 'child' }, '/project')).resolves.toBe(true);
+    expect(lookups).toBe(2);
+    expect(fetchImpl.mock.calls.some(([url, init]) => new URL(url).pathname === '/api/session/child/permission/perm/reply' && init.method === 'POST')).toBe(true);
+  });
+
+  it('lets notifications wait for the retried reply when their own lineage lookup fails', async () => {
+    let replyLookups = 0;
+    const fetchImpl = vi.fn(async (url, init = {}) => {
+      const path = new URL(url).pathname;
+      if (path === '/api/session/child') {
+        // The notification asks with another directory; its lookup always fails.
+        if (directoryHeader(init) === '/notify') return new Response('', { status: 503 });
+        replyLookups += 1;
+        return replyLookups === 1 ? new Response('', { status: 503 }) : Response.json({ id: 'child', parentID: 'root' });
+      }
+      if (init.method === 'POST') return Response.json({});
+      return new Response('[]');
+    });
+    const { runtime } = createRuntime({
+      stored: { permissionAutoAccept: { sessions: { root: 'auto' } } },
+      fetchImpl,
+      retryDelaysMs: [0, 0],
+    });
+    const replied = runtime.processPermission({ id: 'perm', sessionID: 'child' }, '/project');
+    await expect(runtime.isPermissionAutoAnswered('child', '/notify', 'perm')).resolves.toBe(true);
+    await expect(replied).resolves.toBe(true);
+  });
+
   it('retries a transient reply failure and deduplicates concurrent events', async () => {
     let replyAttempts = 0;
     const fetchImpl = vi.fn(async (url, init = {}) => {
@@ -170,12 +260,16 @@ describe('permission auto-accept runtime', () => {
     expect(replyAttempts).toBe(2);
   });
 
-  it('reconciles pending permissions after reconnect', async () => {
+  it('reconciles pending permissions after reconnect in the directories of running sessions', async () => {
     const fetchImpl = vi.fn(async (url, init = {}) => {
       const path = new URL(url).pathname;
-      if (path === '/api/permission/request') return Response.json([{ id: 'pending', sessionID: 'root' }]);
+      if (path === '/api/session/active') return Response.json({ data: { root: { type: 'running' } } });
+      if (path === '/api/session/root') return Response.json({ data: { id: 'root', location: { directory: '/project' } } });
+      if (path === '/api/permission/request') {
+        return Response.json(directoryHeader(init) === '/project' ? [{ id: 'pending', sessionID: 'root' }] : []);
+      }
       if (path === '/api/session/root/permission/pending/reply' && init.method === 'POST') return Response.json({});
-      return Response.json({ id: 'root' });
+      return new Response('', { status: 404 });
     });
     const { connect } = createRuntime({
       stored: { permissionAutoAccept: { sessions: { root: true } } },
@@ -187,6 +281,22 @@ describe('permission auto-accept runtime', () => {
     await vi.waitFor(() => {
       expect(fetchImpl.mock.calls.some(([url]) => new URL(url).pathname === '/api/session/root/permission/pending/reply')).toBe(true);
     });
+  });
+
+  // A list without a directory answers for OpenCode's working directory only
+  // and makes OpenCode start it, MCP servers included.
+  it('never lists pending permissions without a directory', async () => {
+    const fetchImpl = vi.fn(async (url) => {
+      const path = new URL(url).pathname;
+      if (path === '/api/session/active') return Response.json({ data: {} });
+      return Response.json([]);
+    });
+    const { runtime, connect } = createRuntime({ fetchImpl });
+    connect();
+    await runtime.reconcilePending();
+
+    const lists = fetchImpl.mock.calls.filter(([url]) => new URL(url).pathname === '/api/permission/request');
+    expect(lists).toEqual([]);
   });
 
   it('accepts existing pending permissions when a session policy is enabled', async () => {
@@ -246,6 +356,34 @@ describe('permission auto-accept runtime', () => {
 
     emit({ type: 'permission.replied', properties: { sessionID: 'root', requestID: 'held', reply: 'once' } });
     expect(onPermissionReplied).toHaveBeenCalledWith('held');
+  });
+
+  it('tells clients about every request it left for the user, and only those', async () => {
+    const fetchImpl = vi.fn(async (url) => (
+      String(url).endsWith('/permission/broken/reply') ? new Response('', { status: 500 }) : Response.json({})
+    ));
+    const verdicts = { held: { action: 'hold' }, safe: { action: 'accept' }, broken: { action: 'accept' } };
+    const broadcastGlobalUiEvent = vi.fn();
+    const { runtime, emit } = createRuntime({
+      stored: { permissionAutoAccept: { sessions: { root: 'safety', manual: 'ask' } } },
+      fetchImpl,
+      evaluatePermission: async (permission) => verdicts[permission.id],
+      broadcastGlobalUiEvent,
+    });
+    await runtime.load();
+
+    for (const [id, sessionID] of [['held', 'root'], ['safe', 'root'], ['broken', 'root'], ['asked', 'manual']]) {
+      emit({ type: 'permission.asked', properties: { id, sessionID } });
+    }
+    await flush();
+
+    const leftForUser = broadcastGlobalUiEvent.mock.calls
+      .map(([event]) => event)
+      .filter((event) => event.type === 'openchamber:permission-auto-accept.left-for-user');
+    expect(leftForUser).toEqual([
+      { type: 'openchamber:permission-auto-accept.left-for-user', properties: { permissionId: 'held', sessionId: 'root', directory: '/project' } },
+      { type: 'openchamber:permission-auto-accept.left-for-user', properties: { permissionId: 'broken', sessionId: 'root', directory: '/project' } },
+    ]);
   });
 
   it('never consults the safety net in an auto session', async () => {

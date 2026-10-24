@@ -1,5 +1,10 @@
 import { EventEmitter } from 'node:events';
+import fs from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+
+import { injectedEnvKeys } from '../injected-env.js';
 
 const spawnMock = vi.fn();
 const spawnSyncMock = vi.fn();
@@ -19,6 +24,7 @@ vi.mock('./startup-performance.js', () => ({
 }));
 
 const { createOpenCodeLifecycleRuntime } = await import('./lifecycle.js');
+const { createServerDiagnosticJournal } = await import('../diagnostics/server-journal.js');
 
 const originalOpencodeBinary = process.env.OPENCODE_BINARY;
 const originalPath = process.env.PATH;
@@ -102,7 +108,7 @@ const createRuntime = (overrides = {}, stateOverrides = {}, envOverrides = {}) =
     waitForReady: vi.fn(async () => true),
     normalizeApiPrefix: vi.fn(() => ''),
     applyOpencodeBinaryFromSettings: vi.fn(async () => null),
-    checkOpenCodeBinary: async () => '2.0.14',
+    checkOpenCodeBinary: async () => '2.0.19',
   ensureOpencodeCliEnv: vi.fn(),
     ensureLocalOpenCodeServerPassword: vi.fn(async () => 'password'),
     resolveManagedOpenCodeLaunchSpec: vi.fn((binary) => ({ binary, args: [], wrapperType: null })),
@@ -154,6 +160,41 @@ describe('OpenCode lifecycle', () => {
       for (const [, , options] of spawnMock.mock.calls) {
         expect(options.env).not.toHaveProperty('OPENCODE_BINARY');
       }
+      // Credential reads take variable keys from the environment the current process got.
+      expect(runtime.getManagedOpenCodeProcessEnv()).toBe(spawnMock.mock.calls[1][2].env);
+      expect(runtime.getManagedOpenCodeProcessEnv()).toMatchObject({ SHELL_ONLY: 'yes' });
+    } finally {
+      await runtime.testState.openCodeProcess.close();
+    }
+  });
+
+  it('journals managed launch, readiness, exit and restart as fixed actions only', async () => {
+    const journal = createServerDiagnosticJournal();
+    spawnMock.mockImplementation(() => {
+      const child = createMockChild();
+      queueMicrotask(() => {
+        child.stderr.emit('data', 'plugin failed: token=secret-123 /private/file\n');
+        child.stdout.emit('data', 'opencode server listening on http://127.0.0.1:45678\n');
+      });
+      return child;
+    });
+    globalThis.fetch = vi.fn(async () => ({ ok: false }));
+    const runtime = createRuntime({ diagnosticJournal: journal });
+    const firstServer = await runtime.startOpenCode();
+    runtime.testState.openCodeProcess = firstServer;
+    try {
+      await runtime.restartOpenCode();
+      expect(journal.snapshot().events.map(({ action, detail }) => [action, detail])).toEqual([
+        ['managed launch', 'attempt=1'],
+        ['managed ready', 'attempt=1'],
+        ['managed restart started', undefined],
+        ['managed process exited', undefined],
+        ['managed launch', 'attempt=1'],
+        ['managed ready', 'attempt=1'],
+        ['managed restart ready', undefined],
+      ]);
+      expect(spawnMock.mock.calls[0][2].env).not.toHaveProperty('OPENCODE_PRINT_LOGS');
+      expect(JSON.stringify(journal.snapshot())).not.toMatch(/secret|private/);
     } finally {
       await runtime.testState.openCodeProcess.close();
     }
@@ -162,7 +203,7 @@ describe('OpenCode lifecycle', () => {
   it('records an authoritative ready terminal event for external startup', async () => {
     globalThis.fetch = vi.fn(async () => ({
       ok: true,
-      json: async () => ({ version: '2.0.15', pid: 1, urls: [], paths: { tmp: '/tmp' } }),
+      json: async () => ({ version: '2.1.2', pid: 1, urls: [], paths: { tmp: '/tmp' } }),
     }));
     const runtime = createRuntime({
       env: {
@@ -194,7 +235,7 @@ describe('OpenCode lifecycle', () => {
   it('recovers an external OPENCODE_HOST connection using its configured endpoint', async () => {
     const fetchMock = vi.fn(async () => ({
       ok: true,
-      json: async () => ({ version: '2.0.15', pid: 1, urls: [], paths: { tmp: '/tmp' } }),
+      json: async () => ({ version: '2.1.2', pid: 1, urls: [], paths: { tmp: '/tmp' } }),
     }));
     globalThis.fetch = fetchMock;
     const runtime = createRuntime({}, {
@@ -209,6 +250,7 @@ describe('OpenCode lifecycle', () => {
 
     await runtime.restartOpenCode();
 
+    expect(runtime.getManagedOpenCodeProcessEnv()).toBeNull();
     expect(fetchMock).toHaveBeenCalledWith(
       'http://seamus:4095/api/info',
       expect.objectContaining({ method: 'GET' }),
@@ -269,9 +311,14 @@ describe('OpenCode lifecycle', () => {
   });
 
   it('warms only the last-used directory after a successful bootstrap', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'oc-warm-'));
+    const lastUsed = path.join(root, 'worktree-a');
+    const otherProject = path.join(root, 'project-b');
+    await fs.mkdir(lastUsed);
+    await fs.mkdir(otherProject);
     const fetchMock = vi.fn(async () => ({
       ok: true,
-      json: async () => ({ version: '2.0.15', pid: 1, urls: [], paths: { tmp: '/tmp' } }),
+      json: async () => ({ version: '2.1.2', pid: 1, urls: [], paths: { tmp: '/tmp' } }),
     }));
     globalThis.fetch = fetchMock;
     const runtime = createRuntime({
@@ -283,19 +330,285 @@ describe('OpenCode lifecycle', () => {
         ENV_SKIP_OPENCODE_START: true,
       },
       reapManagedOrphanedProcesses: vi.fn(async () => ({ reaped: 0 })),
-      getWarmupDirectories: vi.fn(async () => ['/tmp/worktree-a', '/tmp/project-b']),
+      getWarmupDirectories: vi.fn(async () => [lastUsed, otherProject]),
     });
 
     await runtime.bootstrapOpenCodeAtStartup();
     await new Promise((resolve) => setTimeout(resolve, 0));
 
-    const warmupUrls = fetchMock.mock.calls
-      .map(([url]) => String(url))
-      .filter((url) => url.includes('/api/session?'));
+    const warmups = fetchMock.mock.calls
+      .filter(([url]) => String(url).endsWith('/api/location'))
+      .map(([url, init]) => [String(url), init.headers['x-opencode-directory']]);
     // Each warmed directory boots its whole MCP fleet on OpenCode 2 (#4018).
-    expect(warmupUrls).toEqual([
-      'http://127.0.0.1:45678/api/session?directory=%2Ftmp%2Fworktree-a&limit=1',
+    // v2 reads the directory from the header, and only location routes start
+    // one: `/api/session` is a global list.
+    expect(warmups).toEqual([
+      ['http://127.0.0.1:45678/api/location', encodeURIComponent(lastUsed)],
     ]);
+    // Server-side reads without a directory of their own go to the warmed one.
+    expect(runtime.getDefaultOpenCodeDirectory()).toBe(lastUsed);
+    await fs.rm(root, { recursive: true, force: true });
+  });
+
+  it('answers null once the warmed default directory is no longer usable', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'oc-stale-'));
+    const stale = path.join(root, 'worktree-a');
+    await fs.mkdir(stale);
+    globalThis.fetch = vi.fn(async () => ({
+      ok: true,
+      json: async () => ({ version: '2.1.2', pid: 1, urls: [], paths: { tmp: '/tmp' } }),
+    }));
+    const runtime = createRuntime({
+      env: {
+        ENV_CONFIGURED_OPENCODE_PORT: 45678,
+        ENV_CONFIGURED_OPENCODE_HOST: null,
+        ENV_EFFECTIVE_PORT: 45678,
+        ENV_CONFIGURED_OPENCODE_HOSTNAME: '127.0.0.1',
+        ENV_SKIP_OPENCODE_START: true,
+      },
+      reapManagedOrphanedProcesses: vi.fn(async () => ({ reaped: 0 })),
+      getWarmupDirectories: vi.fn(async () => [stale]),
+    });
+
+    await runtime.bootstrapOpenCodeAtStartup();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    // While the directory is usable, it scopes default reads.
+    expect(runtime.getDefaultOpenCodeDirectory()).toBe(stale);
+
+    // The project directory is removed while the server keeps running. The
+    // cached default must not keep being handed to OpenCode: a stale path
+    // makes every directory-scoped read answer 500 (the bug behind the quota
+    // endpoints' "UnexpectedStatus: 500").
+    await fs.rm(stale, { recursive: true, force: true });
+    expect(runtime.getDefaultOpenCodeDirectory()).toBeNull();
+
+    // A path that now points at a regular file is not a directory either.
+    await fs.writeFile(stale, 'x');
+    expect(runtime.getDefaultOpenCodeDirectory()).toBeNull();
+    await fs.rm(root, { recursive: true, force: true });
+  });
+
+  it('scopes default reads to the chats root while no project directory is usable', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'oc-no-project-'));
+    const chats = path.join(root, 'chats');
+    const project = path.join(root, 'project');
+    await fs.mkdir(chats);
+    await fs.mkdir(project);
+    let warmup = [];
+    globalThis.fetch = vi.fn(async () => ({
+      ok: true,
+      json: async () => ({ version: '2.1.2', pid: 1, urls: [], paths: { tmp: '/tmp' } }),
+    }));
+    const runtime = createRuntime({
+      env: {
+        ENV_CONFIGURED_OPENCODE_PORT: 45678,
+        ENV_CONFIGURED_OPENCODE_HOST: null,
+        ENV_EFFECTIVE_PORT: 45678,
+        ENV_CONFIGURED_OPENCODE_HOSTNAME: '127.0.0.1',
+        ENV_SKIP_OPENCODE_START: true,
+      },
+      reapManagedOrphanedProcesses: vi.fn(async () => ({ reaped: 0 })),
+      getWarmupDirectories: vi.fn(async () => warmup),
+      noProjectDirectory: chats,
+    });
+
+    await runtime.bootstrapOpenCodeAtStartup();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    // No project: a read without a directory would start OpenCode over the
+    // whole home, its working directory.
+    expect(runtime.getDefaultOpenCodeDirectory()).toBe(chats);
+    expect(globalThis.fetch.mock.calls.filter(([url]) => String(url).endsWith('/api/location'))).toEqual([]);
+
+    // A project opened later takes over once the warmup source names it.
+    warmup = [project];
+    await runtime.bootstrapOpenCodeAtStartup();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(runtime.getDefaultOpenCodeDirectory()).toBe(project);
+    await fs.rm(root, { recursive: true, force: true });
+  });
+
+  // The UI stops a chat's location once the user leaves it. A read that went
+  // to the chat used last at startup would start it again, every quota poll.
+  it('scopes reads without a directory to the directory the user works in now', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'oc-current-'));
+    const leftChat = path.join(root, 'left-chat');
+    const current = path.join(root, 'current');
+    await fs.mkdir(leftChat);
+    await fs.mkdir(current);
+    globalThis.fetch = vi.fn(async () => ({
+      ok: true,
+      json: async () => ({ version: '2.1.2', pid: 1, urls: [], paths: { tmp: '/tmp' } }),
+    }));
+    const runtime = createRuntime({
+      env: {
+        ENV_CONFIGURED_OPENCODE_PORT: 45678,
+        ENV_CONFIGURED_OPENCODE_HOST: null,
+        ENV_EFFECTIVE_PORT: 45678,
+        ENV_CONFIGURED_OPENCODE_HOSTNAME: '127.0.0.1',
+        ENV_SKIP_OPENCODE_START: true,
+      },
+      reapManagedOrphanedProcesses: vi.fn(async () => ({ reaped: 0 })),
+      getWarmupDirectories: vi.fn(async () => [leftChat]),
+    });
+
+    await runtime.bootstrapOpenCodeAtStartup();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(runtime.getDefaultOpenCodeDirectory()).toBe(leftChat);
+
+    runtime.noteCurrentDirectory(current);
+    expect(runtime.getDefaultOpenCodeDirectory()).toBe(current);
+
+    // A directory that is not there is never sent.
+    runtime.noteCurrentDirectory(path.join(root, 'missing'));
+    expect(runtime.getDefaultOpenCodeDirectory()).toBe(current);
+    await fs.rm(root, { recursive: true, force: true });
+  });
+
+  it('advances to a currently-valid warmup directory when the cached default goes stale', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'oc-replace-'));
+    const stale = path.join(root, 'gone');
+    const surviving = path.join(root, 'still-here');
+    await fs.mkdir(stale);
+    await fs.mkdir(surviving);
+    globalThis.fetch = vi.fn(async () => ({
+      ok: true,
+      json: async () => ({ version: '2.1.2', pid: 1, urls: [], paths: { tmp: '/tmp' } }),
+    }));
+    // The warm pass offered both; only the first was cached as the default.
+    const runtime = createRuntime({
+      env: {
+        ENV_CONFIGURED_OPENCODE_PORT: 45678,
+        ENV_CONFIGURED_OPENCODE_HOST: null,
+        ENV_EFFECTIVE_PORT: 45678,
+        ENV_CONFIGURED_OPENCODE_HOSTNAME: '127.0.0.1',
+        ENV_SKIP_OPENCODE_START: true,
+      },
+      reapManagedOrphanedProcesses: vi.fn(async () => ({ reaped: 0 })),
+      getWarmupDirectories: vi.fn(async () => [stale, surviving]),
+    });
+
+    await runtime.bootstrapOpenCodeAtStartup();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(runtime.getDefaultOpenCodeDirectory()).toBe(stale);
+
+    // Removing the first still leaves a valid directory: default reads keep
+    // their location scope rather than dropping it entirely.
+    await fs.rm(stale, { recursive: true, force: true });
+    expect(runtime.getDefaultOpenCodeDirectory()).toBe(surviving);
+    await fs.rm(root, { recursive: true, force: true });
+  });
+
+  it('re-resolves the settings-backed default when the cached one is stale', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'oc-refresh-'));
+    const stale = path.join(root, 'old-project');
+    const navigated = path.join(root, 'new-project');
+    await fs.mkdir(stale);
+    await fs.mkdir(navigated);
+    let current = stale;
+    globalThis.fetch = vi.fn(async () => ({
+      ok: true,
+      json: async () => ({ version: '2.1.2', pid: 1, urls: [], paths: { tmp: '/tmp' } }),
+    }));
+    const runtime = createRuntime({
+      env: {
+        ENV_CONFIGURED_OPENCODE_PORT: 45678,
+        ENV_CONFIGURED_OPENCODE_HOST: null,
+        ENV_EFFECTIVE_PORT: 45678,
+        ENV_CONFIGURED_OPENCODE_HOSTNAME: '127.0.0.1',
+        ENV_SKIP_OPENCODE_START: true,
+      },
+      reapManagedOrphanedProcesses: vi.fn(async () => ({ reaped: 0 })),
+      // Mirrors the real dep: the warmup source answers the settings'
+      // lastDirectory, which moves as the user navigates.
+      getWarmupDirectories: vi.fn(async () => [current]),
+    });
+
+    await runtime.bootstrapOpenCodeAtStartup();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(runtime.getDefaultOpenCodeDirectory()).toBe(stale);
+
+    // The user navigated to another project while the old one vanished.
+    await fs.rm(stale, { recursive: true, force: true });
+    current = navigated;
+    // First read drops the stale default and kicks the refresh; the next read
+    // sees the re-resolved, currently-valid directory and scopes to it.
+    expect(runtime.getDefaultOpenCodeDirectory()).toBeNull();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(runtime.getDefaultOpenCodeDirectory()).toBe(navigated);
+    await fs.rm(root, { recursive: true, force: true });
+  });
+
+  // Windows chmod only toggles the read-only attribute, and root ignores the
+  // permission bits, so neither can take read/execute away from a directory.
+  it.skipIf(process.platform === 'win32' || process.getuid?.() === 0)('treats a directory without read/execute permission as unusable', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'oc-perm-'));
+    const locked = path.join(root, 'locked');
+    await fs.mkdir(locked);
+    globalThis.fetch = vi.fn(async () => ({
+      ok: true,
+      json: async () => ({ version: '2.1.2', pid: 1, urls: [], paths: { tmp: '/tmp' } }),
+    }));
+    const runtime = createRuntime({
+      env: {
+        ENV_CONFIGURED_OPENCODE_PORT: 45678,
+        ENV_CONFIGURED_OPENCODE_HOST: null,
+        ENV_EFFECTIVE_PORT: 45678,
+        ENV_CONFIGURED_OPENCODE_HOSTNAME: '127.0.0.1',
+        ENV_SKIP_OPENCODE_START: true,
+      },
+      reapManagedOrphanedProcesses: vi.fn(async () => ({ reaped: 0 })),
+      getWarmupDirectories: vi.fn(async () => [locked]),
+    });
+
+    await runtime.bootstrapOpenCodeAtStartup();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(runtime.getDefaultOpenCodeDirectory()).toBe(locked);
+
+    // OpenCode answers 500 FileSystem.realPath for a directory it cannot read
+    // or traverse, same as for a missing one, so it must not be sent.
+    await fs.chmod(locked, 0o000);
+    try {
+      expect(runtime.getDefaultOpenCodeDirectory()).toBeNull();
+    } finally {
+      await fs.chmod(locked, 0o755);
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('does not scope the restart agent check to a directory that went stale', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'oc-agent-'));
+    const stale = path.join(root, 'worktree-a');
+    await fs.mkdir(stale);
+    const requested = [];
+    globalThis.fetch = vi.fn(async (url, init) => {
+      requested.push([String(url), init?.headers?.['x-opencode-directory'] ?? null]);
+      if (String(url).endsWith('/api/info')) {
+        return { ok: true, json: async () => ({ version: '2.1.2', pid: 1, urls: [], paths: { tmp: '/tmp' } }) };
+      }
+      return { ok: true, json: async () => ({ data: [{ id: 'build' }] }) };
+    });
+    const runtime = createRuntime({
+      env: {
+        ENV_CONFIGURED_OPENCODE_PORT: 45678,
+        ENV_CONFIGURED_OPENCODE_HOST: null,
+        ENV_EFFECTIVE_PORT: 45678,
+        ENV_CONFIGURED_OPENCODE_HOSTNAME: '127.0.0.1',
+        ENV_SKIP_OPENCODE_START: true,
+      },
+      reapManagedOrphanedProcesses: vi.fn(async () => ({ reaped: 0 })),
+      getWarmupDirectories: vi.fn(async () => [stale]),
+    });
+
+    await runtime.bootstrapOpenCodeAtStartup();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    await fs.rm(stale, { recursive: true, force: true });
+    await expect(runtime.waitForAgentPresence('build', 500, 50)).resolves.toBeUndefined();
+
+    const agentChecks = requested.filter(([url]) => url.endsWith('/api/agent'));
+    expect(agentChecks.length).toBeGreaterThan(0);
+    expect(agentChecks.every(([, directory]) => directory === null)).toBe(true);
+    await fs.rm(root, { recursive: true, force: true });
   });
 
   it('records an authoritative error terminal event when bootstrap fails', async () => {
@@ -694,6 +1007,35 @@ describe('OpenCode lifecycle', () => {
     expect(server.signalCode).toBe('SIGTERM');
   });
 
+  it('removes AppImage launcher entries from the managed OpenCode launch env', async () => {
+    delete process.env.OPENCODE_BINARY;
+    const previous = { APPDIR: process.env.APPDIR, LD_LIBRARY_PATH: process.env.LD_LIBRARY_PATH };
+    process.env.APPDIR = '/tmp/.mount_OpenChAbC123';
+    process.env.LD_LIBRARY_PATH = '/tmp/.mount_OpenChAbC123/usr/lib:/opt/x:';
+    const child = createMockChild();
+    spawnMock.mockImplementationOnce(() => {
+      queueMicrotask(() => {
+        child.stdout.emit('data', 'opencode server listening on http://127.0.0.1:45678\n');
+      });
+      return child;
+    });
+
+    try {
+      const runtime = createRuntime();
+      const server = await runtime.startOpenCode();
+      const [, , options] = spawnMock.mock.calls[0];
+
+      expect(options.env.LD_LIBRARY_PATH).toBe('/opt/x');
+
+      await server.close();
+    } finally {
+      for (const [key, value] of Object.entries(previous)) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+    }
+  });
+
   it('strips AppImage ARGV0 from managed OpenCode launch env', async () => {
     delete process.env.OPENCODE_BINARY;
     const previousArgv0 = process.env.ARGV0;
@@ -726,6 +1068,42 @@ describe('OpenCode lifecycle', () => {
       if (previousArgv0 === undefined) delete process.env.ARGV0;
       else process.env.ARGV0 = previousArgv0;
     }
+  });
+
+  it('passes the user variables to OpenCode under the variables OpenChamber owns', async () => {
+    const child = createMockChild();
+    spawnMock.mockImplementationOnce(() => {
+      queueMicrotask(() => {
+        child.stdout.emit('data', 'opencode server listening on http://127.0.0.1:45678\n');
+      });
+      return child;
+    });
+    const getUserEnvironment = vi.fn(() => ({
+      DATABASE_URL: 'postgres://db',
+      PATH: '/opt/tools/bin',
+      OPENCODE_PASSWORD: 'user-password',
+      OPENCHAMBER_AGENT_TOOL_TOKEN: 'user-token',
+    }));
+    const getManagedOpenCodeEnv = vi.fn(async () => ({ OPENCHAMBER_AGENT_TOOL_TOKEN: 'ephemeral' }));
+
+    const runtime = createRuntime({ getUserEnvironment, getManagedOpenCodeEnv });
+    const server = await runtime.startOpenCode();
+    const [, , options] = spawnMock.mock.calls[0];
+
+    expect(options.env.DATABASE_URL).toBe('postgres://db');
+    expect(options.env.PATH).toBe('/opt/tools/bin:/home/user/.bun/bin:/usr/local/bin:/usr/bin');
+    expect(options.env.OPENCODE_PASSWORD).toBe('password');
+    expect(options.env.OPENCHAMBER_AGENT_TOOL_TOKEN).toBe('ephemeral');
+    expect(runtime.getManagedOpenCodeProcessEnv().DATABASE_URL).toBe('postgres://db');
+    // The replaced values are recorded as OpenChamber's; the user's are not.
+    const injected = injectedEnvKeys(options.env);
+    for (const key of ['OPENCODE_PASSWORD', 'OPENCODE_SERVER_PASSWORD', 'OPENCHAMBER_AGENT_TOOL_TOKEN']) {
+      expect(injected.has(key)).toBe(true);
+    }
+    expect(injected.has('DATABASE_URL')).toBe(false);
+    expect(injected.has('PATH')).toBe(false);
+
+    await server.close();
   });
 
   it('adds managed OpenChamber tool environment without allowing it to replace launch invariants', async () => {
@@ -1021,7 +1399,7 @@ it('shares the managed CLI preflight with desktop while startup is pending', asy
   await checking;
   const desktopVerdict = runtime.getManagedOpenCodePreflight();
   expect(runtime.testState.isOpenCodeReady).toBe(false);
-  finish('2.0.15');
+  finish('2.1.2');
   expect(await desktopVerdict).toBe(true);
   expect(checks).toBe(1);
   const server = await starting;

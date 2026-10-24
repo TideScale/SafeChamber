@@ -26,6 +26,8 @@ const routingConfigSchema = z.object({
   enabled: z.boolean(),
   fallback: z.object({ model: modelRefSchema, variant: z.string().nullable() }).nullable(),
   minConfidence: z.number(),
+  // Absent from servers before "Try to preserve cache usage", which reject it in a save.
+  preserveCache: z.boolean().optional(),
   safetyNet: z.object({ enabled: z.boolean(), threshold: z.number() }),
   categories: z.array(routingCategorySchema),
 });
@@ -38,7 +40,11 @@ const builtinCategorySchema = z.object({ id: z.string().min(1), name: z.string()
 const jevSourceSchema = z.enum(['typesafe', 'zen-free']);
 
 /** A classification provider: which service answers Jev requests, or `off` for none. */
-const classifierSourceSchema = z.enum(['off', 'zen-promo', 'zen-key', 'openrouter', 'vercel', 'typesafe']);
+const classifierSourceSchema = z.enum(['off', 'zen-promo', 'zen-key', 'openrouter', 'vercel', 'typesafe', 'custom']);
+
+/** The custom System One endpoint as the server shows it: the key stays on the server. */
+// `pinned`: set by the server environment (OPENCHAMBER_JEV_URL), read-only here.
+const customEndpointSchema = z.object({ url: z.string().min(1), model: z.string().min(1), keyPresent: z.boolean(), pinned: z.boolean().default(false) });
 
 // A source this build does not know (a newer server) reads as no source and is
 // left out of the list, so it cannot fail the whole routing state.
@@ -57,14 +63,19 @@ const classifierSchema = z.object({
  * `/api/routing` as this build reads it, from any server version. Servers from
  * before the classifier pick send neither `jevAvailable` nor `classifier`; Jev
  * always answered there, through the free zen model. `classifier` is the
- * three-source view kept for v2.0.2 clients (null once OpenRouter or Vercel is
- * involved); `classification` is the full picture and wins when present.
+ * three-source view kept for v2.0.2 clients (null once OpenRouter, Vercel or a
+ * custom endpoint is involved); `classification` is the full picture and wins
+ * when present.
  */
 export const routingStateSchema = z.object({
   available: z.boolean(),
   autoReady: z.boolean(),
   jevAvailable: z.boolean().default(true),
   tokenPresent: z.boolean(),
+  // Servers before the custom source never send it.
+  customEndpoint: customEndpointSchema.nullable().default(null),
+  // An administrator turned Jev off for this server; servers before it never did.
+  enterpriseMode: z.boolean().default(false),
   jevSource: jevSourceSchema,
   classifier: classifierSchema.nullable().default(null),
   classification: classifierSchema.nullable().default(null),
@@ -80,11 +91,23 @@ export type RoutingJevSource = z.infer<typeof jevSourceSchema>;
 export type ClassifierSource = z.infer<typeof classifierSourceSchema>;
 export type RoutingState = z.infer<typeof routingStateSchema>;
 
+/**
+ * What Settings saves for the custom endpoint. `key`: a string replaces the
+ * saved key, null removes it, absent keeps it.
+ */
+export interface CustomEndpointInput {
+  url: string;
+  model: string;
+  key?: string | null;
+}
+
 export const ROUTING_UNAVAILABLE: RoutingState = {
   available: false,
   autoReady: false,
   jevAvailable: false,
   tokenPresent: false,
+  customEndpoint: null,
+  enterpriseMode: false,
   jevSource: 'zen-free',
   classifier: null,
   config: null,
@@ -129,3 +152,50 @@ export const saveClassifierSource = async (source: ClassifierSource): Promise<Ro
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ source }),
   }));
+
+export const saveCustomEndpoint = async (endpoint: CustomEndpointInput): Promise<RoutingState> =>
+  readState(await runtimeFetch('/api/routing/classifier/custom', {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(endpoint),
+  }));
+
+export const clearCustomEndpoint = async (): Promise<RoutingState> =>
+  readState(await runtimeFetch('/api/routing/classifier/custom', { method: 'DELETE' }));
+
+const sourceSchema = classifierSourceSchema.exclude(['off']);
+// Two shapes, told apart by `ok`: a discriminated union needs one variant
+// per discriminator value, so every failure shares one object and only
+// `unavailable` comes without a source and model.
+const classifierTestSchema = z.discriminatedUnion('ok', [
+  z.object({ ok: z.literal(true), source: sourceSchema, model: z.string(), ms: z.number() }),
+  z.object({
+    ok: z.literal(false),
+    reason: z.enum(['unavailable', 'http', 'timeout', 'unparsable', 'network']),
+    source: sourceSchema.optional(),
+    model: z.string().optional(),
+    status: z.number().optional(),
+    message: z.string().optional(),
+  }),
+]);
+export type ClassifierTestResult = z.infer<typeof classifierTestSchema>;
+
+/**
+ * One Jev request through the provider answering now, or through `custom`
+ * endpoint fields as typed (an empty key reuses the saved one). Saves nothing.
+ */
+export const parseClassifierTestResult = (payload: unknown): ClassifierTestResult => classifierTestSchema.parse(payload);
+
+export const testClassifier = async (custom?: CustomEndpointInput): Promise<ClassifierTestResult> => {
+  const response = await runtimeFetch('/api/routing/classifier/test', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(custom ? { custom } : {}),
+  });
+  const payload: unknown = await response.json().catch(() => null);
+  if (!response.ok) {
+    const failure = errorPayloadSchema.safeParse(payload);
+    throw new Error(failure.success ? failure.data.error : `Routing request failed (${response.status})`);
+  }
+  return parseClassifierTestResult(payload);
+};

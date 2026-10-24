@@ -28,8 +28,13 @@ describe('turn telemetry', () => {
 
   test('formats durations, counts and approximate throughput', () => {
     expect(formatTelemetryDuration(0)).toBe('0.0s');
+    expect(formatTelemetryDuration(49)).toBe('<0.1s');
+    expect(formatTelemetryDuration(50)).toBe('0.1s');
     expect(formatTelemetryDuration(1234)).toBe('1.2s');
-    expect(formatTelemetryDuration(84000)).toBe('1m24s');
+    expect(formatTelemetryDuration(84000)).toBe('1m 24s');
+    expect(formatTelemetryDuration(2796044)).toBe('46m 36s');
+    expect(formatTelemetryDuration(119_600)).toBe('2m 0s');
+    expect(formatTelemetryDuration(84600)).toBe('1m 25s');
     expect(formatTelemetryTokens(0)).toBe('0');
     expect(formatTelemetryTokens(500)).toBe('500');
     expect(formatTelemetryTokens(1234)).toBe('1.2K');
@@ -46,9 +51,23 @@ describe('turn telemetry', () => {
       tokens: { input: 1500, output: 100, reasoning: 0, cache: { read: 0, write: 0 } },
     }), parts: [text(21500)] });
     const stats = getLatestCompletedTurnStats(records);
-    expect(stats).toEqual({ stepsCount: 2, lastAssistantMessageId: 'a2', totalToolDurationMs: 3000,
+    expect(stats).toEqual({ stepsCount: 2, lastAssistantMessageId: 'a2', elapsedDurationMs: 24000, totalToolDurationMs: 3000,
       totalLlmDurationMs: 10000, outputTokens: 300, reasoningTokens: 300, totalGeneratedTokens: 600,
       inputTokens: 2500, cost: 0.015, tokensPerSecond: 60, responseTokensPerSecond: null, avgTtftMs: 1000, cacheHitPercent: 44 });
+  });
+
+  test('omits elapsed time when turn boundary timestamps are invalid', () => {
+    const invalidStartStats = getLatestCompletedTurnStats([
+      { info: { ...user, time: { created: Number.NaN } }, parts: [] },
+      { info: assistant(), parts: [] },
+    ]);
+    const invalidEndStats = getLatestCompletedTurnStats([
+      { info: { ...user, time: { created: 6000 } }, parts: [] },
+      { info: assistant(), parts: [] },
+    ]);
+
+    expect(invalidStartStats?.elapsedDurationMs).toBeNull();
+    expect(invalidEndStats?.elapsedDurationMs).toBeNull();
   });
 
   test('uses only the latest user-bounded turn', () => {
@@ -123,6 +142,15 @@ describe('turn telemetry', () => {
     expect(stats?.avgTtftMs).toBe(200);
   });
 
+  test('a part stamped at step creation is not a measured TTFT', () => {
+    const stamped = getLatestCompletedTurnStats(turn(assistant(), [text(1000), tool(1000, 4000)]));
+    expect(stamped?.avgTtftMs).toBeNull();
+    expect(stamped?.stepsCount).toBe(1);
+
+    const later = getLatestCompletedTurnStats(turn(assistant(), [text(1000), text(1800)]));
+    expect(later?.avgTtftMs).toBe(800);
+  });
+
   for (const [start, end] of [[0, 2000], [2000, 6000], [3000, 2000], [NaN, 3000]]) {
     test(`invalid tool interval ${start}..${end} omits duration-dependent metrics`, () => {
     const stats = getLatestCompletedTurnStats(turn(assistant(), [tool(start, end)]));
@@ -159,7 +187,7 @@ describe('turn telemetry', () => {
     expect(getLatestCompletedTurnStats(residual)?.totalLlmDurationMs).toBe(1);
 
     const finalText = turn(assistant({ tokens: { ...baseTokens(), output: 400 } }),
-      [{ ...text(1000), text: 'Final answer', time: { start: 1000, end: 1002 } }]);
+      [{ ...text(1001), text: 'Final answer', time: { start: 1001, end: 1003 } }]);
     expect(getLatestCompletedTurnStats(finalText)?.responseTokensPerSecond).toBeNull();
 
     // A fast but possible rate still shows.
@@ -214,6 +242,22 @@ describe('turn telemetry', () => {
       expect(stats?.responseTokensPerSecond).toBeNull();
       expect(stats?.tokensPerSecond !== null).toBe(true);
     }
+  });
+
+  test('hides response speed for text stamped with the step window on reload', () => {
+    // Live, the text window is 2500 to 4500: 130 tok/s.
+    const live = turn(assistant({ tokens: { ...baseTokens(), output: 260 } }), [
+      { ...text(2500), text: 'Final answer', time: { start: 2500, end: 4500 } },
+    ]);
+    expect(getLatestCompletedTurnStats(live)?.responseTokensPerSecond).toBe(130);
+    // Reloaded, stored text has no timing and takes the step's created and
+    // completed, which would read 65 tok/s.
+    const reloaded = turn(assistant({ tokens: { ...baseTokens(), output: 260 } }), [
+      { ...text(1000), text: 'Final answer', time: { start: 1000, end: 5000 } },
+    ]);
+    const stats = getLatestCompletedTurnStats(reloaded);
+    expect(stats?.responseTokensPerSecond).toBeNull();
+    expect(stats?.tokensPerSecond).toBe(65);
   });
 
   test('response speed needs valid output usage and a successful final reply', () => {

@@ -4,8 +4,7 @@ import { matchesRankQuery } from '@/lib/search/fuzzySearch';
 import { normalizePath } from '@/lib/pathNormalization';
 import { isChatDirectoryPath } from '@/lib/chatDirectories';
 import { resolveGlobalSessionDirectory } from '@/stores/useGlobalSessionsStore';
-import { getPinnedSessionKey } from '@/stores/useSessionPinnedStore';
-import { getGitHubPrStatusKey } from '@/stores/useGitHubPrStatusStore';
+import { getPinnedSessionKey } from '@/lib/sessionPins';
 import type { WorktreeMetadata } from '@/types/worktree';
 import type { SessionNode } from '../types';
 
@@ -22,6 +21,7 @@ export type SessionNodeChildRenderExtras = {
   subtreeContainsEditing: Set<string>;
   menuOpenSessionId: string | null;
   nodeStructureKey: string;
+  blockingBadgeSessionScopes?: readonly BlockingBadgeSessionScope[];
   /**
    * Bumped once a minute by the owning list so rows that render a relative
    * timestamp ("5m") re-render and recompute it. Only the Recent list
@@ -83,7 +83,7 @@ export const nodeContainsSessionId = (node: SessionNode, sessionId: string | nul
   return false;
 };
 
-export type FormBadgeSessionScope = {
+export type BlockingBadgeSessionScope = {
   directory: string;
   sessionIDs: string[];
 };
@@ -114,18 +114,16 @@ export const getSessionWorktreeMenuDisabled = ({
 }): boolean => !sessionDirectory || isStreaming || isMovingToWorktree;
 
 /**
- * Choose which (directory, sessionIDs) scopes a sidebar row's pending-question
- * badge should count. An expanded row counts only its own session; a collapsed
+ * Choose which (directory, sessionIDs) scopes a sidebar row's blocking-request
+ * badges should count. An expanded row counts only its own session; a collapsed
  * parent row additionally rolls up the hidden descendants of its subtree,
- * grouped by the directory store each descendant actually lives in, so badges
- * stay correct for worktree/subtask sessions without bootstrapping their
- * directory stores.
+ * grouped by the directory store each descendant actually lives in.
  */
-export const selectFormBadgeSessionScopes = (
+export const selectBlockingBadgeSessionScopes = (
   node: SessionNode,
   isExpanded: boolean,
   fallbackDirectory: string | null,
-): FormBadgeSessionScope[] => {
+): BlockingBadgeSessionScope[] => {
   const sessionIDsByDirectory = new Map<string, string[]>();
   const visit = (current: SessionNode): void => {
     const directory = resolveGlobalSessionDirectory(current.session)
@@ -344,25 +342,6 @@ export const nodeHasPinnedMembershipChange = (
 };
 
 /**
- * Visibility classes for the row's right-edge badges (pending permissions /
- * questions). The hover actions paint over the row's right edge, and they are
- * also forced visible while the row menu is open — without hover, so the
- * hover reveal padding does not apply and the actions would cover the badges.
- * The badges therefore yield exactly like the date/branch metadata label:
- * hidden while the actions are hover-revealed or the menu is open. Rows with
- * always-visible actions reserve permanent padding instead, so their badges
- * never conflict and must stay visible.
- */
-export const selectRowBadgeVisibilityClass = (input: {
-  actionsAlwaysVisible: boolean;
-  menuOpen: boolean;
-  hideOnHoverClass: string;
-}): string => {
-  if (input.actionsAlwaysVisible) return '';
-  return `transition-opacity duration-150 ${input.menuOpen ? 'opacity-0' : input.hideOnHoverClass}`;
-};
-
-/**
  * Branch line for a row's tooltip and recent-list marker. An explicit
  * `secondaryMeta` means the owning projection already filtered the branch
  * (Recent and Timeline hide HEAD; Recent also hides a branch equal to the
@@ -380,17 +359,17 @@ export const resolveTooltipBranchLabel = (
 );
 
 /**
- * GitHub PR lookup key for a row. The row's worktree is the only source of
- * the directory/branch pair; VS Code renders no PR badges.
+ * The worktree directory and branch whose change request a row shows. The
+ * row's worktree is the only source of the pair; VS Code renders no PR badges.
  */
-export const resolveSessionPrLookupKey = (
+export const resolveSessionPrLookup = (
   worktree: WorktreeMetadata | null | undefined,
   isVSCode: boolean,
-): string | null => {
+): { directory: string; branch: string } | null => {
   if (isVSCode) return null;
   const branch = worktree?.branch?.trim();
   const directory = normalizePath(worktree?.path ?? null);
-  return branch && directory ? getGitHubPrStatusKey(directory, branch) : null;
+  return branch && directory ? { directory, branch } : null;
 };
 
 /**

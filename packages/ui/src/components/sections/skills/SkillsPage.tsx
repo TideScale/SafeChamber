@@ -22,7 +22,6 @@ import {
   SettingsFieldRow,
   SettingsStackedField,
   SETTINGS_FIELD_LABEL_CLASS,
-  SETTINGS_SELECT_SIZE,
 } from '@/components/sections/shared/SettingsSection';
 import { SettingsInfoHint } from '@/components/sections/shared/SettingsInfoHint';
 import {
@@ -43,6 +42,7 @@ import { Icon } from "@/components/icon/Icon";
 import { SimpleMarkdownRenderer } from '@/components/chat/MarkdownRenderer';
 import { PreviewToggleButton } from '@/components/views/PreviewToggleButton';
 import { SkillsCatalogPage } from './catalog/SkillsCatalogPage';
+import { SkillUseField } from './SkillUseField';
 import {
   SKILL_LOCATION_OPTIONS,
   locationPartsFrom,
@@ -52,8 +52,8 @@ import {
 import { useI18n } from '@/lib/i18n';
 import { languageByExtension } from '@/lib/codemirror/languageByExtension';
 import { createFlexokiCodeMirrorTheme } from '@/lib/codemirror/flexokiTheme';
-import { shikiHighlightExtension } from '@/lib/codemirror/shikiHighlight';
-import { getResolvedShikiTheme } from '@/lib/shiki/appThemeRegistry';
+import { codeHighlightExtension } from '@/lib/codemirror/codeHighlight';
+import { getCodeTokenTheme } from '@/lib/shiki/appThemeRegistry';
 import { getLanguageFromExtension } from '@/lib/toolHelpers';
 import { useThemeSystem } from '@/contexts/useThemeSystem';
 import { useUIStore } from '@/stores/useUIStore';
@@ -61,7 +61,7 @@ import { cn } from '@/lib/utils';
 import { EditorView } from '@codemirror/view';
 import type { Extension } from '@codemirror/state';
 
-export interface SkillsPageProps {
+interface SkillsPageProps {
   view?: 'installed' | 'catalog';
 }
 
@@ -162,6 +162,7 @@ const SkillsInstalledPage: React.FC = () => {
   const [draftSource, setDraftSource] = React.useState<'opencode' | 'agents'>('opencode');
   const [description, setDescription] = React.useState('');
   const [instructions, setInstructions] = React.useState('');
+  const [disableModelInvocation, setDisableModelInvocation] = React.useState(false);
   const [skillMarkdown, setSkillMarkdown] = React.useState(() => buildSkillMarkdown('', ''));
   const [skillEditorMode, setSkillEditorMode] = React.useState<'edit' | 'preview'>('edit');
   const [supportingFiles, setSupportingFiles] = React.useState<SupportingFile[]>([]);
@@ -171,6 +172,7 @@ const SkillsInstalledPage: React.FC = () => {
   
   const [originalDescription, setOriginalDescription] = React.useState('');
   const [originalInstructions, setOriginalInstructions] = React.useState('');
+  const [originalDisableModelInvocation, setOriginalDisableModelInvocation] = React.useState(false);
   
   const [isFileDialogOpen, setIsFileDialogOpen] = React.useState(false);
   const [newFileName, setNewFileName] = React.useState('');
@@ -221,23 +223,30 @@ const SkillsInstalledPage: React.FC = () => {
 
   const skillEditorKey = JSON.stringify([settingsDirectory, selectedSkillName, selectedSkill?.path, isNewSkill]);
   const hydratedSkill = React.useRef<string | null>(null);
-  const currentEditor = React.useRef({ key: skillEditorKey, markdown: skillMarkdown });
-  currentEditor.current = { key: skillEditorKey, markdown: skillMarkdown };
+  const currentEditor = React.useRef({ key: skillEditorKey, markdown: skillMarkdown, disableModelInvocation });
+  currentEditor.current = { key: skillEditorKey, markdown: skillMarkdown, disableModelInvocation };
   const savedMarkdown = React.useRef('');
+  const savedDisableModelInvocation = React.useRef(false);
 
   React.useEffect(() => {
     let cancelled = false;
-    const hydrateText = (nextDescription: string, nextInstructions: string) => {
+    const hydrateText = (nextDescription: string, nextInstructions: string, nextDisableModelInvocation: boolean) => {
       if (currentEditor.current.key !== skillEditorKey) return;
       const markdown = buildSkillMarkdown(nextDescription, nextInstructions);
-      const dirty = hydratedSkill.current === skillEditorKey
-        && currentEditor.current.markdown !== savedMarkdown.current;
+      const isHydrated = hydratedSkill.current === skillEditorKey;
+      const textDirty = isHydrated && currentEditor.current.markdown !== savedMarkdown.current;
+      const invocationDirty = isHydrated
+        && currentEditor.current.disableModelInvocation !== savedDisableModelInvocation.current;
       hydratedSkill.current = skillEditorKey;
       savedMarkdown.current = markdown;
-      if (!dirty) {
+      savedDisableModelInvocation.current = nextDisableModelInvocation;
+      if (!textDirty) {
         setDescription(nextDescription);
         setInstructions(nextInstructions);
         setSkillMarkdown(markdown);
+      }
+      if (!invocationDirty) {
+        setDisableModelInvocation(nextDisableModelInvocation);
       }
     };
     const loadSkillDetails = async () => {
@@ -248,9 +257,10 @@ const SkillsInstalledPage: React.FC = () => {
         setDraftName(skillDraft.name || '');
         setDraftScope(skillDraft.scope || 'user');
         setDraftSource(skillDraft.source === 'agents' ? 'agents' : 'opencode');
-        hydrateText(nextDescription, nextInstructions);
+        hydrateText(nextDescription, nextInstructions, false);
         setOriginalDescription('');
         setOriginalInstructions('');
+        setOriginalDisableModelInvocation(false);
         setSupportingFiles([]);
         setPendingFiles(skillDraft.pendingFiles || []);
       } else if (selectedSkillName && selectedSkill) {
@@ -261,9 +271,11 @@ const SkillsInstalledPage: React.FC = () => {
             const md = detail.sources.md;
             const nextDescription = md.description || '';
             const nextInstructions = md.instructions || '';
-            hydrateText(nextDescription, nextInstructions);
+            const nextDisableModelInvocation = md.disableModelInvocation === true;
+            hydrateText(nextDescription, nextInstructions, nextDisableModelInvocation);
             setOriginalDescription(nextDescription);
             setOriginalInstructions(nextInstructions);
+            setOriginalDisableModelInvocation(nextDisableModelInvocation);
             setSupportingFiles(md.supportingFiles || []);
           }
         } catch (error) {
@@ -292,7 +304,7 @@ const SkillsInstalledPage: React.FC = () => {
 
   const supportingFileEditorExtensions = React.useMemo<Extension[]>(() => {
     const filePath = newFileName.trim() || 'supporting-file.md';
-    // Shiki token colors for code supporting files; markdown stays on lezer.
+    // File-view token colors for code supporting files; markdown stays on lezer.
     const shikiLanguage = getLanguageFromExtension(filePath);
     const useShiki = Boolean(shikiLanguage) && shikiLanguage !== 'markdown';
     const extensions: Extension[] = [createFlexokiCodeMirrorTheme(currentTheme, useShiki ? { syntaxColors: false, fontSize: editorFontSize } : { fontSize: editorFontSize })];
@@ -301,10 +313,10 @@ const SkillsInstalledPage: React.FC = () => {
       extensions.push(languageExtension);
     }
     if (useShiki && shikiLanguage) {
-      extensions.push(shikiHighlightExtension({
+      extensions.push(codeHighlightExtension({
         language: shikiLanguage,
         themeName: currentTheme.metadata.id,
-        theme: getResolvedShikiTheme(currentTheme),
+        theme: getCodeTokenTheme(currentTheme),
       }));
     }
     extensions.push(EditorView.lineWrapping);
@@ -336,7 +348,11 @@ const SkillsInstalledPage: React.FC = () => {
   const save = React.useCallback(async (): Promise<AutosaveResult> => {
     const skillName = selectedSkillName?.trim();
     if (isNewSkill || isReadOnlySkill || !skillName) return AUTOSAVE_UNCHANGED;
-    if (description === originalDescription && instructions === originalInstructions) {
+    if (
+      description === originalDescription
+      && instructions === originalInstructions
+      && disableModelInvocation === originalDisableModelInvocation
+    ) {
       return AUTOSAVE_UNCHANGED;
     }
     if (!description.trim()) {
@@ -348,6 +364,7 @@ const SkillsInstalledPage: React.FC = () => {
       description: description.trim(),
       instructions: instructions.trim() || undefined,
       targetPath: selectedSkill?.path,
+      disableModelInvocation,
     }, settingsDirectory);
     if (!success) {
       return autosaveFailed(t('settings.skills.page.toast.updateSkillFailed'));
@@ -355,17 +372,21 @@ const SkillsInstalledPage: React.FC = () => {
 
     if (currentEditor.current.key === skillEditorKey) {
       savedMarkdown.current = buildSkillMarkdown(description, instructions);
+      savedDisableModelInvocation.current = disableModelInvocation;
       setOriginalDescription(description);
       setOriginalInstructions(instructions);
+      setOriginalDisableModelInvocation(disableModelInvocation);
     }
     return AUTOSAVE_SAVED;
   }, [
     description,
     instructions,
+    disableModelInvocation,
     isNewSkill,
     isReadOnlySkill,
     originalDescription,
     originalInstructions,
+    originalDisableModelInvocation,
     selectedSkill?.path,
     selectedSkillName,
     settingsDirectory,
@@ -375,6 +396,12 @@ const SkillsInstalledPage: React.FC = () => {
   ]);
 
   const autosave = useAutosave(save);
+
+  const handleDisableModelInvocationChange = (next: boolean) => {
+    setDisableModelInvocation(next);
+    // A new skill is written once, on Create.
+    if (!isNewSkill) autosave.requestSave();
+  };
 
   const handleCreate = async () => {
     const skillName = draftName.trim().replace(/\s+/g, '-').toLowerCase();
@@ -401,6 +428,7 @@ const SkillsInstalledPage: React.FC = () => {
         scope: draftScope,
         source: draftSource,
         supportingFiles: pendingFiles.length > 0 ? pendingFiles : undefined,
+        disableModelInvocation,
       };
       const success = await createSkill(config, settingsDirectory);
       if (success) {
@@ -555,7 +583,7 @@ const SkillsInstalledPage: React.FC = () => {
       <div className="flex h-full items-center justify-center px-4">
         <div className="text-center text-muted-foreground">
           <Icon name="book-open" className="mx-auto mb-3 h-10 w-10 sm:h-12 sm:w-12 opacity-50" />
-          <p className="typography-body">{t('settings.skills.page.empty.title')}</p>
+          <p className="typography-ui-label">{t('settings.skills.page.empty.title')}</p>
           <p className="typography-meta mt-1 opacity-75">{t('settings.skills.page.empty.description')}</p>
         </div>
       </div>
@@ -566,7 +594,7 @@ const SkillsInstalledPage: React.FC = () => {
     return (
       <div className="flex h-full items-center justify-center px-4">
         <div className="text-center text-muted-foreground">
-          <p className="typography-body">{t('settings.skills.page.loading.details')}</p>
+          <p className="typography-ui-label">{t('settings.skills.page.loading.details')}</p>
         </div>
       </div>
     );
@@ -612,7 +640,7 @@ const SkillsInstalledPage: React.FC = () => {
                     setDraftSource(next.source === 'agents' ? 'agents' : 'opencode');
                   }}
                 >
-                  <SelectTrigger size={SETTINGS_SELECT_SIZE} className="w-fit gap-1.5">
+                  <SelectTrigger className="w-fit gap-1.5">
                     {draftScope === 'user' ? (
                       <Icon name="user-3" className="h-3.5 w-3.5" />
                     ) : (
@@ -630,7 +658,7 @@ const SkillsInstalledPage: React.FC = () => {
                             {option.source === 'agents' ? <Icon name="robot-2" className="h-3.5 w-3.5" /> : null}
                             <span>{locationLabelText(option.value)}</span>
                           </div>
-                          <span className="typography-micro text-muted-foreground ml-6">{locationDescriptionText(option.value)}</span>
+                          <span className="typography-micro text-muted-foreground ms-6">{locationDescriptionText(option.value)}</span>
                         </div>
                       </SelectItem>
                     ))}
@@ -653,10 +681,18 @@ const SkillsInstalledPage: React.FC = () => {
                 onChange={(e) => handleDescriptionChange(e.target.value)}
                 placeholder={t('settings.skills.page.field.descriptionPlaceholder')}
                 rows={2}
-                className="w-full resize-none min-h-[60px] max-h-32 bg-transparent"
+                className="w-full resize-none min-h-[60px] bg-transparent"
                 disabled={isReadOnlySkill}
               />
             </SettingsStackedField>
+
+            <SkillUseField
+              skill={isNewSkill ? null : selectedSkill ?? null}
+              directory={settingsDirectory}
+              manual={disableModelInvocation}
+              onManualChange={handleDisableModelInvocationChange}
+              manualLocked={isReadOnlySkill}
+            />
 
         </SettingsSection>
 
@@ -690,7 +726,7 @@ const SkillsInstalledPage: React.FC = () => {
                     <SimpleMarkdownRenderer
                       content={skillMarkdown}
                       className="typography-markdown-body"
-                      stripFrontmatter
+                      frontmatter="hide"
                       enableFileReferences={false}
                     />
                   </div>

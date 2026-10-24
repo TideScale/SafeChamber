@@ -1,5 +1,6 @@
 import type { SidebarSection } from '@/constants/sidebar';
 import type { IconName } from '@/components/icon/icons';
+import { isIsolatedSpacesPageVisible } from '@/lib/spaces/release';
 
 export type SettingsPageSlug =
   | 'home'
@@ -27,6 +28,7 @@ export type SettingsPageSlug =
   | 'notifications'
   | 'voice'
   | 'tunnel'
+  | 'isolated-spaces'
   | 'about'
   | 'integrations'
   | 'extensions';
@@ -44,6 +46,10 @@ export interface SettingsRuntimeContext {
   isMobile: boolean;
   /** Whether this runtime has Jev routing, which needs the OpenChamber server. */
   routingAvailable: boolean;
+  /** The server runs in enterprise mode: pages for what it refuses are hidden. */
+  enterpriseMode: boolean;
+  /** Enterprise mode keeps Jev off (no administrator's endpoint), so pages that only configure Jev are hidden. */
+  jevBlockedByEnterprise: boolean;
 }
 
 export interface SettingsPageMeta {
@@ -162,7 +168,7 @@ export const SETTINGS_PAGE_METADATA: readonly SettingsPageMeta[] = [
     title: 'Git',
     group: 'projects',
     kind: 'single',
-    keywords: ['git', 'identity', 'identities', 'ssh', 'profiles', 'credentials', 'keys', 'commit', 'gitmoji'],
+    keywords: ['git', 'github', 'gitlab', 'identity', 'identities', 'ssh', 'profiles', 'credentials', 'keys', 'commit', 'gitmoji', 'oauth', 'prs', 'issues'],
     isAvailable: (ctx) => !ctx.isVSCode,
   },
   {
@@ -201,7 +207,7 @@ export const SETTINGS_PAGE_METADATA: readonly SettingsPageMeta[] = [
     kind: 'single',
     description: 'Pick the right model for each message automatically, and get asked before risky actions in auto-accepted sessions.',
     keywords: ['routing', 'auto', 'jev', 'typesafe', 'model routing', 'categories', 'safety net', 'auto-accept', 'fallback'],
-    isAvailable: (ctx) => !ctx.isVSCode && ctx.routingAvailable,
+    isAvailable: (ctx) => !ctx.isVSCode && ctx.routingAvailable && !ctx.jevBlockedByEnterprise,
   },
   {
     slug: 'magic-prompts',
@@ -221,7 +227,16 @@ export const SETTINGS_PAGE_METADATA: readonly SettingsPageMeta[] = [
 
   { slug: 'notifications', title: 'Notifications', group: 'general', kind: 'single', keywords: ['alerts', 'native', 'summary', 'summarization'], },
   { slug: 'voice', title: 'Voice', group: 'general', kind: 'single', keywords: ['tts', 'speech', 'voice'], isAvailable: (ctx) => !ctx.isVSCode },
-  { slug: 'tunnel', title: 'External Tunnel', group: 'projects', kind: 'single', keywords: ['tunnel', 'external', 'cloudflare', 'qr', 'remote', 'mobile', 'share'], isAvailable: (ctx) => !ctx.isVSCode },
+  { slug: 'tunnel', title: 'External Tunnel', group: 'projects', kind: 'single', keywords: ['tunnel', 'external', 'cloudflare', 'tailscale', 'qr', 'remote', 'mobile', 'share'], isAvailable: (ctx) => !ctx.isVSCode && !ctx.enterpriseMode },
+  {
+    slug: 'isolated-spaces',
+    title: 'Isolated spaces',
+    group: 'projects',
+    kind: 'single',
+    keywords: ['isolated', 'space', 'spaces', 'container', 'docker', 'colima', 'sandbox', 'disk', 'clean up', 'image'],
+    // Never in VS Code (decision 16 of the design); before the feature's first release only with the key on.
+    isAvailable: (ctx) => !ctx.isVSCode && isIsolatedSpacesPageVisible(),
+  },
   { slug: 'about', title: 'About', group: 'general', kind: 'single', keywords: ['about', 'version', 'updates', 'release', 'changelog'], isAvailable: (ctx) => ctx.isMobile && !ctx.isVSCode },
   { slug: 'integrations', title: 'Integrations', group: 'general', kind: 'single', keywords: ['integration', 'connect', 'oauth', 'github', 'linear', 'extension', 'claude', 'plugin'], isAvailable: (ctx) => !ctx.isVSCode },
   {
@@ -324,7 +339,7 @@ export function getSettingsNavIcon(slug: SettingsPageSlug): IconName | null {
     case 'integrations':
       return 'plug';
     case 'extensions':
-      return 'apps';
+      return 'puzzle';
 
     case 'usage':
       return 'bar-chart-2';
@@ -332,6 +347,8 @@ export function getSettingsNavIcon(slug: SettingsPageSlug): IconName | null {
       return 'mic';
     case 'tunnel':
       return 'home-office';
+    case 'isolated-spaces':
+      return 'box-3';
     case 'about':
       return 'information';
     case 'home':

@@ -11,17 +11,18 @@
 import { createHash } from 'crypto';
 
 import { buildResult } from '../../utils/index.js';
-import { loadClaudeCredential } from './auth.js';
+import { findClaudeCredential, loadClaudeCredential } from './auth.js';
 import { toClaudeUsage } from './transforms.js';
 
 export const providerId = 'claude';
 export const providerName = 'Claude';
-export const aliases = ['anthropic', 'claude'];
+const aliases = ['anthropic', 'claude'];
 
 const USAGE_URL = 'https://api.anthropic.com/api/oauth/usage';
 const OAUTH_BETA_HEADER = 'oauth-2025-04-20';
 const DEFAULT_COOLDOWN_MS = 5 * 60 * 1000;
 const MAX_COOLDOWN_MS = 60 * 60 * 1000;
+const SESSION_EXPIRED_ERROR = 'Claude session expired. Open Claude Code to sign in again.';
 
 /**
  * Last good payload, kept only to survive Anthropic's aggressive rate limiting.
@@ -33,6 +34,7 @@ const MAX_COOLDOWN_MS = 60 * 60 * 1000;
 let cachedUsage = null;
 let cooldownUntil = 0;
 let pendingFetch = null;
+let lastFingerprint = null;
 
 const fingerprintOf = (credential) =>
   createHash('sha256').update(`${credential.accessToken}\0${credential.refreshToken ?? ''}`).digest('hex');
@@ -65,18 +67,24 @@ const cachedResultFor = (fingerprint, planLabel) => {
 const failure = (error, { configured = true } = {}) =>
   buildResult({ providerId, providerName, ok: false, configured, error });
 
-export const isConfigured = () => Boolean(loadClaudeCredential());
+export const isConfigured = (auth) => Boolean(findClaudeCredential(auth));
 
 const fetchQuotaUncoalesced = async () => {
-  const credential = loadClaudeCredential();
+  const credential = await loadClaudeCredential();
   if (!credential) {
     return failure('Not configured', { configured: false });
   }
 
   const fingerprint = fingerprintOf(credential);
-  if (cachedUsage && cachedUsage.fingerprint !== fingerprint) {
+  if (lastFingerprint !== null && lastFingerprint !== fingerprint) {
     cachedUsage = null;
     cooldownUntil = 0;
+  }
+  lastFingerprint = fingerprint;
+
+  const expiresAt = credential.expiresAt;
+  if (Number.isFinite(expiresAt) && expiresAt > 0 && expiresAt <= Date.now()) {
+    return failure(SESSION_EXPIRED_ERROR);
   }
 
   if (Date.now() < cooldownUntil) {
@@ -104,7 +112,7 @@ const fetchQuotaUncoalesced = async () => {
   }
 
   if (response.status === 401 || response.status === 403) {
-    return failure('Claude session expired. Open Claude Code to sign in again.');
+    return failure(SESSION_EXPIRED_ERROR);
   }
 
   if (!response.ok) {
@@ -148,4 +156,5 @@ export const resetClaudeQuotaCache = () => {
   cachedUsage = null;
   cooldownUntil = 0;
   pendingFetch = null;
+  lastFingerprint = null;
 };

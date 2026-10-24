@@ -1,5 +1,6 @@
 import React from 'react';
 
+import { focusChatInput } from '@/components/chat/composer/editor/dom';
 import { toast } from '@/components/ui';
 import { useI18n } from '@/lib/i18n';
 import { useInlineCommentDraftStore } from '@/stores/useInlineCommentDraftStore';
@@ -16,7 +17,7 @@ import type { BrowserAnnotationOverlayLabels } from '@/lib/browser/annotationOve
  * cannot leave a prompt claiming an attachment that never arrived — the text
  * states what actually happened.
  */
-export const useAnnotationAttach = (directory: string) => {
+export const useAnnotationAttach = (directory: string, intro?: string) => {
   const { t } = useI18n();
   const currentSessionId = useSessionUIStore((state) => state.currentSessionId);
   const newSessionDraftOpen = useSessionUIStore((state) => state.newSessionDraft?.open);
@@ -42,20 +43,22 @@ export const useAnnotationAttach = (directory: string) => {
 
     addInlineCommentDraft({ directory, sessionKey }, {
       source: 'preview-annotation',
-      fileLabel: result.payload.pageUrl || 'browser',
+      fileLabel: result.payload.pageUrl || result.payload.pageTitle || 'browser',
       startLine: 1,
       endLine: 1,
       code: formatBrowserAnnotationPrompt({
         payload: result.payload,
         screenshotAttached,
-        intro: t('contextPanel.browser.annotate.intro'),
+        intro: intro ?? t('contextPanel.browser.annotate.intro'),
       }),
       language: 'markdown',
       text: '',
     });
 
     toast.success(t('contextPanel.browser.annotate.attached'));
-  }, [addAttachedFile, addInlineCommentDraft, currentSessionId, directory, newSessionDraftOpen, t]);
+    // Focus leaves the page for the composer so Enter sends the prompt.
+    requestAnimationFrame(focusChatInput);
+  }, [addAttachedFile, addInlineCommentDraft, currentSessionId, directory, intro, newSessionDraftOpen, t]);
 };
 
 /** Overlay labels, resolved through i18n so the in-page UI follows the app locale. */
