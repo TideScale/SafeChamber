@@ -62,6 +62,13 @@ const PROMPT_PAGE_MAP: Record<string, PromptPageConfig> = {
       { id: 'git.pr.generate.instructions', titleKey: 'settings.magicPrompts.page.block.instructions' },
     ],
   },
+  'walkthrough': {
+    titleKey: 'settings.magicPrompts.page.group.walkthrough.title',
+    descriptionKey: 'settings.magicPrompts.page.group.walkthrough.description',
+    blocks: [
+      { id: 'walkthrough.instructions', titleKey: 'settings.magicPrompts.page.block.instructions' },
+    ],
+  },
   'git.conflict.resolve': {
     titleKey: 'settings.magicPrompts.page.group.gitConflictResolve.title',
     descriptionKey: 'settings.magicPrompts.page.group.gitConflictResolve.description',
@@ -493,7 +500,7 @@ export const MagicPromptsPage: React.FC = () => {
   const renderError = (target: EditorContext, message: string, path?: string) => (
     <div role="alert" className="flex flex-wrap items-center justify-between gap-3 rounded-lg bg-[var(--status-error-background)] px-4 py-3">
       <div className="min-w-0 flex-1 basis-64 space-y-1 typography-meta text-[var(--status-error)]">
-        <p>{message}</p>
+        <p dir="auto">{message}</p>
         {path ? <p dir="ltr" className="break-all" data-magic-prompt-path>{path}</p> : null}
       </div>
       <Button variant="outline" size="sm" onClick={() => { void load(target); }}>

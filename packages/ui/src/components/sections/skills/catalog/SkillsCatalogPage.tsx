@@ -378,6 +378,7 @@ export const SkillsCatalogPage: React.FC<SkillsCatalogPageProps> = ({ mode, onMo
       <SettingsPageLayout
         title={t('settings.skills.catalog.page.title')}
         showSaveStatus={false}
+        namedBySidebar
       >
       {showModeTabs && (
             <div className="mb-4">
@@ -399,10 +400,6 @@ export const SkillsCatalogPage: React.FC<SkillsCatalogPageProps> = ({ mode, onMo
               </div>
             </div>
           )}
-
-        <p className="typography-meta text-muted-foreground mb-4">
-          {t('settings.skills.catalog.page.subtitle')}
-        </p>
 
         <div data-settings-item="skills.catalog.search" className="mb-5">
           <div className="relative max-w-md">
@@ -465,7 +462,7 @@ export const SkillsCatalogPage: React.FC<SkillsCatalogPageProps> = ({ mode, onMo
                 <span className="typography-ui-label text-muted-foreground block">
                   {t('settings.skills.catalog.page.source.addOwnTitle')}
                 </span>
-                <span className="typography-micro text-muted-foreground/70 block mt-0.5">
+                <span className="typography-micro text-muted-foreground block mt-0.5">
                   {t('settings.skills.catalog.page.source.addOwnDescription')}
                 </span>
               </span>
@@ -501,7 +498,7 @@ export const SkillsCatalogPage: React.FC<SkillsCatalogPageProps> = ({ mode, onMo
               <span className="typography-micro font-medium uppercase tracking-wide text-muted-foreground truncate">
                 {listTitle}
               </span>
-              <span className="typography-micro text-muted-foreground/70 shrink-0">
+              <span className="typography-micro text-muted-foreground shrink-0">
                 {t('settings.skills.catalog.page.foundCount', { count: filtered.length })}
               </span>
             </div>
@@ -631,10 +628,10 @@ export const SkillsCatalogPage: React.FC<SkillsCatalogPageProps> = ({ mode, onMo
                           {item.description ? (
                             <div className="typography-meta text-muted-foreground mt-0.5 line-clamp-2">{item.description}</div>
                           ) : (
-                            <div className="typography-meta text-muted-foreground/50 mt-0.5 italic">{t('settings.skills.catalog.shared.noDescription')}</div>
+                            <div className="typography-meta text-muted-foreground mt-0.5 italic">{t('settings.skills.catalog.shared.noDescription')}</div>
                           )}
 
-                          <div className="typography-micro text-muted-foreground/80 mt-1 flex items-center gap-2 min-w-0">
+                          <div className="typography-micro text-muted-foreground mt-1 flex items-center gap-2 min-w-0">
                             {skillUrl ? (
                               <a
                                 href={skillUrl}

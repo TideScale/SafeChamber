@@ -13,9 +13,11 @@ const QUOTE_FIELDS = new Map([
   ['terminal', 'output'],
 ]);
 // Linked items whose message text is the whole context: the current kinds
-// (`repository-issue`, `change-request`, `tracker-item`) and the legacy names
-// older messages carry.
-const LINK_KINDS = new Set(['repository-issue', 'change-request', 'tracker-item', 'github-issue', 'github-pr', 'linear-issue']);
+// (`repository-issue`, `repository-discussion`, `change-request`,
+// `tracker-item`) and the legacy names older messages carry.
+const LINK_KINDS = new Set([
+  'repository-issue', 'repository-discussion', 'change-request', 'tracker-item', 'github-issue', 'github-pr', 'linear-issue',
+]);
 
 export function excerpt(text, limit) {
   if (text.length <= limit) return text;
@@ -121,6 +123,10 @@ function readMessage(message) {
     // `collectTurns` walks.
     providerID: message.model?.providerID,
     modelID: message.model?.id,
+    // Files OpenCode saw change in the folder during this step, or null when
+    // it took no snapshot (snapshots off, not a git folder). The folder is
+    // shared, so another session's edits can show up here too.
+    snapshotFiles: role === 'assistant' && Array.isArray(message.snapshot?.files) ? message.snapshot.files : null,
     complete: role === 'assistant'
       && message.finish === 'stop'
       && Boolean(message.time?.completed)
@@ -154,12 +160,14 @@ function collectTurns(messages) {
       const authored = [...attached.map((entry) => entry.authored), message.authored].filter(Boolean).join('\n\n');
       attached = [];
       if (!text) continue;
-      active = { user: { ...message, text, authored }, assistant: null, complete: false };
+      active = { user: { ...message, text, authored }, assistant: null, complete: false, changedFiles: null };
       turns.push(active);
       continue;
     }
     attached = [];
     if (!active || message.role !== 'assistant') continue;
+    // Every step of the turn counts, not only the one with the final text.
+    if (message.snapshotFiles) active.changedFiles = new Set([...(active.changedFiles ?? []), ...message.snapshotFiles]);
     if (message.text) active.assistant = message;
     active.complete = message.complete && Boolean(message.text);
   }

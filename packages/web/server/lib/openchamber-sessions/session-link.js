@@ -24,7 +24,8 @@ const MAX_TITLE_LENGTH = 300;
 const MAX_IDENTIFIER_LENGTH = 64;
 
 // The native entry the UI keeps for a repository thread exists for github.com
-// only (`linkedIssues.ts`): owner/repo#number, pull or issue.
+// only (`linkedIssues.ts`): owner/repo#number, pull or issue. A discussion is
+// an external entry with the canonical id the UI writes for one too.
 const NATIVE_THREAD = { provider: 'github', host: 'github.com' };
 
 const linkInputSchema = z.object({
@@ -75,14 +76,18 @@ const trackerEntryKind = (provider) => (provider === 'linear' ? 'linear' : 'trac
  */
 export const buildLinkEntry = (input, linkedAt, { matchTrackerUrl = () => null } = {}) => {
   const parsed = linkInputSchema.safeParse(input);
-  if (!parsed.success) return { error: 'link needs url, title, and kind (change or issue); identifier is optional' };
+  // Fields put straight into parameters never arrive: the tool schema has no
+  // url or kind there and drops them, so the message names the nesting.
+  if (!parsed.success) return { error: 'Pass the link as parameters.link: { url, title, kind: "change" | "issue", identifier? }; the link was not added' };
   const { title, kind, identifier } = parsed.data;
   const url = parseHttpUrl(parsed.data.url);
   if (!url) return { error: 'link.url must be an absolute http(s) URL' };
   const host = url.hostname.replace(/^www\./, '').toLowerCase();
 
   const thread = threadPathOf(host, url.pathname);
-  if (thread?.provider === NATIVE_THREAD.provider && host === NATIVE_THREAD.host) {
+  // A discussion has no native entry: it is stored as an external link, which
+  // every UI keeps, and a newer UI reads it as a discussion by its address.
+  if (thread?.provider === NATIVE_THREAD.provider && host === NATIVE_THREAD.host && thread.match[3] !== 'discussions') {
     const [, owner, repo, threadKind, rawNumber] = thread.match;
     const number = Number(rawNumber);
     return { entry: {
@@ -114,11 +119,14 @@ export const buildLinkEntry = (input, linkedAt, { matchTrackerUrl = () => null }
   // request linked again from its Changes tab, or with a query, refreshes the
   // first link.
   const canonical = thread ? `${url.origin}${thread.match[0].replace(/\/$/, '')}` : null;
+  // A GitHub discussion is named by its number, as the UI names one it links.
+  const discussion = thread?.provider === NATIVE_THREAD.provider && thread.match[3] === 'discussions' ? `#${Number(thread.match[4])}` : null;
   return { entry: {
     id: `link:${canonical ?? url.toString()}`,
     kind: 'external',
-    thread: kind,
-    identifier: identifier || host,
+    // The address says a discussion is no code change, whatever the model filled in.
+    thread: discussion ? 'issue' : kind,
+    identifier: identifier || discussion || host,
     title,
     url: url.toString(),
     linkedAt,
